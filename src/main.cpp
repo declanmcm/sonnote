@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <iostream>
 
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -536,14 +537,13 @@ static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& no
 
         SeqEvent e1;
         e1.type = 1;
-        e1.sample  = (uint64_t)std::max(0.0, std::floor(bon  * spb));
-        e1.freq       = c4 * std::pow(2.0f, n.octave - 4.0f);
+        e1.beat  = n.beat_on;
+        e1.value       = c4 * std::pow(2.0f, n.octave - 4.0f);
         ev.push_back(e1);
         SeqEvent e2;
         e2.type = 0;
-        e2.sample = (uint64_t)std::max((double)e1.sample + 1.0,
-                                          std::floor(boff * spb)); // exclusive
-        e2.freq = c4 * std::pow(2.0f, n.octave - 4.0f);
+        e2.beat = n.beat_off; // exclusive
+        e2.value = c4 * std::pow(2.0f, n.octave - 4.0f);
         ev.push_back(e2);
         std::fflush(stdout);
     }
@@ -1458,13 +1458,20 @@ int main(int, char**)
     ImGui_ImplOpenGL3_Init("#version 330");
 
     // Audio
-    AudioParams audioParams;
-    if (!audio_start(audioParams)) {
-        std::fprintf(stderr, "Audio init failed.\n");
+    AudioEngine engine;
+    if (!engine.start()) {
+        std::cerr << "Failed to start audio engine." << std::endl;
+        return 1;
     }
+    std::cout << "Audio engine started." << std::endl;
+
+    engine.setGain(0.4f);
+    engine.setWaveform(WaveformType::Sine);
+    engine.setTempo(120.0f);
 
     bool show_demo = false;
     bool running = true;
+    bool playing = false;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -1479,19 +1486,18 @@ int main(int, char**)
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // ==== Your UI ====
-        ImGui::Begin("Synth Controls");
-        float f = audioParams.freq.load();
-        float g = audioParams.gain.load();
-        if (ImGui::SliderFloat("Frequency (Hz)", &f, 20.f, 2000.f)) {
-            audioParams.freq.store(f);
-        }
-        if (ImGui::SliderFloat("Gain", &g, 0.0f, 1.0f)) {
-            audioParams.gain.store(g);
-        }
-        ImGui::Checkbox("Show ImGui Demo", &show_demo);
-        ImGui::Text("Audio running: %s", "yes");
-        ImGui::End();
+        // ImGui::Begin("Synth Controls");
+        // float f = audioParams.freq.load();
+        // float g = audioParams.gain.load();
+        // if (ImGui::SliderFloat("Frequency (Hz)", &f, 20.f, 2000.f)) {
+        //     audioParams.freq.store(f);
+        // }
+        // if (ImGui::SliderFloat("Gain", &g, 0.0f, 1.0f)) {
+        //     audioParams.gain.store(g);
+        // }
+        // ImGui::Checkbox("Show ImGui Demo", &show_demo);
+        // ImGui::Text("Audio running: %s", "yes");
+        // ImGui::End();
 
         gBeatOctCanvas.draw("Note Canvas", 320.0f);
 
@@ -1499,16 +1505,16 @@ int main(int, char**)
 
         ImGui::Begin("Transport");
         ImGui::SliderFloat("BPM", &bpm, 30.f, 240.f, "%.1f");
-        ImGui::SliderFloat("Attack", &gAttackLength, 0.0001f, 10.0f, "%.4f");
-        ImGui::SliderFloat("Decay", &gReleaseLength, 0.0001f, 10.0f, "%.4f");
+        // ImGui::SliderFloat("Attack", &gAttackLength, 0.0001f, 10.0f, "%.4f");
+        // ImGui::SliderFloat("Decay", &gReleaseLength, 0.0001f, 10.0f, "%.4f");
         static char wavName[256] = "take1.wav";
         ImGui::InputText("WAV filename", wavName, IM_ARRAYSIZE(wavName));
         ImGui::InputText("Jump size", jump, IM_ARRAYSIZE(jump));
         ImGui::InputText("Split size", split, IM_ARRAYSIZE(split));
 
-        if (ImGui::SliderFloat("Master Gain", &g, 0.0f, 1.0f)) {
-            audio_set_gain(g);
-        }
+        // if (ImGui::SliderFloat("Master Gain", &g, 0.0f, 1.0f)) {
+        //     audio_set_gain(g);
+        // }
 
         // Custom Play/Stop button with a triangle
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1523,7 +1529,6 @@ int main(int, char**)
         dl->AddRectFilled(p0, ImVec2(p0.x+sz.x, p0.y+sz.y), bg, 6.0f);
 
         // Draw play button
-        bool playing = audio_is_playing();
         if (!playing) {
             // triangle
             ImVec2 c = { p0.x + sz.x*0.45f, p0.y + sz.y*0.5f };
@@ -1543,22 +1548,18 @@ int main(int, char**)
 
         if (ImGui::Button("Export WAV")) {
             // Build on/off events from your notes (you already have this)
-            uint32_t sr = (uint32_t)getSR(); // or 48000
+            uint32_t sr = 48000; // or 48000
             auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, 0.0f);
 
             // Sort OFF before ON at same sample (important to avoid spikes)
             std::sort(ev.begin(), ev.end(), [](const SeqEvent& a, const SeqEvent& b){
-                if (a.sample != b.sample) return a.sample < b.sample;
+                if (a.beat != b.beat) return a.beat < b.beat;
                 return a.type < b.type; // OFF(0) first, ON(1) after
             });
 
-            bool ok = audio_save_wav(wavName, ev, sr, audioParams.gain.load(),
-                                    gAttackLength, gReleaseLength);
-            if (!ok) {
-                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "Export failed.");
-            } else {
-                ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "Saved %s", wavName);
-            }
+            engine.setEvents(ev);
+
+            engine.exportWav("output.wav", 4.0f);
         }
 
         if (ImGui::Button("Export MIDI")) {
@@ -1582,16 +1583,17 @@ int main(int, char**)
             play_triggered_from_space = false;
             if (!playing) {
                 // Build events from current points
-                uint32_t sr = getSR(); // if you don’t have gDevice here, store it globally or pass it out
-                // Safer: track sample rate yourself; we know we asked for 48000
-                sr = 48000;
+                uint32_t sr = 48000; // if you don’t have gDevice here, store it globally or pass it out
+                
 
                 auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, playhead_time);
-                audio_load_sequence(ev);
-                audio_play(true);
+                engine.setEvents(ev);
+                engine.resetSampleCounter();
+                engine.setPlayState(true);
             } else {
-                audio_play(false);
+                engine.setPlayState(false);
             }
+            playing = !playing;
         }
         ImGui::End();
 
@@ -1608,7 +1610,7 @@ int main(int, char**)
         SDL_GL_SwapWindow(window);
     }
 
-    audio_stop();
+    engine.stop();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();

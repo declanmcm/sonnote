@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(ComposerPlayground LANGUAGES CXX)
+project(Sonnote LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+include(FindPkgConfig)
+
+find_package(Vulkan REQUIRED)
+find_package(SDL2 REQUIRED)
+pkg_check_modules(JACK REQUIRED jack)
+pkg_check_modules(SNDFILE REQUIRED sndfile)
 
 # ---------- ImGui sources ----------
 file(GLOB IMGUI_SRC
@@ -21,16 +28,9 @@ target_include_directories(imgui PUBLIC
   extern/imgui/backends
 )
 
-#find_package(Vulkan REQUIRED)
-#find_package(SDL2 REQUIRED)
-
-#add_executable(vulkan_demo main.cpp)
-#target_link_libraries(vulkan_demo PRIVATE Vulkan::Vulkan SDL2::SDL2)
-
 # ---------- SDL2 (config or pkg-config fallback) ----------
 # Try the official CMake package first (provides SDL2::SDL2)
 find_package(SDL2 QUIET CONFIG)
-
 
 if (NOT TARGET SDL2::SDL2)
   # Fallback to CMake's FindSDL2 (if present)
@@ -62,14 +62,21 @@ add_executable(app
 )
 
 target_include_directories(app PRIVATE
+  ${JACK_INCLUDE_DIRS}
+  ${SNDFILE_INCLUDE_DIRS}
   extern/imgui
   extern/miniaudio
+  ${SDL2_INCLUDE_DIRS}
 )
 
 target_link_libraries(app PRIVATE
   imgui
+  pthread
   SDL2::SDL2
   OpenGL::GL
+  Vulkan::Vulkan
+  ${JACK_LIBRARIES}
+  ${SNDFILE_LIBRARIES}
 )
 
 # Some Linux toolchains need these explicitly
