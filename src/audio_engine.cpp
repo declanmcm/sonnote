@@ -101,6 +101,27 @@ bool AudioEngine::start() {
         return false;
     }
 
+    const char** ports;
+
+    // Connect L
+    ports = jack_get_ports(jack->client, nullptr, nullptr,
+                        JackPortIsInput | JackPortIsPhysical);
+    if (ports && ports[0]) {
+        jack_connect(jack->client, 
+            jack_port_name(jack->outL),
+            ports[0]);
+    }
+
+    // Connect R
+    if (ports && ports[1]) {
+        jack_connect(jack->client, 
+            jack_port_name(jack->outR),
+            ports[1]);
+    }
+
+    // Free the list
+    if (ports) free(ports);
+
     return true;
 }
 

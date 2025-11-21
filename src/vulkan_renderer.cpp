@@ -21,6 +21,10 @@ VulkanRenderer::VulkanRenderer(SDL_Window* win) : window(win) {
     createCommandPool();
     createCommandBuffers();
     createSyncObjects();
+    int w, h;
+    SDL_Vulkan_GetDrawableSize(window, &w, &h);
+    windowWidth = w;
+    windowHeight = h;
 }
 
 VulkanRenderer::~VulkanRenderer() {

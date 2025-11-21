@@ -17,6 +17,13 @@ struct Vertex {
     float color[3];
 };
 
+struct Rect {
+    float x;
+    float y;
+    float w;
+    float h;
+};
+
 static std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
     if (!file.is_open()) throw std::runtime_error("failed to open file!");
@@ -36,13 +43,14 @@ public:
 
     std::vector<Vertex> vertices; 
     std::vector<uint16_t> indices;
+    std::vector<Rect> rects;
 
     void addRect(float x, float y, float w, float h, float r, float g, float b) {
         // Convert to NDC
-        float x1 = (x / swapchainExtent.width)  * 2.0f - 1.0f;
-        float y1 = 1.0f - (y / swapchainExtent.height) * 2.0f;
-        float x2 = ((x + w) / swapchainExtent.width)  * 2.0f - 1.0f;
-        float y2 = 1.0f - ((y + h) / swapchainExtent.height) * 2.0f;
+        float x1 = (x / windowWidth)  * 2.0f - 1.0f;
+        float y1 = 1.0f - (y / windowHeight) * 2.0f;
+        float x2 = ((x + w) / windowWidth)  * 2.0f - 1.0f;
+        float y2 = 1.0f - ((y + h) / windowHeight) * 2.0f;
 
         Vertex v0 = {{x1, y1}, {r, g, b}};
         Vertex v1 = {{x2, y1}, {r, g, b}};
@@ -60,8 +68,32 @@ public:
         vkUnmapMemory(device, vertexMemory);
     }
 
+    void onResize(int newW, int newH)
+    {
+        vkDeviceWaitIdle(device);
+
+        windowWidth = newW;
+        windowHeight = newH;
+
+        // Destroy old
+        for (auto fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
+        for (auto iv : imageViews) vkDestroyImageView(device, iv, nullptr);
+        vkDestroySwapchainKHR(device, swapchain, nullptr);
+
+        // Recreate swapchain with new dimensions
+        swapchainExtent = { (uint32_t)newW, (uint32_t)newH };
+        createSwapchain();       // must update swapchainExtent
+        createFramebuffers();    // must rebuild for new views
+        createCommandBuffers();
+    }
+    
+    uint32_t getWindowWidth() const { return windowWidth; }
+    uint32_t getWindowHeight() const { return windowHeight; }
+
 private:
     SDL_Window* window;
+    uint32_t windowWidth;
+    uint32_t windowHeight;
     VkInstance instance{};
     VkSurfaceKHR surface{};
     VkPhysicalDevice physicalDevice{};
