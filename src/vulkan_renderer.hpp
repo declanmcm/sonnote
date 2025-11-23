@@ -17,13 +17,6 @@ struct Vertex {
     float color[3];
 };
 
-struct Rect {
-    float x;
-    float y;
-    float w;
-    float h;
-};
-
 static std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
     if (!file.is_open()) throw std::runtime_error("failed to open file!");
@@ -43,7 +36,6 @@ public:
 
     std::vector<Vertex> vertices; 
     std::vector<uint16_t> indices;
-    std::vector<Rect> rects;
 
     void addRect(float x, float y, float w, float h, float r, float g, float b) {
         // Convert to NDC
@@ -68,22 +60,29 @@ public:
         vkUnmapMemory(device, vertexMemory);
     }
 
-    void onResize(int newW, int newH)
-    {
+    void onResize(SDL_Window* window) {
         vkDeviceWaitIdle(device);
 
-        windowWidth = newW;
-        windowHeight = newH;
+        // Get ACTUAL framebuffer size
+        int dw, dh;
+        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
 
-        // Destroy old
+        windowWidth  = dw;
+        windowHeight = dh;
+        swapchainExtent = { (uint32_t)dw, (uint32_t)dh };
+
+        // Destroy old resources
         for (auto fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
         for (auto iv : imageViews) vkDestroyImageView(device, iv, nullptr);
         vkDestroySwapchainKHR(device, swapchain, nullptr);
 
-        // Recreate swapchain with new dimensions
-        swapchainExtent = { (uint32_t)newW, (uint32_t)newH };
-        createSwapchain();       // must update swapchainExtent
-        createFramebuffers();    // must rebuild for new views
+        // Recreate swapchain & dependent objects
+        createSwapchain();
+        createFramebuffers();
+
+        vertices.clear();
+        updateVertexData(); 
+
         createCommandBuffers();
     }
     
@@ -364,16 +363,20 @@ private:
         vertexInput.pVertexBindingDescriptions = &bindingDesc;
         vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attribs.size());
         vertexInput.pVertexAttributeDescriptions = attribs.data();
+
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-        VkViewport viewport{0.0f, 0.0f, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f};
-        VkRect2D scissor{{0, 0}, swapchainExtent};
-        VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewportState.viewportCount = 1;
-        viewportState.pViewports = &viewport;
-        viewportState.scissorCount = 1;
-        viewportState.pScissors = &scissor;
+        // ---- Dynamic viewport & scissor ----
+        std::array<VkDynamicState, 2> dynStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR
+        };
+
+        VkPipelineDynamicStateCreateInfo dyn{};
+        dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dyn.dynamicStateCount = (uint32_t)dynStates.size();
+        dyn.pDynamicStates = dynStates.data();
 
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = VK_POLYGON_MODE_FILL;
@@ -390,6 +393,11 @@ private:
         VkPipelineColorBlendStateCreateInfo colorBlend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         colorBlend.attachmentCount = 1;
         colorBlend.pAttachments = &colorBlendAttachment;
+
+        // ---- NO fixed viewport/scissor here ----
+        VkPipelineViewportStateCreateInfo viewportState {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
 
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout);
@@ -441,43 +449,27 @@ private:
         allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
         vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data());
 
-        for (size_t i = 0; i < commandBuffers.size(); i++) {
-            VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            vkBeginCommandBuffer(commandBuffers[i], &beginInfo);
+        // for (size_t i = 0; i < commandBuffers.size(); i++) {
+        //     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        //     vkBeginCommandBuffer(commandBuffers[i], &beginInfo);
 
-            VkClearValue clearColor = {0.1f, 0.1f, 0.1f, 1.0f};
-            VkRenderPassBeginInfo rpBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-            rpBegin.renderPass = renderPass;
-            rpBegin.framebuffer = framebuffers[i];
-            rpBegin.renderArea.extent = swapchainExtent;
-            rpBegin.clearValueCount = 1;
-            rpBegin.pClearValues = &clearColor;
-            vkCmdBeginRenderPass(commandBuffers[i], &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-            vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            VkBuffer buffers[] = {vertexBuffer};
-            VkDeviceSize offsets[] = {0};
-            vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, buffers, offsets);
-            vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
-            vkCmdEndRenderPass(commandBuffers[i]);
-            vkEndCommandBuffer(commandBuffers[i]);
-        }
+        //     VkClearValue clearColor = {0.1f, 0.1f, 0.1f, 1.0f};
+        //     VkRenderPassBeginInfo rpBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        //     rpBegin.renderPass = renderPass;
+        //     rpBegin.framebuffer = framebuffers[i];
+        //     rpBegin.renderArea.extent = swapchainExtent;
+        //     rpBegin.clearValueCount = 1;
+        //     rpBegin.pClearValues = &clearColor;
+        //     vkCmdBeginRenderPass(commandBuffers[i], &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+        //     vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        //     VkBuffer buffers[] = {vertexBuffer};
+        //     VkDeviceSize offsets[] = {0};
+        //     vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, buffers, offsets);
+        //     vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
+        //     vkCmdEndRenderPass(commandBuffers[i]);
+        //     vkEndCommandBuffer(commandBuffers[i]);
+        // }
     }
-
-    void drawRect(float x, float y, float w, float h, float r, float g, float b) {
-    // Convert pixel coordinates to Normalized Device Coordinates (NDC)
-    float x1 = (x / swapchainExtent.width)  * 2.0f - 1.0f;
-    float y1 = 1.0f - (y / swapchainExtent.height) * 2.0f;
-    float x2 = ((x + w) / swapchainExtent.width)  * 2.0f - 1.0f;
-    float y2 = 1.0f - ((y + h) / swapchainExtent.height) * 2.0f;
-
-    vertices = {
-        {{x1, y1}, {r, g, b}},
-        {{x2, y1}, {r, g, b}},
-        {{x2, y2}, {r, g, b}},
-        {{x1, y2}, {r, g, b}}
-    };
-    indices = {0, 1, 2, 2, 3, 0};
-}
 
     
     void createSyncObjects() {
