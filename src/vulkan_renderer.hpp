@@ -89,6 +89,10 @@ public:
     uint32_t getWindowWidth() const { return windowWidth; }
     uint32_t getWindowHeight() const { return windowHeight; }
 
+    VkDevice getDevice() {
+        return device;
+    }
+
 private:
     SDL_Window* window;
     uint32_t windowWidth;

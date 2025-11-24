@@ -8,6 +8,7 @@ include(FindPkgConfig)
 
 find_package(Vulkan REQUIRED)
 find_package(SDL2 REQUIRED)
+find_package(Freetype REQUIRED)
 pkg_check_modules(JACK REQUIRED jack)
 pkg_check_modules(SNDFILE REQUIRED sndfile)
 
@@ -64,17 +65,24 @@ add_executable(app
 target_include_directories(app PRIVATE
   ${JACK_INCLUDE_DIRS}
   ${SNDFILE_INCLUDE_DIRS}
+  extern/msdfgen/core
+  extern/msdfgen/ext
+  extern/msdfgen
   extern/imgui
   extern/miniaudio
   ${SDL2_INCLUDE_DIRS}
+  ${FREETYPE_INCLUDE_DIRS}
 )
 
 target_link_libraries(app PRIVATE
   imgui
   pthread
+  msdfgen-core
+  msdfgen-ext
   SDL2::SDL2
   OpenGL::GL
   Vulkan::Vulkan
+  Freetype::Freetype
   ${JACK_LIBRARIES}
   ${SNDFILE_LIBRARIES}
 )

@@ -1,6 +1,7 @@
 #include <SDL.h>
 #include "imgui.h"
-#include "vulkan_renderer.hpp"
+#include "vulkan_renderer.cpp"
+#include "msdf_text.cpp"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
 #include <cstdio>
@@ -57,6 +58,33 @@ struct TreeNode {
         return children.back().get();
     }
 };
+
+struct Rect {
+    float x;
+    float y;
+    float w;
+    float h;
+    float r;
+    float g;
+    float b;
+    float utility;
+    int function;
+};
+
+struct CurrentBox {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+};
+
+#define F_MARGIN_PANEL 0
+#define F_BORDER 1
+#define F_NOTE_WINDOW 2
+#define F_CONTROL_WINDOW 3
+#define F_ABSOLUTE 4
+
+#define NW_HEIGHT 0.75f
 
 // Recursive print function
 void printTree(const TreeNode* node, int depth = 0) {
@@ -1233,7 +1261,7 @@ struct Canvas2D {
                 closest = n;
                 distance = current_distance;
             }
-            // rectangle from (x0w,y±h/2) to (x1w,y±h/2); choose fixed height (e.g., 0.6 octave)
+            // rectangle from (x0w,y±h/2) to (x1w,y±h/2); choose fixed  (e.g., 0.6 octave)
             // float halfH = 1.0/24.0;
             ImVec2 a = worldToScreen(topLeft, { x0w, y});
             ImVec2 b = worldToScreen(topLeft, { x1w, y});
@@ -1427,10 +1455,9 @@ struct Canvas2D {
 // Put this near your other statics:
 static Canvas2D gBeatOctCanvas;
 
-
 int main(int, char**)
 {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
         return 1;
     }
@@ -1439,11 +1466,17 @@ int main(int, char**)
         "Sonnote",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 720,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
 
     VulkanRenderer renderer = VulkanRenderer(window);
 
+    MSDFTextRenderer* text = new MSDFTextRenderer(&renderer);
+
+    text->loadFontMSDF("/usr/share/fonts/TTF/DejaVuSans.ttf", 48.0f);
+    text->createPipeline(renderer.mainRenderPass, 0);
+
+    fflush(stdout);
     // Audio
     AudioEngine engine;
     if (!engine.start()) {
@@ -1456,84 +1489,68 @@ int main(int, char**)
     engine.setWaveform(WaveformType::Sine);
     engine.setTempo(120.0f);
 
-    bool show_demo = false;
+    std::vector<Rect> rects;
+
+    CurrentBox nw;
+    CurrentBox cw;
+    float noteX, noteY;
+    noteX = noteY = -1.0f;
+
+    rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
+    rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
+    rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
+    rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
+    rects.push_back({8.0f, 20.0f, 60.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_ABSOLUTE});
+
     bool running = true;
     bool playing = false;
+    bool size_changed = false;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) running = false;
             if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
                 e.window.windowID == SDL_GetWindowID(window)) running = false;
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                size_changed = true;
+                renderer.onResize(window);
+            }
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
+                int dw, dh;
+                SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+                float nx = e.button.x  / (float)dh;
+                float ny = ((float)dh - e.button.y) / (float)dh;
+
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                } else if (e.button.button == SDL_BUTTON_RIGHT) {
+
+                }
+            }
+            if (e.type == SDL_MOUSEMOTION) {
+                int dw, dh;
+                SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+                float nx = e.button.x  / (float)dh;
+                float ny = ((float)dh - e.button.y) / (float)dh;
+                
+                if (nx >= nw.x1 && nx <= nw.x2 && ny >= nw.y1 && ny <= nw.y2) {
+                    noteX = nx;
+                    noteY = ny;
+                } else {
+                    noteX = -1.0f;
+                    noteY = -1.0f;
+                }
+            }
         }
 
-        // Start new ImGui frame
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL2_NewFrame();
-        ImGui::NewFrame();
-
-        // ImGui::Begin("Synth Controls");
-        // float f = audioParams.freq.load();
-        // float g = audioParams.gain.load();
-        // if (ImGui::SliderFloat("Frequency (Hz)", &f, 20.f, 2000.f)) {
-        //     audioParams.freq.store(f);
-        // }
-        // if (ImGui::SliderFloat("Gain", &g, 0.0f, 1.0f)) {
-        //     audioParams.gain.store(g);
-        // }
-        // ImGui::Checkbox("Show ImGui Demo", &show_demo);
-        // ImGui::Text("Audio running: %s", "yes");
-        // ImGui::End();
-
-        gBeatOctCanvas.draw("Note Canvas", 320.0f);
+        // gBeatOctCanvas.draw();
 
         static float bpm = 120.0f;
 
-        ImGui::Begin("Transport");
-        ImGui::SliderFloat("BPM", &bpm, 30.f, 240.f, "%.1f");
-        // ImGui::SliderFloat("Attack", &gAttackLength, 0.0001f, 10.0f, "%.4f");
-        // ImGui::SliderFloat("Decay", &gReleaseLength, 0.0001f, 10.0f, "%.4f");
-        static char wavName[256] = "take1.wav";
-        ImGui::InputText("WAV filename", wavName, IM_ARRAYSIZE(wavName));
-        ImGui::InputText("Jump size", jump, IM_ARRAYSIZE(jump));
-        ImGui::InputText("Split size", split, IM_ARRAYSIZE(split));
+        // Draw control panel (bpm, attack, decay, wav save name, jump size, split size, gain)
+        // Play button
+        // Export wav button
 
-        // if (ImGui::SliderFloat("Master Gain", &g, 0.0f, 1.0f)) {
-        //     audio_set_gain(g);
-        // }
-
-        // Custom Play/Stop button with a triangle
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImVec2 sz = { 40, 28 };
-        ImGui::InvisibleButton("##playbtn", sz, ImGuiButtonFlags_MouseButtonLeft);
-        bool hovered = ImGui::IsItemHovered();
-        bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-
-        // Button background
-        ImU32 bg = hovered ? IM_COL32(70,80,90,255) : IM_COL32(55,60,66,255);
-        dl->AddRectFilled(p0, ImVec2(p0.x+sz.x, p0.y+sz.y), bg, 6.0f);
-
-        // Draw play button
-        if (!playing) {
-            // triangle
-            ImVec2 c = { p0.x + sz.x*0.45f, p0.y + sz.y*0.5f };
-            ImVec2 a = { c.x - 8, c.y - 10 };
-            ImVec2 b = { c.x - 8, c.y + 10 };
-            ImVec2 d = { c.x + 10, c.y };
-            dl->AddTriangleFilled(a, b, d, IM_COL32(240,240,240,255));
-        } else {
-            // stop square
-            ImVec2 a = { p0.x + sz.x*0.35f, p0.y + sz.y*0.25f };
-            ImVec2 b = { p0.x + sz.x*0.65f, p0.y + sz.y*0.75f };
-            dl->AddRectFilled(a, b, IM_COL32(240,240,240,255), 2.0f);
-        }
-
-        ImGui::SameLine();
-        ImGui::TextUnformatted(playing ? "Stop" : "Play");
-
-        if (ImGui::Button("Export WAV")) {
+        if (false) { // If wav button is pressed
             // Build on/off events from your notes (you already have this)
             uint32_t sr = 48000; // or 48000
             auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, 0.0f);
@@ -1549,24 +1566,21 @@ int main(int, char**)
             engine.exportWav("output.wav", 4.0f);
         }
 
-        if (ImGui::Button("Export MIDI")) {
-            if (save_midi_file_mpe_format1("take1.mid", gBeatOctCanvas.notes, bpm))
-                ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "Saved take1.mid");
-            else
-                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "Export failed");
+        if (false) { // if export midi button is pressed
+            save_midi_file_mpe_format1("take1.mid", gBeatOctCanvas.notes, bpm);
         }
 
-        if (ImGui::Button("Save Project")) {
+        if (false) { // if save project button is pressed
             save_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci);
         }
 
-        if (ImGui::Button("Load Project")) {
+        if (false) { // If load project button is pressed
             load_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci);
         }
 
 
         // Handle click: (re)build sequence and toggle
-        if (clicked || play_triggered_from_space) {
+        if (false || play_triggered_from_space) { // Handle play
             play_triggered_from_space = false;
             if (!playing) {
                 // Build events from current points
@@ -1582,26 +1596,60 @@ int main(int, char**)
             }
             playing = !playing;
         }
-        ImGui::End();
 
+        // Clear vertex list and rebuild from rectangles
+        renderer.vertices.clear();
+        int dw, dh;
+        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+         for (auto& r : rects) {
+            float x, y, w, h;
+            if (r.function == F_ABSOLUTE) {
+                // x is distance from left edge of control window
+                // y is distances from top edge of control window
+                x = r.x + (cw.x1 * dw);
+                y = (cw.y2 * dh) - r.y - r.h;
+                w = r.w;
+                h = r.h;
+            } else {
+                x = r.x * dw;
+                y = r.y * dh;
+                w = r.w * dw;
+                h = r.h * dh;
+            }
+            if (r.function == F_BORDER) {
+                x -= r.utility;
+                y -= r.utility;
+                w += r.utility * 2;
+                h += r.utility * 2;
+            } else if (r.function == F_MARGIN_PANEL || r.function == F_NOTE_WINDOW || r.function == F_CONTROL_WINDOW) {
+                x += r.utility;
+                y += r.utility;
+                w -= r.utility * 2;
+                h -= r.utility * 2;
+                if (size_changed) {
+                    if (r.function == F_NOTE_WINDOW) {
+                        nw.x1 = x / dw;
+                        nw.y1 = y / dh;
+                        nw.x2 = (x + w) / dw;
+                        nw.y2 = (y + h) / dh;
+                    } else if (r.function == F_CONTROL_WINDOW) {
+                        cw.x1 = x / dw;
+                        cw.y1 = y / dh;
+                        cw.x2 = (x + w) / dw;
+                        cw.y2 = (y + h) / dh;
+                    }
+                }
+            }
 
-        if (show_demo) ImGui::ShowDemoWindow(&show_demo);	
+            renderer.addRect(x, y, w, h, r.r, r.g, r.b); 
+        }
 
-        // Render
-        ImGui::Render();
-        int w, h; SDL_GL_GetDrawableSize(window, &w, &h);
-        glViewport(0, 0, w, h);
-        glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(window);
+        renderer.updateVertexData();
+        renderer.drawFrame();
+        if (size_changed) size_changed = false;
     }
 
     engine.stop();
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL2_Shutdown();
-    ImGui::DestroyContext();
-    SDL_GL_DeleteContext(gl_ctx);
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
