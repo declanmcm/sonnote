@@ -60,6 +60,8 @@ find_package(OpenGL REQUIRED)
 add_executable(app
   src/main.cpp
   src/audio_engine.cpp
+  src/vulkan_renderer.cpp
+  src/text_renderer.cpp
 )
 
 target_include_directories(app PRIVATE
@@ -77,8 +79,8 @@ target_include_directories(app PRIVATE
 target_link_libraries(app PRIVATE
   imgui
   pthread
-  msdfgen-core
-  msdfgen-ext
+#  msdfgen-core
+#  msdfgen-ext
   SDL2::SDL2
   OpenGL::GL
   Vulkan::Vulkan

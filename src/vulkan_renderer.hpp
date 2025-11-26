@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <array>
+#include "text_renderer.hpp"
 
 #define WIDTH 800
 #define HEIGHT 600
@@ -112,6 +113,8 @@ private:
     std::vector<VkImageView> imageViews;
     std::vector<VkFramebuffer> framebuffers;
     uint32_t imageCount;
+
+    TextRenderer textRenderer;
 
     VkRenderPass renderPass{};
     VkPipelineLayout pipelineLayout{};

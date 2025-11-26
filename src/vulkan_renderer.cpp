@@ -25,6 +25,20 @@ VulkanRenderer::VulkanRenderer(SDL_Window* win) : window(win) {
     SDL_Vulkan_GetDrawableSize(window, &w, &h);
     windowWidth = w;
     windowHeight = h;
+
+    try {
+        textRenderer.init(
+            { device, physicalDevice, graphicsQueue, graphicsFamily },
+            renderPass,
+            // Pass in your actual swapchain/window width/height
+            (float)w, (float)h, 
+            "fonts/atlas.png", // Path to your pre-generated MSDF texture atlas
+            4.0f                         // The range value used when generating the atlas
+        );
+    } catch (const std::exception& e) {
+        std::cerr << "Text Renderer initialization failed: " << e.what() << std::endl;
+        // Handle error
+    }
 }
 
 VulkanRenderer::~VulkanRenderer() {
@@ -87,6 +101,29 @@ void VulkanRenderer::drawFrame() {
         vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
         vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
     }
+
+    // Begin staging all text strings
+    textRenderer.beginTextSubmission(); 
+
+    // Add multiple text strings (all text will be batched into a single draw call)
+    textRenderer.addText(
+        "hello I am new", 
+        50.0f, 50.0f,          // x, y position (screen space)
+        100.0f,                 // scale
+        glm::vec4(1.0f, 0.5f, 0.0f, 1.0f), // Orange color (RGB A)
+        cmd
+    );
+    
+    // textRenderer.addText(
+    //     "FPS: 60", 
+    //     50.0f, 50.0f,
+    //     1.0f,
+    //     glm::vec4(0.0f, 1.0f, 0.0f, 1.0f), // Green color
+    //     cmd
+    // );
+
+    // End submission, which updates the vertex buffer and issues the draw command(s)
+    textRenderer.endTextSubmission(cmd);
 
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);

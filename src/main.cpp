@@ -1,7 +1,6 @@
 #include <SDL.h>
 #include "imgui.h"
-#include "vulkan_renderer.cpp"
-#include "msdf_text.cpp"
+#include "vulkan_renderer.hpp"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
 #include <cstdio>
@@ -85,6 +84,10 @@ struct CurrentBox {
 #define F_ABSOLUTE 4
 
 #define NW_HEIGHT 0.75f
+
+TextRenderer g_textRenderer;
+VulkanDeviceContext g_deviceContext; // You'd need to populate this
+VkRenderPass g_renderPass;           // Your main render pass
 
 // Recursive print function
 void printTree(const TreeNode* node, int depth = 0) {
@@ -1470,11 +1473,6 @@ int main(int, char**)
     );
 
     VulkanRenderer renderer = VulkanRenderer(window);
-
-    MSDFTextRenderer* text = new MSDFTextRenderer(&renderer);
-
-    text->loadFontMSDF("/usr/share/fonts/TTF/DejaVuSans.ttf", 48.0f);
-    text->createPipeline(renderer.mainRenderPass, 0);
 
     fflush(stdout);
     // Audio
