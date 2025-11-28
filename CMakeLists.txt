@@ -13,21 +13,21 @@ pkg_check_modules(JACK REQUIRED jack)
 pkg_check_modules(SNDFILE REQUIRED sndfile)
 
 # ---------- ImGui sources ----------
-file(GLOB IMGUI_SRC
-  extern/imgui/imgui.cpp
-  extern/imgui/imgui_draw.cpp
-  extern/imgui/imgui_tables.cpp
-  extern/imgui/imgui_widgets.cpp
-  extern/imgui/imgui_demo.cpp
-  extern/imgui/backends/imgui_impl_sdl2.cpp
-  extern/imgui/backends/imgui_impl_opengl3.cpp
-)
+#file(GLOB IMGUI_SRC
+#  extern/imgui/imgui.cpp
+#  extern/imgui/imgui_draw.cpp
+#  extern/imgui/imgui_tables.cpp
+#  extern/imgui/imgui_widgets.cpp
+#  extern/imgui/imgui_demo.cpp
+#  extern/imgui/backends/imgui_impl_sdl2.cpp
+#  extern/imgui/backends/imgui_impl_opengl3.cpp
+#)
 
-add_library(imgui STATIC ${IMGUI_SRC})
-target_include_directories(imgui PUBLIC
-  extern/imgui
-  extern/imgui/backends
-)
+#add_library(imgui STATIC ${IMGUI_SRC})
+#target_include_directories(imgui PUBLIC
+#  extern/imgui
+#  extern/imgui/backends
+#)
 
 # ---------- SDL2 (config or pkg-config fallback) ----------
 # Try the official CMake package first (provides SDL2::SDL2)
@@ -51,7 +51,8 @@ if (NOT TARGET SDL2::SDL2)
 endif()
 
 # Make sure ImGui can see <SDL.h> by inheriting SDL2's include dirs
-target_link_libraries(imgui PUBLIC SDL2::SDL2)
+#imgui
+target_link_libraries(SDL2::SDL2)
 
 # ---------- OpenGL ----------
 find_package(OpenGL REQUIRED)
@@ -67,17 +68,17 @@ add_executable(app
 target_include_directories(app PRIVATE
   ${JACK_INCLUDE_DIRS}
   ${SNDFILE_INCLUDE_DIRS}
-  extern/msdfgen/core
-  extern/msdfgen/ext
-  extern/msdfgen
-  extern/imgui
+#  extern/msdfgen/core
+#  extern/msdfgen/ext
+#  extern/msdfgen
+#  extern/imgui
   extern/miniaudio
   ${SDL2_INCLUDE_DIRS}
   ${FREETYPE_INCLUDE_DIRS}
 )
 
 target_link_libraries(app PRIVATE
-  imgui
+#  imgui
   pthread
 #  msdfgen-core
 #  msdfgen-ext

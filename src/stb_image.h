@@ -4206,7 +4206,8 @@ static void stbi__fill_bits(stbi__zbuf *z)
         z->zbuffer = z->zbuffer_end;  /* treat this as EOF so we fail. */
         return;
       }
-      z->code_buffer |= (unsigned int) stbi__zget8(z) << z->num_bits;
+      unsigned int z8 = stbi__zget8(z);
+      z->code_buffer |= (unsigned int) z8 << z->num_bits;
       z->num_bits += 8;
    } while (z->num_bits <= 24);
 }
@@ -4437,6 +4438,7 @@ static int stbi__parse_uncompressed_block(stbi__zbuf *a)
 
 static int stbi__parse_zlib_header(stbi__zbuf *a)
 {
+   // 1a
    int cmf   = stbi__zget8(a);
    int cm    = cmf & 15;
    /* int cinfo = cmf >> 4; */
@@ -4547,7 +4549,9 @@ STBIDEF char *stbi_zlib_decode_malloc_guesssize_headerflag(const char *buffer, i
    a.zbuffer_end = (stbi_uc *) buffer + len;
    if (stbi__do_zlib(&a, p, initial_size, 1, parse_header)) {
       if (outlen) *outlen = (int) (a.zout - a.zout_start);
+      // memcpy(a.zout_start, a.zbuffer, *outlen);
       return a.zout_start;
+      // return (char*) a.zbuffer;
    } else {
       STBI_FREE(a.zout_start);
       return NULL;
@@ -5279,12 +5283,14 @@ static void *stbi__do_png(stbi__png *p, int *x, int *y, int *n, int req_comp, st
          else
             result = stbi__convert_format16((stbi__uint16 *) result, p->s->img_out_n, req_comp, p->s->img_x, p->s->img_y);
          p->s->img_out_n = req_comp;
-         if (result == NULL) return result;
+         if (result == NULL)
+            return result;
       }
       *x = p->s->img_x;
       *y = p->s->img_y;
       if (n) *n = p->s->img_n;
    }
+   
    STBI_FREE(p->out);      p->out      = NULL;
    STBI_FREE(p->expanded); p->expanded = NULL;
    STBI_FREE(p->idata);    p->idata    = NULL;

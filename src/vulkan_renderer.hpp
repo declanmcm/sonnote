@@ -129,6 +129,16 @@ private:
     std::vector<VkCommandBuffer> commandBuffers;
     VkSemaphore imageAvailable{}, renderFinished{};
 
+    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+        VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
+        VkDebugUtilsMessageTypeFlagsEXT             messageType,
+        const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+        void*                                       pUserData) 
+    {
+        std::cerr << "Vulkan Validation: " << pCallbackData->pMessage << std::endl;
+        return VK_FALSE;
+    }
+
     // Private helper functions
     int createInstance() {
         // ---- Vulkan instance ----
@@ -146,9 +156,24 @@ private:
         createInfo.enabledExtensionCount = extCount;
         createInfo.ppEnabledExtensionNames = extensions.data();
 
-        // const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
-        // createInfo.enabledLayerCount = 1;
-        // createInfo.ppEnabledLayerNames = validationLayers;
+        const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
+        createInfo.enabledLayerCount = 1;
+        createInfo.ppEnabledLayerNames = validationLayers;
+        
+        VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
+        debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        debugCreateInfo.messageSeverity =
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        debugCreateInfo.messageType =
+            VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        debugCreateInfo.pfnUserCallback = debugCallback;  // you write this function
+
+        createInfo.pNext = &debugCreateInfo;
+
 
         for (auto e : extensions)
         std::cout << "Using extension: " << e << std::endl;
@@ -158,6 +183,15 @@ private:
             std::cerr << "vkCreateInstance failed with code " << res << std::endl;
             return -1;
         }
+
+        auto func = (PFN_vkCreateDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+
+        VkDebugUtilsMessengerEXT debugMessenger;
+        if (func != nullptr) {
+            func(instance, &debugCreateInfo, nullptr, &debugMessenger);
+        }
+
         return 0;
     }
 
@@ -409,6 +443,7 @@ private:
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout);
 
+
         VkGraphicsPipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pipeInfo.stageCount = 2;
         pipeInfo.pStages = stages;
@@ -418,6 +453,7 @@ private:
         pipeInfo.pRasterizationState = &raster;
         pipeInfo.pMultisampleState = &multisample;
         pipeInfo.pColorBlendState = &colorBlend;
+        pipeInfo.pDynamicState = &dyn;
         pipeInfo.layout = pipelineLayout;
         pipeInfo.renderPass = renderPass;
 

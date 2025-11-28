@@ -3,7 +3,7 @@
 layout(location = 0) in vec2 fragUV;
 layout(location = 0) out vec4 outColor;
 
-layout(set = 0, binding = 0) uniform sampler2D atlas;
+layout(set = 0, binding = 1) uniform sampler2D atlas;
 layout(push_constant) uniform PushConstants {
     vec4 color;
     float pixelRange; // This must be 4.0f
@@ -29,7 +29,8 @@ void main() {
     screen_px_distance *= pc.pixelRange;
     screen_px_distance /= length(vec2(dFdx(fragUV.x), dFdy(fragUV.y))) * pc.pixelRange;
 
-    // float screen_px_distance = (d - 0.5) * pc.pixelRange;
+    //float screen_px_distance = (d - 0.5) * pc.pixelRange;
+
 
     // 4. Calculate the Anti-aliasing/Smoothing Factor.
     // fwidth is a built-in GLSL function that calculates the absolute magnitude of the
@@ -44,4 +45,5 @@ void main() {
 
     // 6. Final Output
     outColor = vec4(pc.color.rgb, pc.color.a * alpha);
+    //outColor = vec4(texture(atlas, fragUV).rgb, 1.0);
 }

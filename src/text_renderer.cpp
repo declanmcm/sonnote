@@ -142,7 +142,7 @@ void createVulkanBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDevi
     vkGetBufferMemoryRequirements(device, buffer, &memReq);
 
     VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memReq.size;
+    allocInfo.allocationSize = size;
     allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReq.memoryTypeBits, properties);
 
     if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
@@ -399,7 +399,6 @@ void TextRenderer::init(const VulkanDeviceContext& context, VkRenderPass renderP
         throw std::runtime_error("failed to create command pool for text renderer!");
     }
 
-
     // Create Descriptor Set Layout and Pipeline
     createDescriptorSetLayout();
     createPipeline(renderPass);
@@ -442,7 +441,7 @@ void TextRenderer::init(const VulkanDeviceContext& context, VkRenderPass renderP
     VkWriteDescriptorSet descriptorWrite = {};
     descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     descriptorWrite.dstSet = m_descriptorSet;
-    descriptorWrite.dstBinding = 0; // Binding 1 for the combined image sampler
+    descriptorWrite.dstBinding = 1; // Binding 1 for the combined image sampler
     descriptorWrite.dstArrayElement = 0;
     descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     descriptorWrite.descriptorCount = 1;
@@ -451,6 +450,16 @@ void TextRenderer::init(const VulkanDeviceContext& context, VkRenderPass renderP
     vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 
     loadGlyphMetrics("fonts/atlas_metrics.json");
+
+    if (m_glyphMetrics.find('A') != m_glyphMetrics.end()) {
+    auto& m = m_glyphMetrics['A'];
+    std::cout << "'A' metrics:\n"
+              << "  UV: (" << m.atlasUV_L << "," << m.atlasUV_B 
+              << ") to (" << m.atlasUV_R << "," << m.atlasUV_T << ")\n"
+              << "  Plane: (" << m.planeBound_L << "," << m.planeBound_B 
+              << ") to (" << m.planeBound_R << "," << m.planeBound_T << ")\n"
+              << "  Advance: " << m.advance << std::endl;
+    }
 
     // Update the projection matrix UBO
     VkBuffer uboBuffer;
@@ -702,25 +711,9 @@ void TextRenderer::createVertexBuffers(const VulkanDeviceContext& context) {
 }
 
 void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, VkImage image, VkDeviceMemory imageMemory, uint32_t width, uint32_t height, const std::string& path) {
-    // 1. Load image data from disk (using a library like stb_image)
+    // 1. Load image data from disk
     int texWidth, texHeight, texChannels;
-    // NOTE: This requires an external library (stb_image) or pre-processing.
     // Assuming your atlas is R8G8B8A8, 4 channels.
-    // For this implementation, we will use a placeholder data structure.
-    
-    // Placeholder data (e.g., a simple square)
-    // NOTE: Replace this with actual image loading logic (e.g., stb_image_load)
-    // size_t imageSize = width * height * 4;
-    // std::vector<uint8_t> pixels(imageSize, 0xFF); 
-    // // Example: make the top left 10x10 square red
-    // for (uint32_t y = 0; y < 10; y++) {
-    //     for (uint32_t x = 0; x < 10; x++) {
-    //         pixels[(y * width + x) * 4 + 0] = 0xFF; // R
-    //         pixels[(y * width + x) * 4 + 1] = 0x00; // G
-    //         pixels[(y * width + x) * 4 + 2] = 0x00; // B
-    //         pixels[(y * width + x) * 4 + 3] = 0xFF; // A
-    //     }
-    // }
 
     // Load the file and FORCE it to 4 channels
     stbi_uc* pixels = stbi_load(
@@ -731,9 +724,13 @@ void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, Vk
         STBI_rgb_alpha // <--- Forces 4 channels (RGBA)
     );
 
+    if (!pixels) {
+        printf("STBI FAILED: %s\n", stbi_failure_reason());
+        return;
+    }
+
     // If using STBI, the required memory size is simple:
     VkDeviceSize imageSize = texWidth * texHeight * 4;
-
 
     // 2. Create Staging Buffer
     VkBuffer stagingBuffer;
@@ -753,6 +750,7 @@ void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, Vk
     // 3. Copy image data to staging buffer
     // memcpy(data, pixels.data(), imageSize);
     memcpy(data, pixels, imageSize);
+    printf("size: %d\n", imageSize);
     vkUnmapMemory(context.device, stagingBufferMemory);
     
     // 4. Record and submit commands
@@ -847,9 +845,9 @@ void TextRenderer::addText(const std::string& text, float x, float y, float scal
 
         // --- Atlas UVs (Normalized 0.0 to 1.0) ---
         float u_left   = glyph.atlasUV_L;
-        float v_bottom = glyph.atlasUV_B;
+        float v_bottom = 1.0 - glyph.atlasUV_B;
         float u_right  = glyph.atlasUV_R;
-        float v_top    = glyph.atlasUV_T;
+        float v_top    = 1.0 - glyph.atlasUV_T;
 
         // Generate quad vertices (Two triangles forming a quad)
         // Vertices use the calculated screen coordinates and UVs:

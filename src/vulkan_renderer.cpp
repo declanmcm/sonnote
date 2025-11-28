@@ -107,9 +107,9 @@ void VulkanRenderer::drawFrame() {
 
     // Add multiple text strings (all text will be batched into a single draw call)
     textRenderer.addText(
-        "hello I am new", 
-        50.0f, 50.0f,          // x, y position (screen space)
-        100.0f,                 // scale
+        "I've gone and done it", 
+        100.0f, 100.0f,          // x, y position (screen space)
+        50.0f,                 // scale
         glm::vec4(1.0f, 0.5f, 0.0f, 1.0f), // Orange color (RGB A)
         cmd
     );
