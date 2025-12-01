@@ -1,11 +1,12 @@
 #version 450
 
 layout(location = 0) in vec2 fragUV;
+layout(location = 1) in vec4 fragColour;
+
 layout(location = 0) out vec4 outColor;
 
 layout(set = 0, binding = 1) uniform sampler2D atlas;
 layout(push_constant) uniform PushConstants {
-    vec4 color;
     float pixelRange; // This must be 4.0f
 } pc;
 
@@ -44,6 +45,5 @@ void main() {
     float alpha = smoothstep(-smoothing, smoothing, screen_px_distance);
 
     // 6. Final Output
-    outColor = vec4(pc.color.rgb, pc.color.a * alpha);
-    //outColor = vec4(texture(atlas, fragUV).rgb, 1.0);
+    outColor = vec4(fragColour.rgb, fragColour.a * alpha);
 }

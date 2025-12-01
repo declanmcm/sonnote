@@ -49,6 +49,7 @@ struct GlyphMetric {
 struct TextVertex {
     glm::vec2 pos; // Screen-space position
     glm::vec2 uv;  // Texture coordinate
+    glm::vec4 colour;
 };
 
 // --- Main Text Renderer Class ---
@@ -68,6 +69,8 @@ public:
     );
 
     void destroy();
+
+    void onResize(int w, int h);
 
     void beginTextSubmission(); // <-- MISSING DECLARATION FOR ERROR 
     void addText(

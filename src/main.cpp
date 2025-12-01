@@ -70,6 +70,15 @@ struct Rect {
     int function;
 };
 
+struct Button {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    const char* label;
+    bool hit;
+};
+
 struct CurrentBox {
     float x1;
     float y1;
@@ -81,7 +90,7 @@ struct CurrentBox {
 #define F_BORDER 1
 #define F_NOTE_WINDOW 2
 #define F_CONTROL_WINDOW 3
-#define F_ABSOLUTE 4
+#define F_BUTTON_CW 4
 
 #define NW_HEIGHT 0.75f
 
@@ -700,18 +709,26 @@ int main(int, char**)
     float noteX, noteY;
     noteX = noteY = -1.0f;
 
+    const char* buttonLabels[10];
+    buttonLabels[0] = "Test";
+    std::vector<Button> buttons;
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0]);
+
+
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
-    rects.push_back({8.0f, 20.0f, 60.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_ABSOLUTE});
+    rects.push_back({8.0f, 20.0f, 60.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
 
     bool running = true;
     bool playing = false;
     bool size_changed = false;
+    bool rerender = true;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            rerender = true;
             if (e.type == SDL_QUIT) running = false;
             if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
                 e.window.windowID == SDL_GetWindowID(window)) running = false;
@@ -722,10 +739,18 @@ int main(int, char**)
             if (e.type == SDL_MOUSEBUTTONDOWN) {
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+                float ax = e.button.x;
+                float ay = (float)dh - e.button.y;
                 float nx = e.button.x  / (float)dh;
                 float ny = ((float)dh - e.button.y) / (float)dh;
 
                 if (e.button.button == SDL_BUTTON_LEFT) {
+                    for (int i = 0; i < (int)buttons.size(); i++) {
+                        if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
+                            ay >= buttons[i].y1 && ay <= buttons[i].y2) {
+                            buttons[i].hit = true;
+                        }
+                    }
                 } else if (e.button.button == SDL_BUTTON_RIGHT) {
 
                 }
@@ -746,58 +771,75 @@ int main(int, char**)
             }
         }
 
+        // Process events
+        
+
         // Refer to notes for what was here
 
         // Clear vertex list and rebuild from rectangles
-        renderer.vertices.clear();
-        int dw, dh;
-        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
-         for (auto& r : rects) {
-            float x, y, w, h;
-            if (r.function == F_ABSOLUTE) {
-                // x is distance from left edge of control window
-                // y is distances from top edge of control window
-                x = r.x + (cw.x1 * dw);
-                y = (cw.y2 * dh) - r.y - r.h;
-                w = r.w;
-                h = r.h;
-            } else {
+        if (rerender) {
+            renderer.vertices.clear();
+            int dw, dh;
+            SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+            for (auto& r : rects) {
+                float x, y, w, h;
                 x = r.x * dw;
                 y = r.y * dh;
                 w = r.w * dw;
                 h = r.h * dh;
-            }
-            if (r.function == F_BORDER) {
-                x -= r.utility;
-                y -= r.utility;
-                w += r.utility * 2;
-                h += r.utility * 2;
-            } else if (r.function == F_MARGIN_PANEL || r.function == F_NOTE_WINDOW || r.function == F_CONTROL_WINDOW) {
-                x += r.utility;
-                y += r.utility;
-                w -= r.utility * 2;
-                h -= r.utility * 2;
-                if (size_changed) {
-                    if (r.function == F_NOTE_WINDOW) {
-                        nw.x1 = x / dw;
-                        nw.y1 = y / dh;
-                        nw.x2 = (x + w) / dw;
-                        nw.y2 = (y + h) / dh;
-                    } else if (r.function == F_CONTROL_WINDOW) {
-                        cw.x1 = x / dw;
-                        cw.y1 = y / dh;
-                        cw.x2 = (x + w) / dw;
-                        cw.y2 = (y + h) / dh;
-                    }
+                switch (r.function) {
+                    case F_BUTTON_CW: {
+                        // x is distance from left edge of control window
+                        // y is distances from top edge of control window
+                        x = r.x + (cw.x1 * dw);
+                        y = (cw.y2 * (int)dh) - r.y - r.h;
+                        printf("cw.y2: %f, dh: %d, r.y: %f, r.h: %f, x: %f, y: %f\n", cw.y2, dh, r.y, r.h, x, y);
+                        w = r.w;
+                        h = r.h;
+                        buttons[(int)r.utility].x1 = x;
+                        buttons[(int)r.utility].x2 = x + w;
+                        buttons[(int)r.utility].y1 = y;
+                        buttons[(int)r.utility].y2 = y + h;
+                        if (x >= 0.0f && y >= 0.0f)
+                        renderer.addText(buttons[(int)r.utility].label, x, y, 10.0f, glm::vec4(0.0f, 0.0f, 0.0f, 0.0f));
+                        break;
+                    } case F_BORDER:
+                        x -= r.utility;
+                        y -= r.utility;
+                        w += r.utility * 2;
+                        h += r.utility * 2;
+                        break;
+                    case F_MARGIN_PANEL:
+                    case F_NOTE_WINDOW:
+                    case F_CONTROL_WINDOW:
+                        x += r.utility;
+                        y += r.utility;
+                        w -= r.utility * 2;
+                        h -= r.utility * 2;
+                        if (size_changed) {
+                            if (r.function == F_NOTE_WINDOW) {
+                                nw.x1 = x / dw;
+                                nw.y1 = y / dh;
+                                nw.x2 = (x + w) / dw;
+                                nw.y2 = (y + h) / dh;
+                            } else if (r.function == F_CONTROL_WINDOW) {
+                                cw.x1 = x / dw;
+                                cw.y1 = y / dh;
+                                cw.x2 = (x + w) / dw;
+                                cw.y2 = (y + h) / dh;
+                            }
+                        }
+                        break;
                 }
+
+                renderer.addRect(x, y, w, h, r.r, r.g, r.b);
             }
 
-            renderer.addRect(x, y, w, h, r.r, r.g, r.b); 
+            renderer.updateVertexData();
+            renderer.drawFrame();
+            if (size_changed) size_changed = false;
+            rerender = false;
         }
-
-        renderer.updateVertexData();
-        renderer.drawFrame();
-        if (size_changed) size_changed = false;
     }
 
     engine.stop();

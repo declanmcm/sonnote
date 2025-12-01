@@ -57,6 +57,10 @@ VulkanRenderer::~VulkanRenderer() {
     vkDestroyCommandPool(device, commandPool, nullptr);
 }
 
+void VulkanRenderer::addText(const char* text, float x, float y, float scale, const glm::vec4& colour) {
+    texts.emplace_back(text, x, y, scale, colour);
+}
+
 void VulkanRenderer::drawFrame() {
     uint32_t imageIndex;
     vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
@@ -105,22 +109,17 @@ void VulkanRenderer::drawFrame() {
     // Begin staging all text strings
     textRenderer.beginTextSubmission(); 
 
-    // Add multiple text strings (all text will be batched into a single draw call)
-    textRenderer.addText(
-        "I've gone and done it", 
-        100.0f, 100.0f,          // x, y position (screen space)
-        50.0f,                 // scale
-        glm::vec4(1.0f, 0.5f, 0.0f, 1.0f), // Orange color (RGB A)
-        cmd
-    );
-    
-    // textRenderer.addText(
-    //     "FPS: 60", 
-    //     50.0f, 50.0f,
-    //     1.0f,
-    //     glm::vec4(0.0f, 1.0f, 0.0f, 1.0f), // Green color
-    //     cmd
-    // );
+    for (const auto& t : texts) {
+        printf("text: %s, x: %f, y: %f, size: %f", t.text, t.x, t.y, t.size);
+        // Add multiple text strings (all text will be batched into a single draw call)
+        textRenderer.addText(
+            t.text,
+            t.x, t.y,
+            t.size,
+            t.colour,
+            cmd
+        );
+    }
 
     // End submission, which updates the vertex buffer and issues the draw command(s)
     textRenderer.endTextSubmission(cmd);

@@ -378,6 +378,28 @@ TextRenderer::TextRenderer() {
 
 TextRenderer::~TextRenderer() {}
 
+void TextRenderer::onResize(int w, int h) {
+    m_projectionMatrix = glm::ortho(0.0f, (float)w, (float)h, 0.0f, -1.0f, 1.0f);
+
+    // Step 2: Map the UBO memory
+    void* data;
+    VkDeviceSize uboSize = sizeof(glm::mat4);
+    
+    // Remap the memory to get a host pointer. We map the entire buffer (0, uboSize).
+    // Note: Since you used HOST_COHERENT_BIT in init, you don't need to flush the memory.
+    if (vkMapMemory(m_device, m_uboMemory, 0, uboSize, 0, &data) != VK_SUCCESS) {
+        // Handle error if mapping fails
+        std::cerr << "Failed to map UBO memory for text renderer resize." << std::endl;
+        return;
+    }
+
+    // Step 3: Copy the new matrix data
+    memcpy(data, &m_projectionMatrix, uboSize);
+    
+    // Unmap the memory, making the changes visible to the GPU
+    vkUnmapMemory(m_device, m_uboMemory);
+}
+
 void TextRenderer::init(const VulkanDeviceContext& context, VkRenderPass renderPass, float screenWidth, float screenHeight, const std::string& fontAtlasImagePath, float msdfRange) {
     m_device = context.device;
     m_msdfRange = msdfRange;
@@ -582,7 +604,7 @@ void TextRenderer::createPipeline(VkRenderPass renderPass) {
     bindingDescription.stride = sizeof(TextVertex);
     bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+    std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
     // Position (location 0)
     attributeDescriptions[0].binding = 0;
     attributeDescriptions[0].location = 0;
@@ -593,6 +615,11 @@ void TextRenderer::createPipeline(VkRenderPass renderPass) {
     attributeDescriptions[1].location = 1;
     attributeDescriptions[1].format = VK_FORMAT_R32G32_SFLOAT;
     attributeDescriptions[1].offset = offsetof(TextVertex, uv);
+    // 2: Color (NEW)
+    attributeDescriptions[2].binding = 0;
+    attributeDescriptions[2].location = 2; // Must match 'layout(location=2)' in vertex shader
+    attributeDescriptions[2].format = VK_FORMAT_R32G32B32A32_SFLOAT; // vec4
+    attributeDescriptions[2].offset = offsetof(TextVertex, colour);
 
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -855,23 +882,23 @@ void TextRenderer::addText(const std::string& text, float x, float y, float scal
 
         // Triangle 1: Top-Left, Bottom-Left, Bottom-Right
         // (x_left, y_top), (u_left, v_top)
-        m_stagedVertices.push_back({{x_left, y_top}, {u_left, v_top}}); 
+        m_stagedVertices.push_back({{x_left, y_top}, {u_left, v_top}, color}); 
         
         // (x_left, y_bottom), (u_left, v_bottom)
-        m_stagedVertices.push_back({{x_left, y_bottom}, {u_left, v_bottom}}); 
+        m_stagedVertices.push_back({{x_left, y_bottom}, {u_left, v_bottom}, color}); 
         
         // (x_right, y_bottom), (u_right, v_bottom)
-        m_stagedVertices.push_back({{x_right, y_bottom}, {u_right, v_bottom}}); 
+        m_stagedVertices.push_back({{x_right, y_bottom}, {u_right, v_bottom}, color}); 
 
         // Triangle 2: Bottom-Right, Top-Right, Top-Left
         // (x_right, y_bottom), (u_right, v_bottom)
-        m_stagedVertices.push_back({{x_right, y_bottom}, {u_right, v_bottom}}); 
+        m_stagedVertices.push_back({{x_right, y_bottom}, {u_right, v_bottom}, color}); 
         
         // (x_right, y_top), (u_right, v_top)
-        m_stagedVertices.push_back({{x_right, y_top}, {u_right, v_top}}); 
+        m_stagedVertices.push_back({{x_right, y_top}, {u_right, v_top}, color}); 
         
         // (x_left, y_top), (u_left, v_top)
-        m_stagedVertices.push_back({{x_left, y_top}, {u_left, v_top}}); 
+        m_stagedVertices.push_back({{x_left, y_top}, {u_left, v_top}, color}); 
 
         // Advance cursor using the character's advance metric
         cursorX += glyph.advance * scale;
@@ -900,14 +927,12 @@ void TextRenderer::endTextSubmission(VkCommandBuffer commandBuffer) {
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
     
-    // // 5. Push Constants (for color and MSDF range)
-    // struct {
-    //     glm::vec4 color;
-    //     float range;
-    //     float p1, p2; // Padding
-    // } pushData;
-    // pushData.color = m_stagedVertices[0].pos.x < 0 ? glm::vec4(1.0f, 1.0f, 0.0f, 1.0f) : glm::vec4(1.0f, 1.0f, 1.0f, 1.0f); // Example Color
-    // pushData.range = m_msdfRange;
+    // 5. Push Constants (for color and MSDF range)
+    struct TextPushConstants {
+        float range;
+    };
+    TextPushConstants pushData;
+    pushData.range = m_msdfRange;
     
     // vkCmdPushConstants(
     //     commandBuffer,
@@ -918,24 +943,13 @@ void TextRenderer::endTextSubmission(VkCommandBuffer commandBuffer) {
     //     &pushData
     // );
 
-    // Set the required push constants (color + pixelRange)
-    struct TextPushConstants {
-        glm::vec4 color;
-        float pixelRange;
-    };
-    TextPushConstants pc = {
-        // Replace with your desired color (or pass it from addText)
-        glm::vec4(1.0f, 1.0f, 1.0f, 1.0f), 
-        4.0f // This should be the 4.0f stored from init
-    };
-
     vkCmdPushConstants(
         commandBuffer,
         m_pipelineLayout,
         VK_SHADER_STAGE_FRAGMENT_BIT, // Needs to be visible to the fragment shader
         0, 
         sizeof(TextPushConstants), 
-        &pc
+        &pushData
     );
 
     // 6. Draw command

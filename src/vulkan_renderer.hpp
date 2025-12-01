@@ -13,6 +13,14 @@
 #define WIDTH 800
 #define HEIGHT 600
 
+struct Text {
+    const char* text;
+    float x;
+    float y;
+    float size;
+    glm::vec4 colour;
+};
+
 struct Vertex {
     float pos[2];
     float color[3];
@@ -34,6 +42,8 @@ public:
     ~VulkanRenderer();
 
     void drawFrame();
+
+    void addText(const char* text, float x, float y, float scale, const glm::vec4& colour);
 
     std::vector<Vertex> vertices; 
     std::vector<uint16_t> indices;
@@ -67,6 +77,7 @@ public:
         // Get ACTUAL framebuffer size
         int dw, dh;
         SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+        textRenderer.onResize(dw, dh);
 
         windowWidth  = dw;
         windowHeight = dh;
@@ -128,6 +139,8 @@ private:
     VkCommandPool commandPool{};
     std::vector<VkCommandBuffer> commandBuffers;
     VkSemaphore imageAvailable{}, renderFinished{};
+
+    std::vector<Text> texts;
 
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
