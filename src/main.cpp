@@ -75,8 +75,9 @@ struct Button {
     float y1;
     float x2;
     float y2;
-    const char* label;
+    char* label;
     bool hit;
+    float value;
 };
 
 struct CurrentBox {
@@ -91,6 +92,7 @@ struct CurrentBox {
 #define F_NOTE_WINDOW 2
 #define F_CONTROL_WINDOW 3
 #define F_BUTTON_CW 4
+#define F_SLIDER_CW 5
 
 #define NW_HEIGHT 0.75f
 
@@ -709,17 +711,19 @@ int main(int, char**)
     float noteX, noteY;
     noteX = noteY = -1.0f;
 
-    const char* buttonLabels[10];
-    buttonLabels[0] = "Test";
+    char buttonLabels[2][32] = {"Export WAV", "BPM:          "};
     std::vector<Button> buttons;
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0]);
-
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
-    rects.push_back({8.0f, 20.0f, 60.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
+    // Export WAV button
+    rects.push_back({10.0f, 10.0f, 105.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
+    // BPM slider
+    rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 1.0f, F_SLIDER_CW});
 
     bool running = true;
     bool playing = false;
@@ -749,6 +753,7 @@ int main(int, char**)
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
                             buttons[i].hit = true;
+                            buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
                         }
                     }
                 } else if (e.button.button == SDL_BUTTON_RIGHT) {
@@ -783,17 +788,18 @@ int main(int, char**)
             SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
             for (auto& r : rects) {
                 float x, y, w, h;
+                float sliderPoint = -1.0f;
                 x = r.x * dw;
                 y = r.y * dh;
                 w = r.w * dw;
                 h = r.h * dh;
                 switch (r.function) {
+                    case F_SLIDER_CW:
                     case F_BUTTON_CW: {
                         // x is distance from left edge of control window
                         // y is distances from top edge of control window
                         x = r.x + (cw.x1 * dw);
                         y = (cw.y2 * (int)dh) - r.y - r.h;
-                        printf("cw.y2: %f, dh: %d, r.y: %f, r.h: %f, x: %f, y: %f\n", cw.y2, dh, r.y, r.h, x, y);
                         w = r.w;
                         h = r.h;
                         buttons[(int)r.utility].x1 = x;
@@ -801,7 +807,16 @@ int main(int, char**)
                         buttons[(int)r.utility].y1 = y;
                         buttons[(int)r.utility].y2 = y + h;
                         if (x >= 0.0f && y >= 0.0f)
-                        renderer.addText(buttons[(int)r.utility].label, x, y, 10.0f, glm::vec4(0.0f, 0.0f, 0.0f, 0.0f));
+                        if (r.function == F_SLIDER_CW) {
+                            sliderPoint = x + r.w * buttons[(int)r.utility].value;
+                            if (buttons[(int)r.utility].label[0] == 'B') {
+                                printf("hey");
+                                fflush(stdout);
+                                sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));
+                            }
+                        }
+                        renderer.addText(buttons[(int)r.utility].label, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+
                         break;
                     } case F_BORDER:
                         x -= r.utility;
@@ -833,6 +848,8 @@ int main(int, char**)
                 }
 
                 renderer.addRect(x, y, w, h, r.r, r.g, r.b);
+                if (sliderPoint != -1.0f)
+                    renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
             }
 
             renderer.updateVertexData();

@@ -110,7 +110,7 @@ void VulkanRenderer::drawFrame() {
     textRenderer.beginTextSubmission(); 
 
     for (const auto& t : texts) {
-        printf("text: %s, x: %f, y: %f, size: %f", t.text, t.x, t.y, t.size);
+        // printf("text: %s, x: %f, y: %f, size: %f", t.text, t.x, t.y, t.size);
         // Add multiple text strings (all text will be batched into a single draw call)
         textRenderer.addText(
             t.text,
@@ -120,6 +120,7 @@ void VulkanRenderer::drawFrame() {
             cmd
         );
     }
+    texts.clear();
 
     // End submission, which updates the vertex buffer and issues the draw command(s)
     textRenderer.endTextSubmission(cmd);
