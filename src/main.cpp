@@ -78,6 +78,7 @@ struct Button {
     char* label;
     bool hit;
     float value;
+    char* text;
 };
 
 struct CurrentBox {
@@ -93,6 +94,7 @@ struct CurrentBox {
 #define F_CONTROL_WINDOW 3
 #define F_BUTTON_CW 4
 #define F_SLIDER_CW 5
+#define F_TEXT_BOX_CW 6
 
 #define NW_HEIGHT 0.75f
 
@@ -711,10 +713,17 @@ int main(int, char**)
     float noteX, noteY;
     noteX = noteY = -1.0f;
 
-    char buttonLabels[2][32] = {"Export WAV", "BPM:          "};
+    char buttonLabels[8][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:"};
+    char texts[3][32] = {"              ", "              ", "              "};
     std::vector<Button> buttons;
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0]);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.0f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.0f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.2f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[7], false, 0.0f, texts[2]);
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
@@ -724,11 +733,20 @@ int main(int, char**)
     rects.push_back({10.0f, 10.0f, 105.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
     // BPM slider
     rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 1.0f, F_SLIDER_CW});
+    // Attack, decay, gain sliders
+    rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 2.0f, F_SLIDER_CW});
+    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 3.0f, F_SLIDER_CW});
+    rects.push_back({10.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
+    // WAV Save name, jump size, split size text boxes
+    rects.push_back({10.0f, 125.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
+    rects.push_back({10.0f, 160.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
+    rects.push_back({10.0f, 195.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
 
     bool running = true;
     bool playing = false;
     bool size_changed = false;
     bool rerender = true;
+    int selected = -1;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -741,6 +759,7 @@ int main(int, char**)
                 renderer.onResize(window);
             }
             if (e.type == SDL_MOUSEBUTTONDOWN) {
+                selected = -1;
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
                 float ax = e.button.x;
@@ -752,12 +771,28 @@ int main(int, char**)
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
+                            selected = i;
                             buttons[i].hit = true;
                             buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
                         }
                     }
                 } else if (e.button.button == SDL_BUTTON_RIGHT) {
 
+                }
+            }
+            if (e.type == SDL_KEYDOWN) {
+                char key = e.key.keysym.sym;
+                if (key == SDLK_ESCAPE) running = false;
+                else if (selected != -1) {
+                    if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
+                        if (buttons[selected].text[0] == ' ') {
+                            sprintf(buttons[selected].text, "%c", key); 
+                        } else
+                            sprintf(buttons[selected].text, "%s%c", buttons[selected].text, key);
+                    }
+                    else if ((key == 127 || key == 8) && strlen(buttons[selected].text) > 0) {
+                        buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
+                    }
                 }
             }
             if (e.type == SDL_MOUSEMOTION) {
@@ -793,8 +828,10 @@ int main(int, char**)
                 y = r.y * dh;
                 w = r.w * dw;
                 h = r.h * dh;
+                bool selection = false;
                 switch (r.function) {
                     case F_SLIDER_CW:
+                    case F_TEXT_BOX_CW:
                     case F_BUTTON_CW: {
                         // x is distance from left edge of control window
                         // y is distances from top edge of control window
@@ -806,17 +843,25 @@ int main(int, char**)
                         buttons[(int)r.utility].x2 = x + w;
                         buttons[(int)r.utility].y1 = y;
                         buttons[(int)r.utility].y2 = y + h;
-                        if (x >= 0.0f && y >= 0.0f)
                         if (r.function == F_SLIDER_CW) {
                             sliderPoint = x + r.w * buttons[(int)r.utility].value;
                             if (buttons[(int)r.utility].label[0] == 'B') {
-                                printf("hey");
-                                fflush(stdout);
                                 sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));
+                            } else if (buttons[(int)r.utility].label[0] == 'A') {
+                                sprintf(buttons[(int)r.utility].label, "Attack: %.3f", buttons[(int)r.utility].value * 2.98 + 0.02);
+                            } else if (buttons[(int)r.utility].label[0] == 'D') {
+                                sprintf(buttons[(int)r.utility].label, "Decay: %.3f", buttons[(int)r.utility].value * 2.98 + 0.02);
+                            } else if (buttons[(int)r.utility].label[0] == 'G') {
+                                sprintf(buttons[(int)r.utility].label, "Gain: %.3f", buttons[(int)r.utility].value * 5.0);
                             }
+                        } else if (r.function == F_TEXT_BOX_CW) {
+                            if (selected == (int)r.utility)
+                                selection = true;
+                            renderer.addText(buttons[(int)r.utility].label, x + 2, y + 19, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                            renderer.addText(buttons[(int)r.utility].text, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
                         }
-                        renderer.addText(buttons[(int)r.utility].label, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-
+                        if (r.function != F_TEXT_BOX_CW)
+                            renderer.addText(buttons[(int)r.utility].label, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
                         break;
                     } case F_BORDER:
                         x -= r.utility;
@@ -847,7 +892,10 @@ int main(int, char**)
                         break;
                 }
 
-                renderer.addRect(x, y, w, h, r.r, r.g, r.b);
+                if (!selection)
+                    renderer.addRect(x, y, w, h, r.r, r.g, r.b);
+                else
+                    renderer.addRect(x, y, w, h, 0.4f, 0.4f, 0.8f);
                 if (sliderPoint != -1.0f)
                     renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
             }
