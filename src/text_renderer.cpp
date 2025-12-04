@@ -85,8 +85,6 @@ void TextRenderer::loadGlyphMetrics(const std::string& jsonFilePath) {
 
         m_glyphMetrics[unicode] = metric;
     }
-    
-    std::cout << "Successfully loaded " << m_glyphMetrics.size() << " glyph metrics." << std::endl;
 }
 
 // --- Vulkan Utilities (adapted from VulkanRenderer patterns) ---
@@ -472,16 +470,6 @@ void TextRenderer::init(const VulkanDeviceContext& context, VkRenderPass renderP
     vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 
     loadGlyphMetrics("fonts/atlas_metrics.json");
-
-    if (m_glyphMetrics.find('A') != m_glyphMetrics.end()) {
-    auto& m = m_glyphMetrics['A'];
-    std::cout << "'A' metrics:\n"
-              << "  UV: (" << m.atlasUV_L << "," << m.atlasUV_B 
-              << ") to (" << m.atlasUV_R << "," << m.atlasUV_T << ")\n"
-              << "  Plane: (" << m.planeBound_L << "," << m.planeBound_B 
-              << ") to (" << m.planeBound_R << "," << m.planeBound_T << ")\n"
-              << "  Advance: " << m.advance << std::endl;
-    }
 
     // Update the projection matrix UBO
     VkBuffer uboBuffer;
