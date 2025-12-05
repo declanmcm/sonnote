@@ -62,6 +62,41 @@ public:
         vertices.insert(vertices.end(), {v0, v1, v2, v2, v3, v0});
     }
 
+    void addCircle(float cx, float cy, float radius, float r, float g, float b, int segments = 32) {
+        // Convert center & radius into NDC
+        float cx_ndc = (cx / windowWidth)  * 2.0f - 1.0f;
+        float cy_ndc = 1.0f - (cy / windowHeight) * 2.0f;
+
+        float rx_ndc = (radius / windowWidth)  * 2.0f;
+        float ry_ndc = (radius / windowHeight) * 2.0f;
+
+        // Center vertex
+        Vertex center = {{cx_ndc, cy_ndc}, {r, g, b}};
+
+        float step = 2.0f * M_PI / segments;
+
+        for (int i = 0; i < segments; i++) {
+            float a0 = i * step;
+            float a1 = (i + 1) * step;
+
+            float x0 = cx_ndc + cos(a0) * rx_ndc;
+            float y0 = cy_ndc + sin(a0) * ry_ndc;
+
+            float x1 = cx_ndc + cos(a1) * rx_ndc;
+            float y1 = cy_ndc + sin(a1) * ry_ndc;
+
+            Vertex v0 = center;
+            Vertex v1 = {{x0, y0}, {r, g, b}};
+            Vertex v2 = {{x1, y1}, {r, g, b}};
+
+            // Add triangle (center, v1, v2)
+            vertices.push_back(v0);
+            vertices.push_back(v1);
+            vertices.push_back(v2);
+        }
+    }
+
+
     void updateVertexData() {
         if (vertices.empty()) return;
         void* data;

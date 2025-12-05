@@ -895,10 +895,10 @@ struct Canvas2D {
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys) {
         // Reserve a canvas rect
         // Vec2 avail = ImGui::GetContentRegionAvail();
-        Vec2 topLeft  = { nw.x2, nw.y1};
+        Vec2 topLeft  = { nw.x1, nw.y2};
         topLeft.x = topLeft.x + 20;
         Vec2 size     = { std::abs(nw.x2 - nw.x1), std::abs(nw.y2 - nw.y1) };
-        Vec2 bottomRight = { nw.x1, nw.y2 };
+        Vec2 bottomRight = { nw.x2, nw.y1 };
 
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
@@ -959,8 +959,8 @@ struct Canvas2D {
         hover_valid = false;
         if (hovered) {
             Vec2 w = screenToWorld(topLeft, hover);
-            std::fflush(stdout);
             w.x = snap_split(w.x);
+            printf("x: %f. y: %f\n", w.x, w.y);
             if (snap_to_grid) {
                 w.y = snap(w.y, snap_y);
             } else if (snap_harmonics) {
@@ -994,8 +994,6 @@ struct Canvas2D {
                 }
                 w.y = closest;
             }
-            // printf("w.x: %f, w.y: %f\n", w.x, w.y);
-            std::fflush(stdout);
             hoverW = w;
             hover_valid = true;
         }
@@ -1382,7 +1380,9 @@ struct Canvas2D {
         // Light-red preview dot (when Snap is on and hovered)
         if ((snap_to_grid || snap_harmonics) && hover_valid) {
             Vec2 sd = worldToScreen(topLeft, hoverW);
+            printf("sd.x: %f, sd.y: %f\n", sd.x, sd.y);
             // dl->AddCircleFilled(sd, 5.0f, IM_COL32(255,120,120,200));
+            renderer.addCircle(sd.x, sd.y, 5.0f, 0.8f, 0.2f, 0.2f);
             if (dragging) {
                 Note n = currently_dragged;
                 float x0w = n.beat_on, x1w = n.beat_off;
@@ -1503,8 +1503,6 @@ int main(int, char**)
 
     CurrentBox nw;
     CurrentBox cw;
-    float noteX, noteY;
-    noteX = noteY = -1.0f;
 
     char buttonLabels[11][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:", "Export MIDI", "Save project", "Load project"};
     char texts[3][32] = {"              ", "              ", "              "};
@@ -1546,6 +1544,7 @@ int main(int, char**)
     bool rerender = true;
     int selected = -1;
     int bpm = 110;
+    Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
     while (running) {
         SDL_Event e;
@@ -1608,11 +1607,11 @@ int main(int, char**)
                 float ny = ((float)dh - e.button.y) / (float)dh;
                 
                 if (nx >= nw.x1 && nx <= nw.x2 && ny >= nw.y1 && ny <= nw.y2) {
-                    noteX = nx;
-                    noteY = ny;
+                    hover.x = nx;
+                    hover.y = ny;
                 } else {
-                    noteX = -1.0f;
-                    noteY = -1.0f;
+                    hover.x = -1.0f;
+                    hover.y = -1.0f;
                 }
             }
         }
@@ -1626,7 +1625,6 @@ int main(int, char**)
             if (!playing) {
                 // Build events from current points
                 uint32_t sr = 48000; // if you don’t have gDevice here, store it globally or pass it out
-                
 
                 auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, playhead_time);
                 engine.setEvents(ev);
@@ -1739,7 +1737,17 @@ int main(int, char**)
                     renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
             }
 
-            gBeatOctCanvas.draw(renderer, nw, {-1.0f, -1.0f}, 0, keys);
+            CurrentBox screenNw;
+            screenNw.x1 = nw.x1 * dw;
+            screenNw.x2 = nw.x2 * dw;
+            screenNw.y1 = nw.y1 * dh;
+            screenNw.y2 = nw.y2 * dh;
+
+            Vec2 screenHover;
+            screenHover.x = hover.x * dw;
+            screenHover.y = hover.y * dh;
+
+            gBeatOctCanvas.draw(renderer, screenNw, screenHover, 0, keys);
 
             renderer.updateVertexData();
             renderer.drawFrame();
