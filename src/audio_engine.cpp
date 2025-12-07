@@ -404,6 +404,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                             voiceIndex = 0; // steal voice 0
 
                         voiceFreqs[voiceIndex]  = ev.value;
+                        printf("ffffrrqq: %f\n", ev.value);
                         voicePhases[voiceIndex] = 0.0f;
                         voiceEnvs[voiceIndex]   = 0.0f;
                         voiceStates[voiceIndex] = 1;

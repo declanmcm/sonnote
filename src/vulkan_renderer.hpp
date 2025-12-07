@@ -308,7 +308,7 @@ private:
     }
 
     void createVertexBuffer() {
-        VkDeviceSize bufferSize = sizeof(Vertex) * 1000; // can hold many rectangles
+        VkDeviceSize bufferSize = sizeof(Vertex) * 100000; // can hold many rectangles
 
         VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufInfo.size = bufferSize;

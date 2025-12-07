@@ -712,13 +712,13 @@ struct Canvas2D {
         // y increases upward in world, downward on screen → invert with (y0 - y)
         printf("topLeft.x: %f, w.x: %f, x0: %f, sx: %f\n", topLeft.x, w.x, x0, sx);
         float sxp = topLeft.x + (w.x - x0) * sx;
-        float syp = topLeft.y + (y0 - w.y) * sy;
+        float syp = topLeft.y + (w.y - y0) * sy;
         return {sxp, syp};
     }
     // Transform: screen -> world
     Vec2 screenToWorld(Vec2 topLeft, Vec2 s) const {
         float wx = x0 + (s.x - topLeft.x) / sx;
-        float wy = y0 - (s.y - topLeft.y) / sy;
+        float wy = y0 + (s.y - topLeft.y) / sy;
         return {wx, wy};
     }
 
@@ -906,12 +906,15 @@ struct Canvas2D {
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
         // --- Panning with RMB drag ---
-        if (hovered && click == 2) {
+        if (hovered && click == 2 && std::abs(prevHover.x) > 1e-6) {
             Vec2 d = { hover.x - prevHover.x, hover.y - prevHover.y};
+            printf("prevHover: (%f, %f)\n", d.x, d.y);
             // Convert pixel delta → world delta
             x0 -= d.x / sx;
-            y0 += d.y / sy; // + because dragging down increases screen y but decreases world y
+            y0 -= d.y / sy; // + because dragging down increases screen y but decreases world y
         }
+
+        prevHover = hover;
 
         // Compute visible world rect
         Vec2 wA = screenToWorld(topLeft,      topLeft);
@@ -1002,7 +1005,7 @@ struct Canvas2D {
         }
 
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
-        if (hovered && containsKey(keys, 'l')) 
+        if (hovered && containsKey(keys, 'p')) 
             playhead_time = hoverW.x;
         else if (hovered && containsKey(keys, ' '))
             play_triggered_from_space = true;
@@ -1285,7 +1288,7 @@ struct Canvas2D {
             // // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 1, noteCol[0], noteCol[1], noteCol[2]);
+            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
 
             float tri_size = 6.0f;
             Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
@@ -1316,7 +1319,7 @@ struct Canvas2D {
             // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, focusCol[0], focusCol[1], focusCol[2]);
+            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, focusCol[0], focusCol[1], focusCol[2]);
             // dl->AddRect(rmin, rmax, IM_COL32(100,60,30,220), 6.0f, 0, 2.0f);
 
             // float tri_size = 6.0f;
@@ -1377,7 +1380,7 @@ struct Canvas2D {
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
             printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 1, 0.47, 0.47, 1.0);
+            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, 0.47, 0.47, 1.0);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
 
@@ -1552,7 +1555,6 @@ int main(int, char**)
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
     while (running) {
-        click = 0;
         SDL_Event e;
         keys.clear();
         while (SDL_PollEvent(&e)) {
@@ -1587,6 +1589,9 @@ int main(int, char**)
                     click = 2;
                 }
             }
+            if (e.type == SDL_MOUSEBUTTONUP) {
+                click = 0;
+            }
             if (e.type == SDL_KEYDOWN) {
                 char key = e.key.keysym.sym;
                 keys.push_back(key);
@@ -1602,9 +1607,7 @@ int main(int, char**)
                         buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
                     }
                 } else {
-                    if (key == ' ') {
-                        play_triggered_from_space = true;
-                    }
+
                 }
             }
             if (e.type == SDL_MOUSEMOTION) {
@@ -1634,6 +1637,7 @@ int main(int, char**)
                 uint32_t sr = 48000; // if you don’t have gDevice here, store it globally or pass it out
 
                 auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, playhead_time);
+                
                 engine.setEvents(ev);
                 engine.resetSampleCounter();
                 engine.setPlayState(true);
