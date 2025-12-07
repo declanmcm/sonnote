@@ -710,6 +710,7 @@ struct Canvas2D {
     // Transform: world -> screen
     Vec2 worldToScreen(Vec2 topLeft, Vec2 w) const {
         // y increases upward in world, downward on screen → invert with (y0 - y)
+        printf("topLeft.x: %f, w.x: %f, x0: %f, sx: %f\n", topLeft.x, w.x, x0, sx);
         float sxp = topLeft.x + (w.x - x0) * sx;
         float syp = topLeft.y + (y0 - w.y) * sy;
         return {sxp, syp};
@@ -767,7 +768,8 @@ struct Canvas2D {
             // printf("%f, ", points[i]);
         }
         // printf("\n\n");
-        float distance = 9.0;
+        printf("v: %f\n", v);
+        float distance = 99.0;
         float closest = std::floor(v);
         for (int i = 0; i < (int)points.size(); i++) {
             if (std::abs(points[i] - v) < distance) {
@@ -779,33 +781,33 @@ struct Canvas2D {
     }
 
     void drawRhythmLine(Vec2 s0, VulkanRenderer& renderer, std::vector<int>& divisions) {
-        // renderer.addRect({s0.x, s0.y + 10}, {s0.x, s0.y - 10}, IM_COL32(120,120,160,255), 1.0f);
-        // if ((int)divisions.size() > 1) {
-        //     switch (divisions.back()) {
-        //         case 8:
-        //             renderer.addRect({s0.x - 3, s0.y - 16}, {s0.x + 3, s0.y - 16}, IM_COL32(120,120,160,255), 1.0f);
-        //         case 4:
-        //             renderer.addRect({s0.x - 3, s0.y - 13}, {s0.x + 3, s0.y - 13}, IM_COL32(120,120,160,255), 1.0f);
-        //         case 2:
-        //             renderer.addRect({s0.x - 3, s0.y - 10}, {s0.x + 3, s0.y - 10}, IM_COL32(120,120,160,255), 1.0f);
-        //             break;
-        //         case 3:
-        //             renderer.addRect({s0.x - 3, s0.y - 11}, {s0.x + 3, s0.y - 9}, IM_COL32(120,120,160,255), 1.0f);
-        //             break;
-        //         case 5:
-        //             renderer.addRect({s0.x - 3, s0.y - 12}, {s0.x, s0.y - 10}, IM_COL32(120,120,160,255), 1.0f);
-        //             renderer.addRect({s0.x + 3, s0.y - 12}, {s0.x, s0.y - 10}, IM_COL32(120,120,160,255), 1.0f);
-        //             break;
-        //         case 7:
-        //             renderer.addRect({s0.x + 3, s0.y - 10}, {s0.x, s0.y - 12}, IM_COL32(120,120,160,255), 1.0f);
-        //             renderer.addRect({s0.x - 3, s0.y - 10}, {s0.x, s0.y - 12}, IM_COL32(120,120,160,255), 1.0f);
-        //             break;
-        //         case 6:
-        //             renderer.addRect({s0.x - 3, s0.y - 12}, {s0.x + 3, s0.y - 8}, IM_COL32(120,120,160,255), 1.0f);
-        //             renderer.addRect({s0.x - 3, s0.y - 8}, {s0.x + 3, s0.y - 12}, IM_COL32(120,120,160,255), 1.0f);
-        //             break;
-        //     }
-        // }
+        renderer.addRect(s0.x, s0.y - 10, 1, 20, 0.47, 0.47, 0.63);
+        if ((int)divisions.size() > 1) {
+            switch (divisions.back()) {
+                case 8:
+                    renderer.addRect(s0.x - 3, s0.y - 16, 6, 32, 0.47, 0.47, 0.63);
+                case 4:
+                    renderer.addRect(s0.x - 3, s0.y - 13, 6, 1, 0.47, 0.47, 0.63);
+                case 2:
+                    renderer.addRect(s0.x - 3, s0.y - 10, 6, 1, 0.47, 0.47, 0.63);
+                    break;
+                case 3:
+                    renderer.addRect(s0.x - 3, s0.y - 11, 6, 2, 0.47, 0.47, 0.63);
+                    break;
+                case 5:
+                    renderer.addRect(s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    renderer.addRect(s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    break;
+                case 7:
+                    renderer.addRect(s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    renderer.addRect(s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    break;
+                case 6:
+                    renderer.addRect(s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
+                    renderer.addRect(s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
+                    break;
+            }
+        }
     }
 
     void drawRhythmLines(TreeNode* current, const std::vector<Note>& sortedStart, const std::vector<Note>& sortedEnd, \
@@ -896,9 +898,10 @@ struct Canvas2D {
         // Reserve a canvas rect
         // Vec2 avail = ImGui::GetContentRegionAvail();
         Vec2 topLeft  = { nw.x1, nw.y2};
-        topLeft.x = topLeft.x + 20;
+        printf("\n\ntopLeft: (%f, %f)\n", topLeft.x, topLeft.y);
         Vec2 size     = { std::abs(nw.x2 - nw.x1), std::abs(nw.y2 - nw.y1) };
         Vec2 bottomRight = { nw.x2, nw.y1 };
+        printf("bottomRight: (%f, %f)\n", bottomRight.x, bottomRight.y);
 
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
@@ -953,6 +956,7 @@ struct Canvas2D {
 
         // Draw playhead
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
+        printf("s0.x: %f\n", s0.x);
         renderer.addRect(s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         // Hover snapped position (for preview dot / rubber band)
@@ -960,7 +964,6 @@ struct Canvas2D {
         if (hovered) {
             Vec2 w = screenToWorld(topLeft, hover);
             w.x = snap_split(w.x);
-            printf("x: %f. y: %f\n", w.x, w.y);
             if (snap_to_grid) {
                 w.y = snap(w.y, snap_y);
             } else if (snap_harmonics) {
@@ -1282,7 +1285,7 @@ struct Canvas2D {
             // // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, noteCol[0], noteCol[1], noteCol[2]);
+            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 1, noteCol[0], noteCol[1], noteCol[2]);
 
             float tri_size = 6.0f;
             Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
@@ -1373,7 +1376,8 @@ struct Canvas2D {
             // renderer.addRect({a.x, a.y}, {b.x, a.y}, noteCol);
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.47, 0.47, 1.0);
+            printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
+            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 1, 0.47, 0.47, 1.0);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
 
@@ -1544,9 +1548,11 @@ int main(int, char**)
     bool rerender = true;
     int selected = -1;
     int bpm = 110;
+    int click = 0;
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
     while (running) {
+        click = 0;
         SDL_Event e;
         keys.clear();
         while (SDL_PollEvent(&e)) {
@@ -1568,6 +1574,7 @@ int main(int, char**)
                 float ny = ((float)dh - e.button.y) / (float)dh;
 
                 if (e.button.button == SDL_BUTTON_LEFT) {
+                    click = 1;
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
@@ -1577,7 +1584,7 @@ int main(int, char**)
                         }
                     }
                 } else if (e.button.button == SDL_BUTTON_RIGHT) {
-
+                    click = 2;
                 }
             }
             if (e.type == SDL_KEYDOWN) {
@@ -1603,7 +1610,7 @@ int main(int, char**)
             if (e.type == SDL_MOUSEMOTION) {
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
-                float nx = e.button.x  / (float)dh;
+                float nx = e.button.x  / (float)dw;
                 float ny = ((float)dh - e.button.y) / (float)dh;
                 
                 if (nx >= nw.x1 && nx <= nw.x2 && ny >= nw.y1 && ny <= nw.y2) {
@@ -1747,7 +1754,7 @@ int main(int, char**)
             screenHover.x = hover.x * dw;
             screenHover.y = hover.y * dh;
 
-            gBeatOctCanvas.draw(renderer, screenNw, screenHover, 0, keys);
+            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys);
 
             renderer.updateVertexData();
             renderer.drawFrame();
