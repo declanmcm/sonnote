@@ -97,6 +97,6 @@ endif()
 
 # Optional: stricter warnings for your code (not third-party)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic -g)
 endif()
 

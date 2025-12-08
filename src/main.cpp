@@ -679,6 +679,8 @@ bool find_division(TreeNode* current, int split, float current_start, float curr
     }
 }
 
+char texts[3][32] = {"file.wav", "              ", "              "};
+
 struct Canvas2D {
     // World-space units
     // x = beats, y = octaves (increasing upward)
@@ -710,7 +712,6 @@ struct Canvas2D {
     // Transform: world -> screen
     Vec2 worldToScreen(Vec2 topLeft, Vec2 w) const {
         // y increases upward in world, downward on screen → invert with (y0 - y)
-        printf("topLeft.x: %f, w.x: %f, x0: %f, sx: %f\n", topLeft.x, w.x, x0, sx);
         float sxp = topLeft.x + (w.x - x0) * sx;
         float syp = topLeft.y + (w.y - y0) * sy;
         return {sxp, syp};
@@ -768,7 +769,6 @@ struct Canvas2D {
             // printf("%f, ", points[i]);
         }
         // printf("\n\n");
-        printf("v: %f\n", v);
         float distance = 99.0;
         float closest = std::floor(v);
         for (int i = 0; i < (int)points.size(); i++) {
@@ -810,6 +810,7 @@ struct Canvas2D {
         }
     }
 
+    // divisions holds the list of recursive split sizes
     void drawRhythmLines(TreeNode* current, const std::vector<Note>& sortedStart, const std::vector<Note>& sortedEnd, \
         float start, float end, std::vector<int> divisions, std::vector<float>& currently_held, Vec2 topLeft, VulkanRenderer& renderer) {
         // printf("start\n");
@@ -817,27 +818,33 @@ struct Canvas2D {
         int latest_starti = 0;
         int latest_endi = 0;
         // printf("start: %f, end: %f, beat_size %f, divisions: %d\n", start, end, beat_size, divisions.back());
+        // Currently dealing with the last-appended number to divisions - the current number to split into
         for (int i = 0; i < divisions.back() + 1; i++) {
             float current_beat = start + i * beat_size;
-            // printf("current_beat: %f\n", current_beat);
             int starti = latest_starti;
             int endi = latest_endi;
-            if ((int)sortedStart.size() > 0 && !((int)divisions.size() > 1 && i == 0) && !((int)divisions.size() > 1 && i == divisions.back())) {
+            // Only draw a line if there is a note playing, keep track of playing notes to perform averages
+            // Only draw lines in the middles if these are subdivisions
+            if ((int)sortedStart.size() > 0 && ((int)divisions.size() == 1 || (i != 0 && i != divisions.back()))) {
                 // printf("endi: %d, sEndsize:%d, sEndBeat_OFF: %f\n", endi, (int)sortedEnd.size(), sortedEnd[endi].beat_off);
-                while (sortedStart[starti].beat_on < current_beat)
+                if (starti >= (int)sortedStart.size()) {
+                    printf("ISSUE: starti: %d, latest_starti: %d\n", starti, latest_starti);
+                }
+                // Setup start and end indexes to line up with the next note event we'll encounter (purely an optimisation)
+                while (starti < (int)sortedStart.size() && sortedStart[starti].beat_on < current_beat)
                     starti++;
-                while (sortedEnd[endi].beat_off < current_beat)
+                while (endi < (int)sortedEnd.size() && sortedEnd[endi].beat_off < current_beat)
                     endi++;
-                if ((starti < (int)sortedStart.size() && sortedStart[starti].beat_on == current_beat) || (endi < (int)sortedEnd.size() && sortedEnd[endi].beat_off == current_beat)) {
-                    while (starti < (int)sortedStart.size() && sortedStart[starti].beat_on == current_beat) {
-                        // printf("adding: %f\n", sortedStart[starti].octave);
+                // If this is true, a note is starting or ending on current_beat, we must keep track of this for the average
+                if ((starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) || (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6)) {
+                    while (starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) {
                         currently_held.push_back(sortedStart[starti].octave);
                         Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedStart[starti].octave });
                         drawRhythmLine(s0, renderer, divisions);
                         latest_starti = starti;
                         starti++;
                     }
-                    while (endi < (int)sortedEnd.size() && sortedEnd[endi].beat_off == current_beat) {
+                    while (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6) {
                         std::vector<float> newList;
                         for (int j = 0; j < (int)currently_held.size(); j++) {
                             // printf("diff: %f\n", std::abs(currently_held[j] - sortedEnd[endi].octave));
@@ -855,6 +862,7 @@ struct Canvas2D {
                         endi++;
                     }
                 } else if ((int)currently_held.size() != 0) {
+                    // If there are notes held but no note events occur on current_beat, take an average and place the marker between them
                     float avg = 0.0f;
                     for (int i = 0; i < (int)currently_held.size(); i++) {
                         avg += currently_held[i];
@@ -894,21 +902,18 @@ struct Canvas2D {
         return false;
     }
 
-    void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys) {
+    void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split) {
         // Reserve a canvas rect
         // Vec2 avail = ImGui::GetContentRegionAvail();
         Vec2 topLeft  = { nw.x1, nw.y2};
-        printf("\n\ntopLeft: (%f, %f)\n", topLeft.x, topLeft.y);
         Vec2 size     = { std::abs(nw.x2 - nw.x1), std::abs(nw.y2 - nw.y1) };
         Vec2 bottomRight = { nw.x2, nw.y1 };
-        printf("bottomRight: (%f, %f)\n", bottomRight.x, bottomRight.y);
 
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
         // --- Panning with RMB drag ---
         if (hovered && click == 2 && std::abs(prevHover.x) > 1e-6) {
             Vec2 d = { hover.x - prevHover.x, hover.y - prevHover.y};
-            printf("prevHover: (%f, %f)\n", d.x, d.y);
             // Convert pixel delta → world delta
             x0 -= d.x / sx;
             y0 -= d.y / sy; // + because dragging down increases screen y but decreases world y
@@ -959,7 +964,6 @@ struct Canvas2D {
 
         // Draw playhead
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
-        printf("s0.x: %f\n", s0.x);
         renderer.addRect(s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         // Hover snapped position (for preview dot / rubber band)
@@ -1010,7 +1014,7 @@ struct Canvas2D {
         else if (hovered && containsKey(keys, ' '))
             play_triggered_from_space = true;
 
-        if (hovered && (containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'f') || containsKey(keys, 's'))) {
+        if (hovered && (containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'j') || containsKey(keys, 's'))) {
             // Find closest note and side of note (start or end)
             if ((int)notes.size() > 0) {
                 Note closest = notes[0];
@@ -1026,6 +1030,7 @@ struct Canvas2D {
                         index = i;
                     } 
                 }
+
                 if (match_found) {
                     // Drag start or end of note
                     if (containsKey(keys, 'l')) {
@@ -1044,6 +1049,7 @@ struct Canvas2D {
                     } else {
                         if (containsKey(keys, 'j')) {
                             // Jump up by the written amount
+                            printf("text: %s, res: %f\n", jump, parseDivisor(jump));
                             notes[index].octave = notes[index].octave + (std::log2(parseDivisor(jump)));
                         } else if (containsKey(keys, 's')) {
                             std::fflush(stdout);
@@ -1379,7 +1385,7 @@ struct Canvas2D {
             // renderer.addRect({a.x, a.y}, {b.x, a.y}, noteCol);
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
+            // printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
             renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, 0.47, 0.47, 1.0);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
@@ -1387,7 +1393,6 @@ struct Canvas2D {
         // Light-red preview dot (when Snap is on and hovered)
         if ((snap_to_grid || snap_harmonics) && hover_valid) {
             Vec2 sd = worldToScreen(topLeft, hoverW);
-            printf("sd.x: %f, sd.y: %f\n", sd.x, sd.y);
             // dl->AddCircleFilled(sd, 5.0f, IM_COL32(255,120,120,200));
             renderer.addCircle(sd.x, sd.y, 5.0f, 0.8f, 0.2f, 0.2f);
             if (dragging) {
@@ -1512,7 +1517,6 @@ int main(int, char**)
     CurrentBox cw;
 
     char buttonLabels[11][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:", "Export MIDI", "Save project", "Load project"};
-    char texts[3][32] = {"              ", "              ", "              "};
     std::vector<Button> buttons;
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
@@ -1583,6 +1587,13 @@ int main(int, char**)
                             selected = i;
                             buttons[i].hit = true;
                             buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
+                            if (selected == 1) {
+                                engine.setTempo(buttons[1].value);
+                            } else if (selected == 2 || selected == 3) {
+                                engine.setADSR({buttons[2].value, buttons[3].value});
+                            } else if (selected == 4) {
+                                engine.setGain(buttons[4].value);
+                            }
                         }
                     }
                 } else if (e.button.button == SDL_BUTTON_RIGHT) {
@@ -1597,7 +1608,8 @@ int main(int, char**)
                 keys.push_back(key);
                 if (key == SDLK_ESCAPE) running = false;
                 else if (selected != -1) {
-                    if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
+
+                    if (key >= 32 && key <= 126 && (selected == 5 || selected == 6 || selected == 7) && strlen(buttons[selected].text) <= 14) {
                         if (buttons[selected].text[0] == ' ') {
                             sprintf(buttons[selected].text, "%c", key); 
                         } else
@@ -1645,6 +1657,10 @@ int main(int, char**)
                 engine.setPlayState(false);
             }
             playing = !playing;
+        }
+
+        if (buttons[0].hit) {
+            engine.exportWav(buttons[5].text, 10.0f);
         }
 
         if (buttons[8].hit) { // if export midi button is pressed
@@ -1758,7 +1774,7 @@ int main(int, char**)
             screenHover.x = hover.x * dw;
             screenHover.y = hover.y * dh;
 
-            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys);
+            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text);
 
             renderer.updateVertexData();
             renderer.drawFrame();

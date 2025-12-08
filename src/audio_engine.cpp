@@ -490,7 +490,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 divisorSmooth = (float)activeCount;
             }
 
-            s /= divisorSmooth;
+            // s /= divisorSmooth;
         } else {
             divisorSmooth = 1.0f;
         }
@@ -576,46 +576,36 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
         // --- Sequencer / Event triggering ---
         double beat = double(sc) / samplesPerBeat;
 
-        while (true) {
+        while (evIndex < events.size() && events[evIndex].beat <= beat) {
             const SeqEvent& ev = events[evIndex];
 
-            if (beat >= ev.beat) {
-                if (ev.type == 1) {
-                    // NOTE ON: find free voice
-                    size_t v = MAX_VOICES;
-                    for (size_t k = 0; k < MAX_VOICES; ++k) {
-                        if (state[k] == 0) { v = k; break; }
-                    }
-                    if (v == MAX_VOICES) v = 0; // steal voice 0
+            if (ev.type == 1) {
+                // NOTE ON: find free voice
+                size_t v = MAX_VOICES;
+                for (size_t k = 0; k < MAX_VOICES; ++k) {
+                    if (state[k] == 0) { v = k; break; }
+                }
+                if (v == MAX_VOICES) v = 0; // steal voice 0
 
-                    freq[v]  = ev.value;
-                    phase[v] = 0.0f;
-                    env[v]   = 0.0f;
-                    state[v] = 1; // attack
-                } else {
-                    // NOTE OFF: release matching voice
-                    for (size_t k = 0; k < MAX_VOICES; ++k) {
-                        if (state[k] != 0 &&
-                            fabsf(freq[k] - ev.value) < 1e-4f &&
-                            state[k] != 3)
-                        {
-                            state[k] = 3; // release
-                            break;
-                        }
+                freq[v]  = ev.value;
+                phase[v] = 0.0f;
+                env[v]   = 0.0f;
+                state[v] = 1; // attack
+            } else {
+                // NOTE OFF: release matching voice
+                for (size_t k = 0; k < MAX_VOICES; ++k) {
+                    if (state[k] != 0 &&
+                        fabsf(freq[k] - ev.value) < 1e-4f &&
+                        state[k] != 3)
+                    {
+                        state[k] = 3; // release
+                        break;
                     }
                 }
+            }
 
-                // advance to next event
-                evIndex++;
-                if (evIndex >= events.size())
-                    evIndex = 0;
-
-                const SeqEvent& nextEv = events[evIndex];
-                if (nextEv.beat > beat)
-                    break;
-                // else we continue the while loop and trigger more past-due events
-            } 
-            else break;
+            // advance to next event
+            evIndex++;
         }
 
         // --- Polyphonic synthesis ---
@@ -673,7 +663,7 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
             } else {
                 divisorSmooth = (float)activeVoices;
             }
-            mix /= divisorSmooth;
+            // mix /= divisorSmooth;
         } else {
             divisorSmooth = 1.0f;
         }
