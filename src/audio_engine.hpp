@@ -71,7 +71,8 @@ enum class MessageType {
     ResetSampleCounter,
     SetADSR,
     SetWaveform,
-    SetTempo
+    SetTempo,
+    Freeze,
 };
 
 struct Message {
@@ -154,8 +155,9 @@ public:
     void setPlayState(bool on);
     void setWaveform(WaveformType type);
     void setTempo(float bpm);
-
+    void toggleFreeze();
     void setADSR(const ADSRParams& a);
+
 
     // Replace the entire event list
     // (Audio thread uses double-buffer swap)

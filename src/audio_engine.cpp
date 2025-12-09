@@ -33,6 +33,7 @@ AudioEngine::~AudioEngine() {
     munlockall();
 }
 
+bool freeze = false;
 
 
 // ======================================================
@@ -190,6 +191,10 @@ void AudioEngine::setADSR(const ADSRParams& a) {
     messageQueue.push(m);
 }
 
+void AudioEngine::toggleFreeze() {
+    freeze = !freeze;
+}
+
 void AudioEngine::setEvents(const std::vector<SeqEvent>& newEvents) {
     // Allocate vector on control thread to avoid RT alloc
     auto* v = new std::vector<SeqEvent>(newEvents);
@@ -235,6 +240,10 @@ void AudioEngine::applyMessages() {
 
         case MessageType::SetADSR:
             adsr = msg.adsr;
+            break;
+
+        case MessageType::Freeze:
+            freeze = true;
             break;
 
         case MessageType::ResetSampleCounter:
@@ -364,7 +373,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         currentBeat = double(sampleCounter) / samplesPerBeat;
 
         // Trigger all events whose beat <= current beat (looping)
-        if (!activeEvents.empty()) {
+        if (!activeEvents.empty() && !freeze) {
 
             // double lastBeat = currentBeat;
             // currentBeat = beat;  // update for envelope or external code, if needed
@@ -376,11 +385,6 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             if (currentBeat < lastBeat) {
                 nextEventIndex = 0;
             }
-            if (nextEventIndex < count &&
-                activeEvents[nextEventIndex].beat <= currentBeat) {
-                    printf("w\n");
-                    printf("nextEventIndex: %d, next event's beat: %f\n", nextEventIndex, activeEvents[nextEventIndex].beat);
-                }
 
             // Consume events while currentBeat passes their beat positions
             while (nextEventIndex < count &&
@@ -390,7 +394,6 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
                 // Only trigger if we *passed* this beat within this audio block
                 if (ev.beat > lastBeat && ev.beat <= currentBeat) {
-                    printf("beat: %f, lastBeat: %f, currentBeat: %f\n", ev.beat, lastBeat, currentBeat);
                     if (ev.type == 1) {
                         // NOTE ON
                         size_t voiceIndex = MAX_VOICES;
@@ -404,7 +407,6 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                             voiceIndex = 0; // steal voice 0
 
                         voiceFreqs[voiceIndex]  = ev.value;
-                        printf("ffffrrqq: %f\n", ev.value);
                         voicePhases[voiceIndex] = 0.0f;
                         voiceEnvs[voiceIndex]   = 0.0f;
                         voiceStates[voiceIndex] = 1;
@@ -505,7 +507,8 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         outL[i] = s;
         outR[i] = s;
 
-        sampleCounter++;
+        if (!freeze)
+            sampleCounter++;
     }
 }
 

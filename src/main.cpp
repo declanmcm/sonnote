@@ -584,19 +584,21 @@ static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& no
         double boff = n.beat_off - playhead_time;
         if (boff <= bon || boff < 0.0f) continue;
         if (bon < 0) bon = 0.0f;
+        if (std::abs(bon - boff) < 1e-6) continue;
 
         SeqEvent e1;
         e1.type = 1;
-        e1.beat  = n.beat_on;
+        e1.beat  = bon;
         e1.value       = c4 * std::pow(2.0f, n.octave - 4.0f);
         ev.push_back(e1);
         SeqEvent e2;
         e2.type = 0;
-        e2.beat = n.beat_off; // exclusive
+        e2.beat = boff; // exclusive
         e2.value = c4 * std::pow(2.0f, n.octave - 4.0f);
         ev.push_back(e2);
         std::fflush(stdout);
     }
+    printf("length: %d\n", (int)ev.size());
     return ev;
 }
 
@@ -679,7 +681,62 @@ bool find_division(TreeNode* current, int split, float current_start, float curr
     }
 }
 
+// Compute greatest common divisor
+int gcd(int a, int b) {
+    return b == 0 ? std::abs(a) : gcd(b, a % b);
+}
+
+// Convert float to simplified fraction
+void floatToFraction(float value, int& num, int& den, int maxDen = 10000) {
+    // Handle sign
+    bool negative = value < 0;
+    value = std::fabs(value);
+
+    // Integer part
+    int intPart = static_cast<int>(value);
+    float fracPart = value - intPart;
+
+    if (fracPart == 0.0f) {
+        num = intPart;
+        den = 1;
+        if (negative) num = -num;
+        return;
+    }
+
+    // Continued fraction algorithm
+    float x = fracPart;
+    int prevNum = 0, prevDen = 1;
+    num = 1; den = 0;
+
+    while (true) {
+        int a = static_cast<int>(x);
+        int tempNum = num, tempDen = den;
+        num = a * num + prevNum;
+        den = a * den + prevDen;
+
+        if (den > maxDen) break;
+
+        float approx = static_cast<float>(num) / den;
+        if (std::fabs(approx - fracPart) < 1e-6f) break;
+
+        prevNum = tempNum;
+        prevDen = tempDen;
+        x = 1.0f / (x - a);
+    }
+
+    num = intPart * den + num;
+    if (negative) num = -num;
+
+    // Simplify
+    int g = gcd(num, den);
+    num /= g;
+    den /= g;
+}
+
+
+
 char texts[3][32] = {"file.wav", "              ", "              "};
+char originText[64];
 
 struct Canvas2D {
     // World-space units
@@ -708,6 +765,41 @@ struct Canvas2D {
 
     bool hover_valid = false;
     Vec2 hoverW{0,0};
+
+    void addCanvasRect(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float rx, float ry, float rw, float rh, float r, float g, float b) {
+        float x = rx;
+        float y = ry;
+        float w = rw;
+        float h = rh;
+
+        if (x + w < topLeft.x || x > bottomRight.x || y + h < bottomRight.y || y > topLeft.y) {
+            return;
+        }
+
+        if (x < topLeft.x) {
+            x = topLeft.x;
+        } else if (x > bottomRight.x) {
+            x = bottomRight.x;
+        }
+        if (y < bottomRight.y) {
+            y = bottomRight.y;
+        } else if (y > topLeft.y) {
+            y = topLeft.y;
+        }
+        if (x + w > bottomRight.x) {
+            w = std::abs(x  - bottomRight.x);
+        } else if (std::abs(x - rx) > 1e-6) {
+            w -= std::abs(x - rx);
+        }
+        if (y + h > topLeft.y) {
+            h = std::abs(topLeft.y - y);
+        } else if (std::abs(x - ry) > 1e-6) {
+            h -= std::abs(y - ry);
+        }
+        if (w != 0 && h != 0) {
+            renderer.addRect(x, y, w, h, r, g, b);
+        }
+    }
 
     // Transform: world -> screen
     Vec2 worldToScreen(Vec2 topLeft, Vec2 w) const {
@@ -780,31 +872,31 @@ struct Canvas2D {
         return closest;
     }
 
-    void drawRhythmLine(Vec2 s0, VulkanRenderer& renderer, std::vector<int>& divisions) {
-        renderer.addRect(s0.x, s0.y - 10, 1, 20, 0.47, 0.47, 0.63);
+    void drawRhythmLine(Vec2 s0, VulkanRenderer& renderer, std::vector<int>& divisions, Vec2 topLeft, Vec2 bottomRight) {
+        addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 10, 1, 20, 0.47, 0.47, 0.63);
         if ((int)divisions.size() > 1) {
             switch (divisions.back()) {
                 case 8:
-                    renderer.addRect(s0.x - 3, s0.y - 16, 6, 32, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 16, 6, 32, 0.47, 0.47, 0.63);
                 case 4:
-                    renderer.addRect(s0.x - 3, s0.y - 13, 6, 1, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 13, 6, 1, 0.47, 0.47, 0.63);
                 case 2:
-                    renderer.addRect(s0.x - 3, s0.y - 10, 6, 1, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 10, 6, 1, 0.47, 0.47, 0.63);
                     break;
                 case 3:
-                    renderer.addRect(s0.x - 3, s0.y - 11, 6, 2, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 11, 6, 2, 0.47, 0.47, 0.63);
                     break;
                 case 5:
-                    renderer.addRect(s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    renderer.addRect(s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
                     break;
                 case 7:
-                    renderer.addRect(s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    renderer.addRect(s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
                     break;
                 case 6:
-                    renderer.addRect(s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
-                    renderer.addRect(s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
+                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
                     break;
             }
         }
@@ -812,7 +904,7 @@ struct Canvas2D {
 
     // divisions holds the list of recursive split sizes
     void drawRhythmLines(TreeNode* current, const std::vector<Note>& sortedStart, const std::vector<Note>& sortedEnd, \
-        float start, float end, std::vector<int> divisions, std::vector<float>& currently_held, Vec2 topLeft, VulkanRenderer& renderer) {
+        float start, float end, std::vector<int> divisions, std::vector<float>& currently_held, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
         // printf("start\n");
         float beat_size = std::abs(end - start) / divisions.back();
         int latest_starti = 0;
@@ -840,7 +932,7 @@ struct Canvas2D {
                     while (starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) {
                         currently_held.push_back(sortedStart[starti].octave);
                         Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedStart[starti].octave });
-                        drawRhythmLine(s0, renderer, divisions);
+                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
                         latest_starti = starti;
                         starti++;
                     }
@@ -857,7 +949,7 @@ struct Canvas2D {
                         currently_held = newList;
                         // std::remove(currently_held.begin(), currently_held.end(), sortedEnd[endi].octave);
                         Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedEnd[endi].octave });
-                        drawRhythmLine(s0, renderer, divisions);
+                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
                         latest_endi = endi;
                         endi++;
                     }
@@ -869,7 +961,7 @@ struct Canvas2D {
                     }
                     avg = avg / (int)currently_held.size();
                     Vec2 s0 = worldToScreen(topLeft, { current_beat,  avg});
-                    drawRhythmLine(s0, renderer, divisions);
+                    drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
 
                 }
                 // printf("CH:%d\n", (int)currently_held.size());
@@ -883,7 +975,7 @@ struct Canvas2D {
                     for (const auto& childChild : child->children) {
                         // printf("gotta go inside\n");
                         divisions.push_back(childChild.get()->value);
-                        drawRhythmLines(childChild.get(), sortedStart, sortedEnd, start + i * beat_size, start + (i + 1) * beat_size, divisions, currently_held, topLeft, renderer);
+                        drawRhythmLines(childChild.get(), sortedStart, sortedEnd, start + i * beat_size, start + (i + 1) * beat_size, divisions, currently_held, renderer, topLeft, bottomRight);
                         divisions.pop_back();
                     }
                 }
@@ -902,7 +994,7 @@ struct Canvas2D {
         return false;
     }
 
-    void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split) {
+    void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
         // Reserve a canvas rect
         // Vec2 avail = ImGui::GetContentRegionAvail();
         Vec2 topLeft  = { nw.x1, nw.y2};
@@ -912,11 +1004,16 @@ struct Canvas2D {
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
         // --- Panning with RMB drag ---
+        if (hovered && dx != 0 || dy != 0) {
+            // Convert pixel delta → world delta
+            x0 -= dx / sx;
+            y0 -= dy / sy; // + because dragging down increases screen y but decreases world y
+        }
+
         if (hovered && click == 2 && std::abs(prevHover.x) > 1e-6) {
             Vec2 d = { hover.x - prevHover.x, hover.y - prevHover.y};
-            // Convert pixel delta → world delta
             x0 -= d.x / sx;
-            y0 -= d.y / sy; // + because dragging down increases screen y but decreases world y
+            y0 -= d.y / sy;
         }
 
         prevHover = hover;
@@ -956,7 +1053,7 @@ struct Canvas2D {
         int beatEnd   = std::min(std::ceil (wB.x), std::ceil(end));
         std::vector<int> divisions;
         divisions.push_back(std::abs(beatEnd - beatStart));
-        drawRhythmLines(splits.get(), sorted, sortedEnd, beatStart, beatEnd, divisions, currently_held, topLeft, renderer);
+        drawRhythmLines(splits.get(), sorted, sortedEnd, beatStart, beatEnd, divisions, currently_held, renderer, topLeft, bottomRight);
 
         // Horizontal: octaves at integer positions
         int octStart = (int)std::floor(wB.y);
@@ -964,7 +1061,7 @@ struct Canvas2D {
 
         // Draw playhead
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
-        renderer.addRect(s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
+        addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         // Hover snapped position (for preview dot / rubber band)
         hover_valid = false;
@@ -1184,21 +1281,22 @@ struct Canvas2D {
                     if (insert > 0)
                         previousOctave = foci[insert - 1].octave;
                     FocusChange start, end;
-                    bool extending_focus = closest.octave == foci[insert - 2].octave;
-                    bool extend_to_note_start = insert == 0 || closest.beat_on > foci[insert - 1].time;
-                    bool start_coincides_with_other_start = insert > 0 && closest.beat_on == foci[insert - 1].time;
-                    if (start_coincides_with_other_start) {
-                        newFoci[insert - 1].time = closest.beat_on;
-                        newFoci[insert - 1].octave = closest.octave;
-                    } else if (extend_to_note_start) {
-                        // printf("to_start\n");
-                        std::fflush(stdout);
-                        // The note the user clicked on starts after than the previous focus change
+
+                    bool closest_starts_after_prev_focus_change =  insert == 0 || closest.beat_on > foci[insert - 1].time;
+                    bool closest_ends_before_next_focus_change = (int)foci.size() == 0 || insert == (int)foci.size() || (insert >= 0 && insert < (int)foci.size() && closest.beat_off < foci[insert].time);
+
+                    bool closest_starts_at_prev_focus_change = insert > 0 && std::abs(closest.beat_on - foci[insert - 1].time) < 1e-6;
+                    bool closest_ends_at_next_focus_change = insert > 0 && insert < (int)foci.size() - 1 && std::abs(closest.beat_off - foci[insert].time) < 1e-6;
+
+                    if (closest_starts_after_prev_focus_change) {
+                        printf("A");
                         start.time = closest.beat_on;
                         start.octave = closest.octave;
-                    } else if (!focus_before) {
-                        // There is a period of rest in focus before the previous focus change
-                        // Nonetheless we must check if there is another focus change that happens after the note starts
+                    } else if (closest_starts_at_prev_focus_change) {
+                        printf("B");
+                        newFoci[insert - 1].time = closest.beat_on;
+                        newFoci[insert - 1].octave = closest.octave;
+                    } else if (!focus_before) { // From here onwards we will not extend to the start of closest
                         if (insert > 1 && closest.beat_on < foci[insert - 2].time) {
                             // Change insert - 2 to be the current frequency instead of zero, then delete insert - 1
                             newFoci[insert - 2].octave = closest.octave;
@@ -1208,21 +1306,15 @@ struct Canvas2D {
                             newFoci[insert - 1].octave = closest.octave;
                         }
                     } else {
-                        // The note starts before the previous focus change and there is another focus immediately before it (or it is the first focus)
                         newFoci[insert - 1].octave = closest.octave;
                     }
 
-                    bool extend_to_note_end = (int)foci.size() == 0 || insert == (int)foci.size() || insert != (int)foci.size() && closest.beat_off < foci[insert].time;
-                    bool end_coincides_with_other_end = insert <= (int)foci.size() - 1 && closest.beat_off == foci[insert].time;
-                    if (end_coincides_with_other_end) {
-                        newFoci[insert].time = closest.beat_off;
-                        newFoci[insert].octave = previousOctave;
-                    } else if (extend_to_note_end) {
-                        // The note ends before the next focus change
+                    if (closest_ends_before_next_focus_change) {
+                        printf("C");
                         end.time = closest.beat_off;
                         end.octave = previousOctave;
-                        // printf("prev: %f\n", previousOctave);
-                        std::fflush(stdout);
+                    } else if (closest_ends_at_next_focus_change) {
+                        printf("D");
                     } else if (!focus_after) {
                         // Still must check if the one after the next happens before the end of the note
                         if (insert == (int)foci.size() || foci[insert + 1].time < closest.beat_off) {
@@ -1233,34 +1325,40 @@ struct Canvas2D {
                         }
                     }
 
-                    if (removePrevious)
-                        newFoci.erase(newFoci.begin() + (insert - 1));
-                    if (removeNext)
-                        newFoci.erase(newFoci.begin() + insert);
+                    bool focus_exists = insert > 0 && start.time == foci[insert - 1].time && start.octave == foci[insert - 1].octave && end.time == foci[insert].time && end.octave == foci[insert].octave;
+                    printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave);
 
-                    if (extend_to_note_start && extend_to_note_end) {
-                        newFoci.insert(newFoci.begin() + insert, start);
-                        newFoci.insert(newFoci.begin() + insert + 1, end);
-                    } else if (extend_to_note_start) {
-                        newFoci.insert(newFoci.begin() + insert, start);
-                    } else if (extend_to_note_end) {
-                        newFoci.insert(newFoci.begin() + insert, end);
-                    }
+                    if (!focus_exists) {
+                        if (removePrevious)
+                            newFoci.erase(newFoci.begin() + (insert - 1));
+                        if (removeNext)
+                            newFoci.erase(newFoci.begin() + insert);
 
-                    for (int i = insert + 1; i < (int)foci.size(); i++)
-                        newFoci.push_back(foci[i]);
-
-                    std::vector<FocusChange> newNewFoci;
-
-                    for (int i = 0; i < (int)newFoci.size(); i++) {
-                        if (i == 0 || newFoci[i].octave != newFoci[i - 1].octave) {
-                            newNewFoci.push_back(newFoci[i]);
+                        if (closest_starts_after_prev_focus_change && closest_ends_before_next_focus_change) {
+                            newFoci.insert(newFoci.begin() + insert, start);
+                            newFoci.insert(newFoci.begin() + insert + 1, end);
+                        } else if (closest_starts_after_prev_focus_change) {
+                            newFoci.insert(newFoci.begin() + insert, start);
+                        } else if (closest_ends_before_next_focus_change) {
+                            newFoci.insert(newFoci.begin() + insert, end);
                         }
-                    }
 
-                    foci = newNewFoci;
-                    for (int i = 0; i < (int)foci.size(); i++) {
-                        // printf("Focus %d: time: %f, octave: %f\n", i, foci[i].time, foci[i].octave);
+
+                        for (int i = insert + 1; i < (int)foci.size(); i++)
+                            newFoci.push_back(foci[i]);
+
+                        std::vector<FocusChange> newNewFoci;
+
+                        for (int i = 0; i < (int)newFoci.size(); i++) {
+                            if (i == 0 || newFoci[i].octave != newFoci[i - 1].octave) {
+                                newNewFoci.push_back(newFoci[i]);
+                            }
+                        }
+
+                        foci = newNewFoci;
+                        for (int i = 0; i < (int)foci.size(); i++) {
+                            printf("Focus %d: time: %f, octave: %f\n", i, foci[i].time, foci[i].octave);
+                        }
                     }
                 }
             }
@@ -1270,6 +1368,7 @@ struct Canvas2D {
         // Existing notes as blue lines
         int focusIndex = 0;
         Note closest;
+        closest.octave = -1.0f;
         float distance = 9999.0f;
         for (const Note& n : notes) {
             float x0w = n.beat_on, x1w = n.beat_off;
@@ -1294,7 +1393,7 @@ struct Canvas2D {
             // // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
+            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
 
             float tri_size = 6.0f;
             Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
@@ -1305,10 +1404,40 @@ struct Canvas2D {
         }
 
         // Add an origin line for the closest note
-        if (closest.origin != 0.0f) {
+        if (closest.octave >= 0.0f && std::abs(closest.origin) > 1e-6) {
             Vec2 a = worldToScreen(topLeft, { closest.beat_on, closest.octave});
             Vec2 c = worldToScreen(topLeft, {closest.beat_on, closest.origin});
-            renderer.addRect(a.x, a.y, c.x - a.x, c.y - a.y, 0.353, 1.0, 0.353);
+            addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y, 2, c.y - a.y, 0.353, 1.0, 0.353);
+            // Text describing the relationship
+            bool down = false;
+            float diff = closest.octave - closest.origin;
+            if (diff < 0) {
+                down = true;
+                diff *= -1;
+            }
+            int octaves = (int)std::floor(diff);
+            diff -= octaves;
+            float ratio = std::pow(2, diff);
+            int num, den;
+            if (down) {
+                floatToFraction(ratio, den, num);
+            } else {
+                floatToFraction(ratio, num, den);
+            }
+            int res = 0;
+            if (den == 1) {
+                res = sprintf(originText, "x %d", num);
+            } else {
+                res = sprintf(originText, "x %d / %d", num, den);
+            }
+            if (octaves != 0) {
+                if (down) {
+                    sprintf(originText + res, " (- %d octaves)", octaves);
+                } else {
+                    sprintf(originText + res, " (+ %d octaves)", octaves);
+                }
+            }
+            renderer.addText(originText, 10, 10, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
         // Draw focus areas on top of existing notes
@@ -1325,7 +1454,7 @@ struct Canvas2D {
             // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, focusCol[0], focusCol[1], focusCol[2]);
+            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, focusCol[0], focusCol[1], focusCol[2]);
             // dl->AddRect(rmin, rmax, IM_COL32(100,60,30,220), 6.0f, 0, 2.0f);
 
             // float tri_size = 6.0f;
@@ -1335,7 +1464,7 @@ struct Canvas2D {
 
             // dl->AddTriangleFilled(p1, p2, p3, focusCol);
 
-            // renderer.addRect({a.x, a.y}, {b.x, a.y}, focusCol);
+            // addCanvasRect(renderer, topLeft, bottomRight, {a.x, a.y}, {b.x, a.y}, focusCol);
 
             if (snap_harmonics) {
                 float startOctave = foci[i].octave;
@@ -1359,13 +1488,13 @@ struct Canvas2D {
                 for (float o = startOctave; o <= endOctave; o++) {
                     if (o != foci[i].octave) {
                         Vec2 s0 = worldToScreen(topLeft, { wB.x, o});
-                        renderer.addRect(rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
+                        addCanvasRect(renderer, topLeft, bottomRight, rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
                     }
                     for (int i = 0; i < sizeof(perfectIntervals) / 4; i++) {
                         float currentOctave = o + std::log2(perfectIntervals[i]);
                         if (currentOctave > octStart && currentOctave < octEnd) {
                             Vec2 s0 = worldToScreen(topLeft, { wB.x, currentOctave});
-                            renderer.addRect(rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
+                            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
                         }
                     }
                 }
@@ -1382,11 +1511,11 @@ struct Canvas2D {
             Vec2 a = worldToScreen(topLeft, { x0w, y });
             Vec2 b = worldToScreen(topLeft, { x1w, y });
 
-            // renderer.addRect({a.x, a.y}, {b.x, a.y}, noteCol);
+            // addCanvasRect(renderer, topLeft, bottomRight, {a.x, a.y}, {b.x, a.y}, noteCol);
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
             // printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
-            renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, 2, 0.47, 0.47, 1.0);
+            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, 0.47, 0.47, 1.0);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
 
@@ -1406,8 +1535,8 @@ struct Canvas2D {
                 // ensure correct corners
                 Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
                 Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-                renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.35, 0.63, 1.0);
-                renderer.addRect(rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.12, 0.24, 0.39);
+                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.35, 0.63, 1.0);
+                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.12, 0.24, 0.39);
             }
         }
 
@@ -1556,11 +1685,15 @@ int main(int, char**)
     int selected = -1;
     int bpm = 110;
     int click = 0;
+    int dx, dy;
+    int sens = 15;
+    dx = dy = 0;
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
     while (running) {
         SDL_Event e;
         keys.clear();
+        dx = dy = 0;
         while (SDL_PollEvent(&e)) {
             rerender = true;
             if (e.type == SDL_QUIT) running = false;
@@ -1584,14 +1717,14 @@ int main(int, char**)
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
-                            selected = i;
+                            if (i == 5 || i == 6 || i == 7) selected = i;
                             buttons[i].hit = true;
                             buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
-                            if (selected == 1) {
-                                engine.setTempo(buttons[1].value);
-                            } else if (selected == 2 || selected == 3) {
+                            if (i == 1) {
+                                engine.setTempo(buttons[1].value * 180 + 20);
+                            } else if (i == 2 || i == 3) {
                                 engine.setADSR({buttons[2].value, buttons[3].value});
-                            } else if (selected == 4) {
+                            } else if (i == 4) {
                                 engine.setGain(buttons[4].value);
                             }
                         }
@@ -1607,8 +1740,7 @@ int main(int, char**)
                 char key = e.key.keysym.sym;
                 keys.push_back(key);
                 if (key == SDLK_ESCAPE) running = false;
-                else if (selected != -1) {
-
+                if (selected != -1) {
                     if (key >= 32 && key <= 126 && (selected == 5 || selected == 6 || selected == 7) && strlen(buttons[selected].text) <= 14) {
                         if (buttons[selected].text[0] == ' ') {
                             sprintf(buttons[selected].text, "%c", key); 
@@ -1619,7 +1751,9 @@ int main(int, char**)
                         buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
                     }
                 } else {
-
+                    if (key == 'n') {
+                        engine.toggleFreeze();
+                    }
                 }
             }
             if (e.type == SDL_MOUSEMOTION) {
@@ -1636,6 +1770,15 @@ int main(int, char**)
                     hover.y = -1.0f;
                 }
             }
+            if (e.type == SDL_MOUSEWHEEL) {
+                dx = e.wheel.x * sens;
+                dy = e.wheel.y * sens;
+
+                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+                    dx = -dx;
+                    dy = -dy;
+                }
+            }
         }
 
         // Process events
@@ -1650,6 +1793,8 @@ int main(int, char**)
 
                 auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, playhead_time);
                 
+                printf("first; %f\n", ev[0].beat);
+
                 engine.setEvents(ev);
                 engine.resetSampleCounter();
                 engine.setPlayState(true);
@@ -1774,7 +1919,7 @@ int main(int, char**)
             screenHover.x = hover.x * dw;
             screenHover.y = hover.y * dh;
 
-            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text);
+            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
 
             renderer.updateVertexData();
             renderer.drawFrame();
