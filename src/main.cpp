@@ -499,10 +499,45 @@ bool save_midi_file_mpe_format1(const std::string& path,
     return true;
 }
 
+// --- Write TreeNode recursively ---
+void writeTreeNode(std::ofstream& f, const TreeNode& node)
+{
+    // Write node value
+    f.write(reinterpret_cast<const char*>(&node.value), sizeof(node.value));
+
+    // Write number of children
+    uint32_t numChildren = static_cast<uint32_t>(node.children.size());
+    f.write(reinterpret_cast<const char*>(&numChildren), sizeof(numChildren));
+
+    // Write each child recursively
+    for (const auto& child : node.children) {
+        writeTreeNode(f, *child);
+    }
+}
+
+// --- Read TreeNode recursively ---
+std::unique_ptr<TreeNode> readTreeNode(std::ifstream& f)
+{
+    int value = 0;
+    f.read(reinterpret_cast<char*>(&value), sizeof(value));
+
+    auto node = std::make_unique<TreeNode>(value);
+
+    uint32_t numChildren = 0;
+    f.read(reinterpret_cast<char*>(&numChildren), sizeof(numChildren));
+
+    for (uint32_t i = 0; i < numChildren; ++i) {
+        node->children.push_back(readTreeNode(f));
+    }
+
+    return node;
+}
+
+
 // --- Write binary song file ---
 bool save_song(const std::string& path,
                const std::vector<Note>& notes,
-               const std::vector<FocusChange>& focusChanges)
+               const std::vector<FocusChange>& focusChanges, const TreeNode& root)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -527,6 +562,9 @@ bool save_song(const std::string& path,
         f.write(reinterpret_cast<const char*>(&fc.octave), sizeof(float));
     }
 
+    // Time divisions
+    writeTreeNode(f, root);
+
     f.close();
     return true;
 }
@@ -534,7 +572,8 @@ bool save_song(const std::string& path,
 // --- Load binary song file ---
 bool load_song(const std::string& path,
                std::vector<Note>& notes,
-               std::vector<FocusChange>& focusChanges)
+               std::vector<FocusChange>& focusChanges,
+               std::unique_ptr<TreeNode>& root)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -545,6 +584,7 @@ bool load_song(const std::string& path,
         throw std::runtime_error("Invalid file format");
     }
 
+    // Notes
     uint32_t numNotes = 0;
     f.read(reinterpret_cast<char*>(&numNotes), sizeof(numNotes));
     notes.resize(numNotes);
@@ -554,6 +594,7 @@ bool load_song(const std::string& path,
         f.read(reinterpret_cast<char*>(&notes[i].octave), sizeof(float));
     }
 
+    // Focus changes
     uint32_t numFocus = 0;
     f.read(reinterpret_cast<char*>(&numFocus), sizeof(numFocus));
     focusChanges.resize(numFocus);
@@ -562,9 +603,13 @@ bool load_song(const std::string& path,
         f.read(reinterpret_cast<char*>(&focusChanges[i].octave), sizeof(float));
     }
 
+    // --- Tree root ---
+    root = readTreeNode(f);
+
     f.close();
     return true;
 }
+
 
 static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& notes,
                                                      float bpm, uint32_t sampleRate, float playhead_time)
@@ -757,6 +802,7 @@ struct Canvas2D {
     std::vector<FocusChange> foci;
 
     bool placing = false;
+    float lengthOrigin = 0.0f;
     Vec2 anchorW{0,0};
     float split_start = -1.0f;
 
@@ -765,6 +811,19 @@ struct Canvas2D {
 
     bool hover_valid = false;
     Vec2 hoverW{0,0};
+    Vec2 unsnappedHoverW{0,0};
+
+    TreeNode* getSplits() {
+        return splits.get();
+    }
+
+    const TreeNode* getSplits() const {
+        return splits.get();
+    }
+
+    void setSplits(std::unique_ptr<TreeNode> newSplits) {
+        splits = std::move(newSplits);
+    }
 
     void addCanvasRect(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float rx, float ry, float rw, float rh, float r, float g, float b) {
         float x = rx;
@@ -1067,6 +1126,7 @@ struct Canvas2D {
         hover_valid = false;
         if (hovered) {
             Vec2 w = screenToWorld(topLeft, hover);
+            unsnappedHoverW = w;
             w.x = snap_split(w.x);
             if (snap_to_grid) {
                 w.y = snap(w.y, snap_y);
@@ -1132,6 +1192,7 @@ struct Canvas2D {
                     // Drag start or end of note
                     if (containsKey(keys, 'l')) {
                         anchorW.y = closest.octave;
+                        lengthOrigin = closest.origin;
                         if (std::abs(hoverW.x - closest.beat_off) < std::abs(hoverW.x - closest.beat_on)) {
                             anchorW.x = closest.beat_on;
                         } else {
@@ -1147,9 +1208,9 @@ struct Canvas2D {
                         if (containsKey(keys, 'j')) {
                             // Jump up by the written amount
                             printf("text: %s, res: %f\n", jump, parseDivisor(jump));
+                            notes[index].origin = std::abs(notes[index].origin) < 1e-6 ? notes[index].octave : notes[index].origin;
                             notes[index].octave = notes[index].octave + (std::log2(parseDivisor(jump)));
                         } else if (containsKey(keys, 's')) {
-                            std::fflush(stdout);
                             if (split_start != -1.0f) {
                                 float split_end = hoverW.x;
                                 if ((split_end > split_start) && std::ceil(split_end) - std::floor(split_start) == 1) {
@@ -1176,189 +1237,188 @@ struct Canvas2D {
                         currently_dragged = closest;
                     }
                     
-
-
                     // Delete the focus if the note had focus on it
-                    std::vector<FocusChange> newFoci;
-                    int count = 0;
-                    for (int i = 0; i < (int)foci.size(); i++) {
-                        // printf("i: %d\n", i);
-                        if (foci[i].time == closest.beat_on) {
-                            if (foci[i].octave != closest.octave) {
+                    if (!containsKey(keys, 's')) {
+                        std::vector<FocusChange> newFoci;
+                        int count = 0;
+                        for (int i = 0; i < (int)foci.size(); i++) {
+                            // printf("i: %d\n", i);
+                            if (foci[i].time == closest.beat_on) {
+                                if (foci[i].octave != closest.octave) {
+                                    newFoci.push_back(foci[i]);
+                                } else if (i != 0 && foci[i - 1].octave != 0.0f) {
+                                    newFoci.push_back(foci[i]);
+                                    newFoci[count].octave = 0.0f;
+                                    count++;
+                                }
+                            } else if (foci[i].time > closest.beat_on && foci[i].time < closest.beat_off) {
+                                if (foci[i].octave == 0.0f && foci[i - 1].octave != closest.octave) {
+                                    newFoci.push_back(foci[i]);
+                                    count++;
+                                } else if (foci[i].octave != closest.octave) {
+                                    newFoci.push_back(foci[i]);
+                                    count++;
+                                } else if (foci[i].octave == closest.octave) {
+                                    newFoci.push_back(foci[i]);
+                                    newFoci[count].octave = 0.0f;
+                                    count++;
+                                }
+                            } else if (foci[i].time == closest.beat_off) {
+                                // printf("!!!!!!!!\n");
+                                if ((i != 0 && foci[i - 1].octave != closest.octave) || ((i != (int)foci.size() - 1) && foci[i].octave != 0.0f)) {
+                                    // printf("??????\n");
+                                    newFoci.push_back(foci[i]);
+                                    count++;
+                                }
+                            } else {
+                                // printf("wot");
                                 newFoci.push_back(foci[i]);
-                            } else if (i != 0 && foci[i - 1].octave != 0.0f) {
-                                newFoci.push_back(foci[i]);
-                                newFoci[count].octave = 0.0f;
                                 count++;
                             }
-                        } else if (foci[i].time > closest.beat_on && foci[i].time < closest.beat_off) {
-                            if (foci[i].octave == 0.0f && foci[i - 1].octave != closest.octave) {
-                                newFoci.push_back(foci[i]);
-                                count++;
-                            } else if (foci[i].octave != closest.octave) {
-                                newFoci.push_back(foci[i]);
-                                count++;
-                            } else if (foci[i].octave == closest.octave) {
-                                newFoci.push_back(foci[i]);
-                                newFoci[count].octave = 0.0f;
-                                count++;
-                            }
-                        } else if (foci[i].time == closest.beat_off) {
-                            // printf("!!!!!!!!\n");
-                            if ((i != 0 && foci[i - 1].octave != closest.octave) || ((i != (int)foci.size() - 1) && foci[i].octave != 0.0f)) {
-                                // printf("??????\n");
-                                newFoci.push_back(foci[i]);
-                                count++;
-                            }
-                        } else {
-                            // printf("wot");
-                            newFoci.push_back(foci[i]);
-                            count++;
                         }
-                    }
-                    // printf("foci: \n");
-                    for (int i = 0; i < (int)foci.size(); i++) {
-                        // printf("i: %d, ", i);
-                        // printf("octave: %f, ", foci[i].octave);
-                        // printf("time: %f, ", foci[i].time);
-                    }
-                    foci = newFoci;
-                    // printf("newFoci: \n");
-                    for (int i = 0; i < (int)foci.size(); i++) {
-                        // printf("i: %d, ", i);
-                        // printf("octave: %f, ", foci[i].octave);
-                        // printf("time: %f, ", foci[i].time);
+                        // printf("foci: \n");
+                        for (int i = 0; i < (int)foci.size(); i++) {
+                            // printf("i: %d, ", i);
+                            // printf("octave: %f, ", foci[i].octave);
+                            // printf("time: %f, ", foci[i].time);
+                        }
+                        foci = newFoci;
+                        // printf("newFoci: \n");
+                        for (int i = 0; i < (int)foci.size(); i++) {
+                            // printf("i: %d, ", i);
+                            // printf("octave: %f, ", foci[i].octave);
+                            // printf("time: %f, ", foci[i].time);
+                        }
                     }
                 }
             }
         }
 
-        if (hovered && click == 2) {
-            if (!placing) {
-                // Find closest note
-                std::vector<Note> within;
-                for (const Note& n : notes) {
-                    if (hoverW.x <= n.beat_off && hoverW.x  >= n.beat_on)
-                        within.push_back(n);
+
+        if (hovered && click == 2 && !placing) {
+            // Find closest note
+            std::vector<Note> within;
+            for (const Note& n : notes) {
+                if (unsnappedHoverW.x <= n.beat_off && unsnappedHoverW.x  >= n.beat_on)
+                    within.push_back(n);
+            }
+            if ((int)within.size() > 0) {
+                Note closest = within[0];
+                float distance = 999999;
+                for (const Note& n : within) {
+                    float current = std::abs(n.octave - unsnappedHoverW.y);
+                    if (current < distance) {
+                        distance = current;
+                        closest = n;
+                    }
                 }
-                if ((int)within.size() > 0) {
-                    Note closest = within[0];
-                    float distance = 999999;
-                    for (const Note& n : within) {
-                        float current = std::abs(n.octave - hoverW.y);
-                        if (current < distance) {
-                            distance = current;
-                            closest = n;
+                // Add to focus changes as far left and as far right as we can
+                int insert = 0;
+                bool focus_after = true;
+                bool focus_before = true;
+                std::vector<FocusChange> newFoci;
+                for (int i = 0; i < (int)foci.size(); i++) {
+                    newFoci.push_back(foci[i]);
+                    if (foci[i].time > unsnappedHoverW.x) {
+                        // This index is the next focus change after the click point
+                        insert = i;
+                        if (foci[i].octave == 0.0f)
+                            focus_after = false;
+                        else if (i <= 1 || foci[i - 2].octave == 0.0f)
+                            focus_before = false;
+                        break;
+                    } else {
+                        if (i == (int)foci.size() - 1) {
+                            insert = i + 1;
                         }
                     }
-                    // Add to focus changes as far left and as far right as we can
-                    int insert = 0;
-                    bool focus_after = true;
-                    bool focus_before = true;
-                    std::vector<FocusChange> newFoci;
-                    for (int i = 0; i < (int)foci.size(); i++) {
-                        newFoci.push_back(foci[i]);
-                        if (foci[i].time > hoverW.x) {
-                            // This index is the next focus change after the click point
-                            insert = i;
-                            if (foci[i].octave == 0.0f)
-                                focus_after = false;
-                            else if (i <= 1 || foci[i - 2].octave == 0.0f)
-                                focus_before = false;
-                            break;
-                        } else {
-                            if (i == (int)foci.size() - 1) {
-                                insert = i + 1;
-                            }
-                        }
-                    }
-                    // printf("insert: %d\n", insert);
-                    // printf("focus_before: %d, focus_after: %d\n", focus_before, focus_after);
-                    std::fflush(stdout);
-                    bool removePrevious = false;
-                    bool removeNext = false;
-                    float previousOctave = 0.0f;
-                    if (insert > 0)
-                        previousOctave = foci[insert - 1].octave;
-                    FocusChange start, end;
+                }
+                // printf("insert: %d\n", insert);
+                // printf("focus_before: %d, focus_after: %d\n", focus_before, focus_after);
+                std::fflush(stdout);
+                bool removePrevious = false;
+                bool removeNext = false;
+                float previousOctave = 0.0f;
+                if (insert > 0)
+                    previousOctave = foci[insert - 1].octave;
+                FocusChange start, end;
 
-                    bool closest_starts_after_prev_focus_change =  insert == 0 || closest.beat_on > foci[insert - 1].time;
-                    bool closest_ends_before_next_focus_change = (int)foci.size() == 0 || insert == (int)foci.size() || (insert >= 0 && insert < (int)foci.size() && closest.beat_off < foci[insert].time);
+                bool closest_starts_after_prev_focus_change =  insert == 0 || closest.beat_on > foci[insert - 1].time;
+                bool closest_ends_before_next_focus_change = (int)foci.size() == 0 || insert == (int)foci.size() || (insert >= 0 && insert < (int)foci.size() && closest.beat_off < foci[insert].time);
 
-                    bool closest_starts_at_prev_focus_change = insert > 0 && std::abs(closest.beat_on - foci[insert - 1].time) < 1e-6;
-                    bool closest_ends_at_next_focus_change = insert > 0 && insert < (int)foci.size() - 1 && std::abs(closest.beat_off - foci[insert].time) < 1e-6;
+                bool closest_starts_at_prev_focus_change = insert > 0 && std::abs(closest.beat_on - foci[insert - 1].time) < 1e-6;
+                bool closest_ends_at_next_focus_change = insert > 0 && insert <= (int)foci.size() - 1 && std::abs(closest.beat_off - foci[insert].time) < 1e-6;
 
-                    if (closest_starts_after_prev_focus_change) {
-                        printf("A");
-                        start.time = closest.beat_on;
-                        start.octave = closest.octave;
-                    } else if (closest_starts_at_prev_focus_change) {
-                        printf("B");
+                if (closest_starts_after_prev_focus_change) {
+                    printf("A");
+                    start.time = closest.beat_on;
+                    start.octave = closest.octave;
+                } else if (closest_starts_at_prev_focus_change) {
+                    printf("B");
+                    newFoci[insert - 1].time = closest.beat_on;
+                    newFoci[insert - 1].octave = closest.octave;
+                } else if (!focus_before) { // From here onwards we will not extend to the start of closest
+                    if (insert > 1 && closest.beat_on < foci[insert - 2].time) {
+                        // Change insert - 2 to be the current frequency instead of zero, then delete insert - 1
+                        newFoci[insert - 2].octave = closest.octave;
+                        removePrevious = true;
+                    } else {
                         newFoci[insert - 1].time = closest.beat_on;
                         newFoci[insert - 1].octave = closest.octave;
-                    } else if (!focus_before) { // From here onwards we will not extend to the start of closest
-                        if (insert > 1 && closest.beat_on < foci[insert - 2].time) {
-                            // Change insert - 2 to be the current frequency instead of zero, then delete insert - 1
-                            newFoci[insert - 2].octave = closest.octave;
-                            removePrevious = true;
-                        } else {
-                            newFoci[insert - 1].time = closest.beat_on;
-                            newFoci[insert - 1].octave = closest.octave;
-                        }
+                    }
+                } else {
+                    newFoci[insert - 1].octave = closest.octave;
+                }
+
+                if (closest_ends_before_next_focus_change) {
+                    printf("C");
+                    end.time = closest.beat_off;
+                    end.octave = previousOctave;
+                } else if (closest_ends_at_next_focus_change) {
+                    printf("D");
+                } else if (!focus_after) {
+                    // Still must check if the one after the next happens before the end of the note
+                    if (insert == (int)foci.size() || foci[insert + 1].time < closest.beat_off) {
+                        removeNext = true;
                     } else {
-                        newFoci[insert - 1].octave = closest.octave;
+                        newFoci[insert].time = closest.beat_off;
+                        newFoci[insert].octave = 0.0f;
+                    }
+                }
+
+                bool focus_exists = insert > 0 && start.time == foci[insert - 1].time && start.octave == foci[insert - 1].octave && end.time == foci[insert].time && end.octave == foci[insert].octave;
+                printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave);
+
+                if (!focus_exists) {
+                    if (removePrevious)
+                        newFoci.erase(newFoci.begin() + (insert - 1));
+                    if (removeNext)
+                        newFoci.erase(newFoci.begin() + insert);
+
+                    if (closest_starts_after_prev_focus_change && closest_ends_before_next_focus_change) {
+                        newFoci.insert(newFoci.begin() + insert, start);
+                        newFoci.insert(newFoci.begin() + insert + 1, end);
+                    } else if (closest_starts_after_prev_focus_change) {
+                        newFoci.insert(newFoci.begin() + insert, start);
+                    } else if (closest_ends_before_next_focus_change) {
+                        newFoci.insert(newFoci.begin() + insert, end);
                     }
 
-                    if (closest_ends_before_next_focus_change) {
-                        printf("C");
-                        end.time = closest.beat_off;
-                        end.octave = previousOctave;
-                    } else if (closest_ends_at_next_focus_change) {
-                        printf("D");
-                    } else if (!focus_after) {
-                        // Still must check if the one after the next happens before the end of the note
-                        if (insert == (int)foci.size() || foci[insert + 1].time < closest.beat_off) {
-                            removeNext = true;
-                        } else {
-                            newFoci[insert].time = closest.beat_off;
-                            newFoci[insert].octave = 0.0f;
+
+                    for (int i = insert + 1; i < (int)foci.size(); i++)
+                        newFoci.push_back(foci[i]);
+
+                    std::vector<FocusChange> newNewFoci;
+
+                    for (int i = 0; i < (int)newFoci.size(); i++) {
+                        if (i == 0 || newFoci[i].octave != newFoci[i - 1].octave) {
+                            newNewFoci.push_back(newFoci[i]);
                         }
                     }
 
-                    bool focus_exists = insert > 0 && start.time == foci[insert - 1].time && start.octave == foci[insert - 1].octave && end.time == foci[insert].time && end.octave == foci[insert].octave;
-                    printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave);
-
-                    if (!focus_exists) {
-                        if (removePrevious)
-                            newFoci.erase(newFoci.begin() + (insert - 1));
-                        if (removeNext)
-                            newFoci.erase(newFoci.begin() + insert);
-
-                        if (closest_starts_after_prev_focus_change && closest_ends_before_next_focus_change) {
-                            newFoci.insert(newFoci.begin() + insert, start);
-                            newFoci.insert(newFoci.begin() + insert + 1, end);
-                        } else if (closest_starts_after_prev_focus_change) {
-                            newFoci.insert(newFoci.begin() + insert, start);
-                        } else if (closest_ends_before_next_focus_change) {
-                            newFoci.insert(newFoci.begin() + insert, end);
-                        }
-
-
-                        for (int i = insert + 1; i < (int)foci.size(); i++)
-                            newFoci.push_back(foci[i]);
-
-                        std::vector<FocusChange> newNewFoci;
-
-                        for (int i = 0; i < (int)newFoci.size(); i++) {
-                            if (i == 0 || newFoci[i].octave != newFoci[i - 1].octave) {
-                                newNewFoci.push_back(newFoci[i]);
-                            }
-                        }
-
-                        foci = newNewFoci;
-                        for (int i = 0; i < (int)foci.size(); i++) {
-                            printf("Focus %d: time: %f, octave: %f\n", i, foci[i].time, foci[i].octave);
-                        }
+                    foci = newNewFoci;
+                    for (int i = 0; i < (int)foci.size(); i++) {
+                        printf("Focus %d: time: %f, octave: %f\n", i, foci[i].time, foci[i].octave);
                     }
                 }
             }
@@ -1563,7 +1623,8 @@ struct Canvas2D {
                         n.beat_on  = std::min(a, b);
                         n.beat_off = std::max(a, b);   // exclusive
                         n.octave   = anchorW.y;        // octave fixed at first click
-                        n.origin = 0.0f;
+                        n.origin = lengthOrigin; // If the note was resized, use the origin from before
+                        lengthOrigin = 0.0f;
                         if (snap_harmonics) {
                             // Check whether there's any focus at the anchor
                             for (int i = 1; i < (int)foci.size(); i++) {
@@ -1638,6 +1699,7 @@ int main(int, char**)
 
     engine.setGain(0.4f);
     engine.setWaveform(WaveformType::Sine);
+    int waveType = 0;
     engine.setTempo(120.0f);
 
     std::vector<Rect> rects;
@@ -1645,12 +1707,12 @@ int main(int, char**)
     CurrentBox nw;
     CurrentBox cw;
 
-    char buttonLabels[11][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:", "Export MIDI", "Save project", "Load project"};
+    char buttonLabels[14][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:", "Export MIDI", "Save project", "Load project", "Change wave", "Sustain:          ", "Release:          "};
     std::vector<Button> buttons;
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.0f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.0f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.2f);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]);
@@ -1658,6 +1720,10 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[8], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[9], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[10], false);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[11], false);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 1.0f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0f);
+    engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
@@ -1667,16 +1733,19 @@ int main(int, char**)
     rects.push_back({10.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 1.0f, F_SLIDER_CW});
     rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 2.0f, F_SLIDER_CW});
     rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 3.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
+    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
+    rects.push_back({10.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
+    rects.push_back({10.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
     // WAV Save name, jump size, split size text boxes
-    rects.push_back({10.0f, 105.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
-    rects.push_back({10.0f, 140.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
-    rects.push_back({10.0f, 175.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
+    rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
+    rects.push_back({10.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
+    rects.push_back({10.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
     // Export WAV, export MIDI, save project, load project buttons
     rects.push_back({140.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
     rects.push_back({140.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});
     rects.push_back({140.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 9.0f, F_BUTTON_CW});
     rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 10.0f, F_BUTTON_CW});
+    rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 11.0f, F_BUTTON_CW});
 
     bool running = true;
     bool playing = false;
@@ -1722,8 +1791,8 @@ int main(int, char**)
                             buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
                             if (i == 1) {
                                 engine.setTempo(buttons[1].value * 180 + 20);
-                            } else if (i == 2 || i == 3) {
-                                engine.setADSR({buttons[2].value, buttons[3].value});
+                            } else if (i == 2 || i == 3 || i == 12 || i == 13) {
+                                engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
                             } else if (i == 4) {
                                 engine.setGain(buttons[4].value);
                             }
@@ -1814,17 +1883,39 @@ int main(int, char**)
         }
 
         if (buttons[9].hit) { // if save project button is pressed
-            save_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci);
+            save_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, *gBeatOctCanvas.getSplits());
             buttons[9].hit = false;
         }
 
         if (buttons[10].hit) { // If load project button is pressed
-            load_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci);
+            std::unique_ptr<TreeNode> loadedSplits;
+            load_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, loadedSplits);
+            gBeatOctCanvas.setSplits(std::move(loadedSplits));
             buttons[10].hit = false;
         }
 
-        // Refer to notes for what was here
+        if (buttons[11].hit) {
+            switch (waveType) {
+                case 0:
+                    engine.setWaveform(WaveformType::Square);
+                    break;
+                case 1:
+                    engine.setWaveform(WaveformType::Saw);
+                    break;
+                case 2:
+                    engine.setWaveform(WaveformType::Triangle);
+                    break;
+                case 3:
+                    engine.setWaveform(WaveformType::Sine);
+                    break;
+            }
+            printf("waveType: %d\n", waveType);
+            waveType++;
+            if (waveType == 4) waveType = 0;
+            buttons[11].hit = false;
+        }
 
+        // Refer to notes for what was here
         // Clear vertex list and rebuild from rectangles
         if (rerender) {
             renderer.vertices.clear();
@@ -1857,9 +1948,13 @@ int main(int, char**)
                             if (buttons[(int)r.utility].label[0] == 'B') {
                                 sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));
                             } else if (buttons[(int)r.utility].label[0] == 'A') {
-                                sprintf(buttons[(int)r.utility].label, "Attack: %.3f", buttons[(int)r.utility].value * 2.98 + 0.02);
+                                sprintf(buttons[(int)r.utility].label, "Attack: %.3f", buttons[(int)r.utility].value * 3.0f);
                             } else if (buttons[(int)r.utility].label[0] == 'D') {
-                                sprintf(buttons[(int)r.utility].label, "Decay: %.3f", buttons[(int)r.utility].value * 2.98 + 0.02);
+                                sprintf(buttons[(int)r.utility].label, "Decay: %.3f", buttons[(int)r.utility].value * 3.0f);
+                            } else if (buttons[(int)r.utility].label[0] == 'S') {
+                                sprintf(buttons[(int)r.utility].label, "Sustain: %.3f", buttons[(int)r.utility].value);
+                            } else if (buttons[(int)r.utility].label[0] == 'R') {
+                                sprintf(buttons[(int)r.utility].label, "Release: %.3f", buttons[(int)r.utility].value * 3.0f);
                             } else if (buttons[(int)r.utility].label[0] == 'G') {
                                 sprintf(buttons[(int)r.utility].label, "Gain: %.3f", buttons[(int)r.utility].value * 5.0);
                             }
@@ -1908,6 +2003,7 @@ int main(int, char**)
                 if (sliderPoint != -1.0f)
                     renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
             }
+            printf("1");
 
             CurrentBox screenNw;
             screenNw.x1 = nw.x1 * dw;

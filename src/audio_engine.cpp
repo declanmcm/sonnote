@@ -239,6 +239,7 @@ void AudioEngine::applyMessages() {
             break;
 
         case MessageType::SetADSR:
+            printf("hi\n");
             adsr = msg.adsr;
             break;
 
@@ -283,7 +284,9 @@ void AudioEngine::applyMessages() {
     }
 }
 
-
+float toPrint[100];
+int printIndex = 0;
+int countdown = 52;
 
 // ======================================================
 // ================= WAVEFORM GENERATION =================
@@ -359,9 +362,10 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
     }
 
     const float sr = sampleRate;
-    const float atkStep = (adsr.attack  > 0.f) ? (1.0f / (adsr.attack  * sr)) : 1.0f;
-    const float relStep = (adsr.release > 0.f) ? (1.0f / (adsr.release * sr)) : 1.0f;
-    const float decStep = (adsr.decay   > 0.f) ? (1.0f / (adsr.decay   * sr)) : 1.0f;
+    const float atkStep = (adsr.attack > 1e-6) ? (1.0f / (float)(adsr.attack  * sr)) : 1.0f;
+    const float relStep = (adsr.release > 1e-6) ? (1.0f / (float)(adsr.release * sr)) : 1.0f;
+    const float decStep = (adsr.decay   > 1e-6) ? (1.0f / (float)(adsr.decay   * sr)) : 1.0f;
+    printf("steps: (%f, %f)\n", atkStep, decStep);
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
@@ -386,10 +390,13 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 nextEventIndex = 0;
             }
 
+            if (countdown < 51) countdown--;
+
             // Consume events while currentBeat passes their beat positions
             while (nextEventIndex < count &&
                 activeEvents[nextEventIndex].beat <= currentBeat)
             {
+                countdown--;
                 const SeqEvent& ev = activeEvents[nextEventIndex];
 
                 // Only trigger if we *passed* this beat within this audio block
@@ -506,6 +513,25 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
         outL[i] = s;
         outR[i] = s;
+        toPrint[printIndex] = s;
+        printIndex++;
+        if (printIndex == 100) printIndex = 0;
+
+        if (countdown == 0) {
+            printf("hey");
+            // Print to file
+            FILE* out = fopen("out.csv", "w+");
+            char str[16];
+            for (int i = 0; i < 99; i++) {
+                printIndex++;
+                if (printIndex == 100) printIndex = 0;
+                sprintf(str, "%f,", toPrint[printIndex]);
+                fputs(str, out);
+            }
+            sprintf(str, "%f", toPrint[++printIndex]);
+            fputs(str, out);
+            fclose(out);
+        }
 
         if (!freeze)
             sampleCounter++;
