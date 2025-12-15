@@ -33,6 +33,7 @@ struct Note {
     int velocity;
     float octave;    // fixed at first click
     float origin;
+    bool selected;
 };
 
 struct FocusChange {
@@ -1133,45 +1134,71 @@ struct Canvas2D {
             } else if (snap_harmonics) {
                 float focus = 0.0f;
                 for (int i = 0; i < (int)foci.size() - 1; i++) {
-                    if (w.x > foci[i].time && w.x < foci[i + 1].time) {
+                    if (unsnappedHoverW.x > foci[i].time && unsnappedHoverW.x < foci[i + 1].time) {
                         focus = foci[i].octave;
                         break;
                     }
                 }
 
-                float currentOctave = focus;
-                if (currentOctave > w.y) {
-                    while (currentOctave > w.y)
-                        currentOctave -= 1;
-                } else if (currentOctave + 1 < w.y) {
-                    while (currentOctave + 1 < w.y) 
-                        currentOctave += 1;
-                }
-
-                // printf("Y pos: %f\n", w.y);
-                float closest = currentOctave;
-                for (int i = 0; i < (int)sizeof(perfectIntervals) / 4; i++) {
-                    // printf("Current: %f\n", currentOctave + std::log2(perfectIntervals[i]));
-                    // printf("Distance: %f\n", std::abs(w.y - (currentOctave + std::log2(perfectIntervals[i]))));
-                    // printf("Distance to closest: %f\n", std::abs(w.y - closest));
-                    if (std::abs(w.y - (currentOctave + std::log2(perfectIntervals[i]))) < std::abs(w.y - closest)) {
-                        // printf("YO\n");
-                        closest = currentOctave + std::log2(perfectIntervals[i]);
+                if (focus > 1e-6) {
+                    float currentOctave = focus;
+                    if (currentOctave > w.y) {
+                        while (currentOctave > w.y)
+                            currentOctave -= 1;
+                    } else if (currentOctave + 1 < w.y) {
+                        while (currentOctave + 1 < w.y) 
+                            currentOctave += 1;
                     }
+
+                    // printf("Y pos: %f\n", w.y);
+                    float closest = currentOctave;
+                    for (int i = 0; i < (int)sizeof(perfectIntervals) / 4; i++) {
+                        // printf("Current: %f\n", currentOctave + std::log2(perfectIntervals[i]));
+                        // printf("Distance: %f\n", std::abs(w.y - (currentOctave + std::log2(perfectIntervals[i]))));
+                        // printf("Distance to closest: %f\n", std::abs(w.y - closest));
+                        if (std::abs(w.y - (currentOctave + std::log2(perfectIntervals[i]))) < std::abs(w.y - closest)) {
+                            // printf("YO\n");
+                            closest = currentOctave + std::log2(perfectIntervals[i]);
+                        }
+                    }
+                    w.y = closest;
                 }
-                w.y = closest;
+                hoverW = w;
+                hover_valid = true;
             }
-            hoverW = w;
-            hover_valid = true;
         }
 
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
-        if (hovered && containsKey(keys, 'p')) 
-            playhead_time = hoverW.x;
-        else if (hovered && containsKey(keys, ' '))
-            play_triggered_from_space = true;
+        if (hovered) {
+            if (containsKey(keys, 'p')) 
+                playhead_time = hoverW.x;
+            else if (containsKey(keys, ' '))
+                play_triggered_from_space = true;
+            else if (containsKey(keys, 'v')) {
+                // Paste notes
+                float firstSelectedTime = 0.0f;
+                for (int i = 0; i < (int)notes.size(); i++) {
+                    if (notes[i].selected) {
+                        if (firstSelectedTime < 1e-6)
+                            firstSelectedTime = notes[i].beat_on;
+                        Note to_push = notes[i];
+                        to_push.beat_on = hoverW.x + notes[i].beat_on - firstSelectedTime;
+                        to_push.beat_off = hoverW.x + notes[i].beat_off - firstSelectedTime;
+                        to_push.selected = false;
+                        notes.push_back(to_push);
+                    }
+                }
+            } else if (containsKey(keys, 'r')) {
+                // Remove selected notes
+                std::vector<Note> newNotes;
+                for (int i = 0; i < (int)notes.size(); i++) {
+                    if (!notes[i].selected) newNotes.push_back(notes[i]);
+                }
+                notes = newNotes;
+            }
+        }
 
-        if (hovered && (containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'j') || containsKey(keys, 's'))) {
+        if (hovered && (containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'j') || containsKey(keys, 's')) || containsKey(keys, 'a')) {
             // Find closest note and side of note (start or end)
             if ((int)notes.size() > 0) {
                 Note closest = notes[0];
@@ -1201,7 +1228,7 @@ struct Canvas2D {
                         placing = true;
                     }
 
-                    if (!(containsKey(keys, 'j') || containsKey(keys, 's'))) {
+                    if (!(containsKey(keys, 'j') || containsKey(keys, 's') || containsKey(keys, 'a'))) {
                         // Delete the note because it will be replaced
                         notes.erase(notes.begin() + index);
                     } else {
@@ -1228,6 +1255,8 @@ struct Canvas2D {
                             } else {
                                 split_start = hoverW.x;
                             }
+                        } else if (containsKey(keys, 'a')) {
+                           notes[index].selected = true;
                         }
                     }
 
@@ -1238,7 +1267,7 @@ struct Canvas2D {
                     }
                     
                     // Delete the focus if the note had focus on it
-                    if (!containsKey(keys, 's')) {
+                    if (!(containsKey(keys, 's') || containsKey(keys, 'a'))) {
                         std::vector<FocusChange> newFoci;
                         int count = 0;
                         for (int i = 0; i < (int)foci.size(); i++) {
@@ -1713,7 +1742,7 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.2f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.16f);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[7], false, 0.0f, texts[2]);
@@ -1721,8 +1750,8 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[9], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[10], false);
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[11], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 1.0f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 0.7f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0083333f);
     engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
