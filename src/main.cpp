@@ -34,6 +34,7 @@ struct Note {
     float octave;    // fixed at first click
     float origin;
     bool selected;
+    int profile;
 };
 
 struct FocusChange {
@@ -1054,6 +1055,32 @@ struct Canvas2D {
         return false;
     }
 
+    int numberContained(std::vector<char> keys) {
+        for (const auto& k : keys) {
+            if (k == '0')
+                return 0;
+            if (k == '1')
+                return 1;
+            if (k == '2')
+                return 2;
+            if (k == '3')
+                return 3;
+            if (k == '4')
+                return 4;
+            if (k == '5')
+                return 5;
+            if (k == '6')
+                return 6;
+            if (k == '7')
+                return 7;
+            if (k == '8')
+                return 8;
+            if (k == '9')
+                return 9;
+        }
+        return 0;
+    }
+
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
         // Reserve a canvas rect
         // Vec2 avail = ImGui::GetContentRegionAvail();
@@ -1091,6 +1118,7 @@ struct Canvas2D {
         const float textCol[3]   = { 0.863, 0.863, 0.863};
         const float playheadCol[3] = { 0.784, 0.08, 0.08 };
         const float noteCol[3] = { 0.353, 0.63, 1.0 };
+        const float selCol[3] = { 1.0, 1.0, 0.2588 };
         const float focusCol[3] = { 1.0, 0.63, 0.353 };
 
         // Sort notes
@@ -1198,126 +1226,131 @@ struct Canvas2D {
             }
         }
 
-        if (hovered && (containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'j') || containsKey(keys, 's')) || containsKey(keys, 'a')) {
+        if (hovered && (int)keys.size() != 0 && (int)notes.size() > 0) {
             // Find closest note and side of note (start or end)
-            if ((int)notes.size() > 0) {
-                Note closest = notes[0];
-                float distance =  99999;
-                int index = 0;
-                bool match_found = false;
-                for (int i = 0; i < (int)notes.size(); i++) { 
-                    float current = std::abs(notes[i].octave - hoverW.y);
-                    if ((hoverW.x <= notes[i].beat_off && hoverW.x  >= notes[i].beat_on) && current < distance) {
-                        match_found = true;
-                        distance = current;
-                        closest = notes[i];
-                        index = i;
-                    } 
+            Note closest = notes[0];
+            float distance =  99999;
+            int index = 0;
+            bool match_found = false;
+            for (int i = 0; i < (int)notes.size(); i++) { 
+                float current = std::abs(notes[i].octave - hoverW.y);
+                if ((hoverW.x <= notes[i].beat_off && hoverW.x  >= notes[i].beat_on) && current < distance) {
+                    match_found = true;
+                    distance = current;
+                    closest = notes[i];
+                    index = i;
+                } 
+            }
+
+            if (match_found) {
+                // Drag start or end of note
+                if (containsKey(keys, 'l')) {
+                    anchorW.y = closest.octave;
+                    lengthOrigin = closest.origin;
+                    if (std::abs(hoverW.x - closest.beat_off) < std::abs(hoverW.x - closest.beat_on)) {
+                        anchorW.x = closest.beat_on;
+                    } else {
+                        anchorW.x = closest.beat_off;
+                    }
+                    placing = true;
                 }
 
-                if (match_found) {
-                    // Drag start or end of note
-                    if (containsKey(keys, 'l')) {
-                        anchorW.y = closest.octave;
-                        lengthOrigin = closest.origin;
-                        if (std::abs(hoverW.x - closest.beat_off) < std::abs(hoverW.x - closest.beat_on)) {
-                            anchorW.x = closest.beat_on;
-                        } else {
-                            anchorW.x = closest.beat_off;
-                        }
-                        placing = true;
-                    }
+                int number = numberContained(keys);
 
-                    if (!(containsKey(keys, 'j') || containsKey(keys, 's') || containsKey(keys, 'a'))) {
-                        // Delete the note because it will be replaced
-                        notes.erase(notes.begin() + index);
-                    } else {
-                        if (containsKey(keys, 'j')) {
-                            // Jump up by the written amount
-                            printf("text: %s, res: %f\n", jump, parseDivisor(jump));
-                            notes[index].origin = std::abs(notes[index].origin) < 1e-6 ? notes[index].octave : notes[index].origin;
-                            notes[index].octave = notes[index].octave + (std::log2(parseDivisor(jump)));
-                        } else if (containsKey(keys, 's')) {
-                            if (split_start != -1.0f) {
-                                float split_end = hoverW.x;
-                                if ((split_end > split_start) && std::ceil(split_end) - std::floor(split_start) == 1) {
-                                    // Split time into specified amount
-                                    int current_beat = std::floor(split_start);
-                                    TreeNode* beat_node = findNode(splits.get(), current_beat);
-                                    if (!beat_node) {
-                                        // Create entry for that beat
-                                        splits.get()->addChild(current_beat);
-                                    }
-                                    find_division(findNode(splits.get(), current_beat), parseDivisor(split), current_beat, current_beat + 1.0f, split_start, split_end);
-                                    printTree(splits.get());
-                                }
-                                split_start = -1.0f;
-                            } else {
-                                split_start = hoverW.x;
+                if (number != -1) {
+                    notes[index].profile = number;
+                }
+                
+                if (containsKey(keys, 'd') || containsKey(keys, 'f') || containsKey(keys, 'l')) {
+                    // Delete the note because it will be replaced
+                    notes.erase(notes.begin() + index);
+                }
+                if (containsKey(keys, 'j')) {
+                    // Jump up by the written amount
+                    printf("text: %s, res: %f\n", jump, parseDivisor(jump));
+                    notes[index].origin = std::abs(notes[index].origin) < 1e-6 ? notes[index].octave : notes[index].origin;
+                    notes[index].octave = notes[index].octave + (std::log2(parseDivisor(jump)));
+                }
+                if (containsKey(keys, 's')) {
+                    if (split_start != -1.0f) {
+                        float split_end = hoverW.x;
+                        if ((split_end > split_start) && std::ceil(split_end) - std::floor(split_start) == 1) {
+                            // Split time into specified amount
+                            int current_beat = std::floor(split_start);
+                            TreeNode* beat_node = findNode(splits.get(), current_beat);
+                            if (!beat_node) {
+                                // Create entry for that beat
+                                splits.get()->addChild(current_beat);
                             }
-                        } else if (containsKey(keys, 'a')) {
-                           notes[index].selected = true;
+                            find_division(findNode(splits.get(), current_beat), parseDivisor(split), current_beat, current_beat + 1.0f, split_start, split_end);
+                            printTree(splits.get());
                         }
+                        split_start = -1.0f;
+                    } else {
+                        split_start = hoverW.x;
                     }
+                }
+                if (containsKey(keys, 'a')) {
+                    notes[index].selected = !(notes[index].selected);
+                }
 
-                    // Frequency drag
-                    if (containsKey(keys, 'f')) {
-                        dragging = true;
-                        currently_dragged = closest;
-                    }
-                    
-                    // Delete the focus if the note had focus on it
-                    if (!(containsKey(keys, 's') || containsKey(keys, 'a'))) {
-                        std::vector<FocusChange> newFoci;
-                        int count = 0;
-                        for (int i = 0; i < (int)foci.size(); i++) {
-                            // printf("i: %d\n", i);
-                            if (foci[i].time == closest.beat_on) {
-                                if (foci[i].octave != closest.octave) {
-                                    newFoci.push_back(foci[i]);
-                                } else if (i != 0 && foci[i - 1].octave != 0.0f) {
-                                    newFoci.push_back(foci[i]);
-                                    newFoci[count].octave = 0.0f;
-                                    count++;
-                                }
-                            } else if (foci[i].time > closest.beat_on && foci[i].time < closest.beat_off) {
-                                if (foci[i].octave == 0.0f && foci[i - 1].octave != closest.octave) {
-                                    newFoci.push_back(foci[i]);
-                                    count++;
-                                } else if (foci[i].octave != closest.octave) {
-                                    newFoci.push_back(foci[i]);
-                                    count++;
-                                } else if (foci[i].octave == closest.octave) {
-                                    newFoci.push_back(foci[i]);
-                                    newFoci[count].octave = 0.0f;
-                                    count++;
-                                }
-                            } else if (foci[i].time == closest.beat_off) {
-                                // printf("!!!!!!!!\n");
-                                if ((i != 0 && foci[i - 1].octave != closest.octave) || ((i != (int)foci.size() - 1) && foci[i].octave != 0.0f)) {
-                                    // printf("??????\n");
-                                    newFoci.push_back(foci[i]);
-                                    count++;
-                                }
-                            } else {
-                                // printf("wot");
+                // Frequency drag
+                if (containsKey(keys, 'f')) {
+                    dragging = true;
+                    currently_dragged = closest;
+                }
+                
+                // Delete the focus if the note had focus on it
+                if (containsKey(keys, 'f') || containsKey(keys, 'l') || containsKey(keys, 'd')) {
+                    std::vector<FocusChange> newFoci;
+                    int count = 0;
+                    for (int i = 0; i < (int)foci.size(); i++) {
+                        // printf("i: %d\n", i);
+                        if (foci[i].time == closest.beat_on) {
+                            if (foci[i].octave != closest.octave) {
+                                newFoci.push_back(foci[i]);
+                            } else if (i != 0 && foci[i - 1].octave != 0.0f) {
+                                newFoci.push_back(foci[i]);
+                                newFoci[count].octave = 0.0f;
+                                count++;
+                            }
+                        } else if (foci[i].time > closest.beat_on && foci[i].time < closest.beat_off) {
+                            if (foci[i].octave == 0.0f && foci[i - 1].octave != closest.octave) {
+                                newFoci.push_back(foci[i]);
+                                count++;
+                            } else if (foci[i].octave != closest.octave) {
+                                newFoci.push_back(foci[i]);
+                                count++;
+                            } else if (foci[i].octave == closest.octave) {
+                                newFoci.push_back(foci[i]);
+                                newFoci[count].octave = 0.0f;
+                                count++;
+                            }
+                        } else if (foci[i].time == closest.beat_off) {
+                            // printf("!!!!!!!!\n");
+                            if ((i != 0 && foci[i - 1].octave != closest.octave) || ((i != (int)foci.size() - 1) && foci[i].octave != 0.0f)) {
+                                // printf("??????\n");
                                 newFoci.push_back(foci[i]);
                                 count++;
                             }
+                        } else {
+                            // printf("wot");
+                            newFoci.push_back(foci[i]);
+                            count++;
                         }
-                        // printf("foci: \n");
-                        for (int i = 0; i < (int)foci.size(); i++) {
-                            // printf("i: %d, ", i);
-                            // printf("octave: %f, ", foci[i].octave);
-                            // printf("time: %f, ", foci[i].time);
-                        }
-                        foci = newFoci;
-                        // printf("newFoci: \n");
-                        for (int i = 0; i < (int)foci.size(); i++) {
-                            // printf("i: %d, ", i);
-                            // printf("octave: %f, ", foci[i].octave);
-                            // printf("time: %f, ", foci[i].time);
-                        }
+                    }
+                    // printf("foci: \n");
+                    for (int i = 0; i < (int)foci.size(); i++) {
+                        // printf("i: %d, ", i);
+                        // printf("octave: %f, ", foci[i].octave);
+                        // printf("time: %f, ", foci[i].time);
+                    }
+                    foci = newFoci;
+                    // printf("newFoci: \n");
+                    for (int i = 0; i < (int)foci.size(); i++) {
+                        // printf("i: %d, ", i);
+                        // printf("octave: %f, ", foci[i].octave);
+                        // printf("time: %f, ", foci[i].time);
                     }
                 }
             }
@@ -1482,7 +1515,10 @@ struct Canvas2D {
             // // ensure correct corners
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
+            if (n.selected)
+                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, selCol[0], selCol[1], selCol[2]);
+            else
+                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
 
             float tri_size = 6.0f;
             Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
@@ -1493,39 +1529,45 @@ struct Canvas2D {
         }
 
         // Add an origin line for the closest note
-        if (closest.octave >= 0.0f && std::abs(closest.origin) > 1e-6) {
-            Vec2 a = worldToScreen(topLeft, { closest.beat_on, closest.octave});
-            Vec2 c = worldToScreen(topLeft, {closest.beat_on, closest.origin});
-            addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y, 2, c.y - a.y, 0.353, 1.0, 0.353);
-            // Text describing the relationship
-            bool down = false;
-            float diff = closest.octave - closest.origin;
-            if (diff < 0) {
-                down = true;
-                diff *= -1;
-            }
-            int octaves = (int)std::floor(diff);
-            diff -= octaves;
-            float ratio = std::pow(2, diff);
-            int num, den;
-            if (down) {
-                floatToFraction(ratio, den, num);
-            } else {
-                floatToFraction(ratio, num, den);
-            }
+        if (closest.octave >= 0.0f) {
             int res = 0;
-            if (den == 1) {
-                res = sprintf(originText, "x %d", num);
-            } else {
-                res = sprintf(originText, "x %d / %d", num, den);
-            }
-            if (octaves != 0) {
+            if (std::abs(closest.origin) > 1e-6) {
+                Vec2 a = worldToScreen(topLeft, { closest.beat_on, closest.octave});
+                Vec2 c = worldToScreen(topLeft, {closest.beat_on, closest.origin});
+                addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y, 2, c.y - a.y, 0.353, 1.0, 0.353);
+                // Text describing the relationship
+                bool down = false;
+                float diff = closest.octave - closest.origin;
+                if (diff < 0) {
+                    down = true;
+                    diff *= -1;
+                }
+                int octaves = (int)std::floor(diff);
+                diff -= octaves;
+                float ratio = std::pow(2, diff);
+                int num, den;
                 if (down) {
-                    sprintf(originText + res, " (- %d octaves)", octaves);
+                    floatToFraction(ratio, den, num);
                 } else {
-                    sprintf(originText + res, " (+ %d octaves)", octaves);
+                    floatToFraction(ratio, num, den);
+                }
+                if (den == 1) {
+                    res = sprintf(originText, "x %d", num);
+                } else {
+                    res = sprintf(originText, "x %d / %d", num, den);
+                }
+                if (octaves != 0) {
+                    if (down) {
+                        res += sprintf(originText + res, " (- %d octaves)", octaves);
+                    } else {
+                        res += sprintf(originText + res, " (+ %d octaves)", octaves);
+                    }
                 }
             }
+            if (res != 0) {
+                res += sprintf(originText + res, ", ");
+            }
+            sprintf(originText + res, "profile %d", closest.profile);
             renderer.addText(originText, 10, 10, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
