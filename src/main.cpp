@@ -637,6 +637,7 @@ static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& no
         e1.type = 1;
         e1.beat  = bon;
         e1.value       = c4 * std::pow(2.0f, n.octave - 4.0f);
+        e1.profile = n.profile;
         ev.push_back(e1);
         SeqEvent e2;
         e2.type = 0;
@@ -707,7 +708,7 @@ bool find_division(TreeNode* current, int split, float current_start, float curr
             if (std::abs(current_start + ((i * size) / (float)denominator) - start) < 0.0001 && std::abs(current_start + (((i + 1) * size) / (float)denominator) - end) < 0.0001) {
                 printf("bruhhhhh");
                 TreeNode* current_beat = findNode(child.get(), i);
-                printf("1");
+                // printf("1");
                 if (!current_beat)
                     child->addChild(i);
                 printf("2");
@@ -782,6 +783,34 @@ void floatToFraction(float value, int& num, int& den, int maxDen = 10000) {
 
 
 
+char buttonLabels[27][32] = {"Export WAV", 
+    "BPM:          ", 
+    "Attack:          ", 
+    "Decay:          ", 
+    "Gain:            ", 
+    "Wav name:",
+    "Jump size:", 
+    "Split size:", 
+    "Export MIDI", 
+    "Save project", 
+    "Load project", 
+    "Change wave", 
+    "Sustain:          ", 
+    "Release:          ", 
+    "OSC1: Sine",
+    "OSC2: Sine",
+    "Attack:          ", 
+    "Decay:          ", 
+    "Sustain:          ", 
+    "Release:          ",
+    "Gain:              ",
+    "OSC3: Sine",
+    "Attack:          ", 
+    "Decay:          ", 
+    "Sustain:          ", 
+    "Release:          ",
+    "Gain:              "
+    };
 char texts[3][32] = {"file.wav", "              ", "              "};
 char originText[64];
 
@@ -1778,45 +1807,73 @@ int main(int, char**)
     CurrentBox nw;
     CurrentBox cw;
 
-    char buttonLabels[14][32] = {"Export WAV", "BPM:          ", "Attack:          ", "Decay:          ", "Gain:            ", "Wav name:", "Jump size:", "Split size:", "Export MIDI", "Save project", "Load project", "Change wave", "Sustain:          ", "Release:          "};
     std::vector<Button> buttons;
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.16f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[7], false, 0.0f, texts[2]);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[8], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[9], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[10], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[11], false);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 0.7f);
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0083333f);
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false); // Export wav
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f); // BPM
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f); // Attack 1 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f); // Decay 1 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.16f); // Gain 1 (value is sent as is)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]); // WAV name
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]); // Jump size
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[7], false, 0.0f, texts[2]); // Split size
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[8], false); // export MIDI
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[9], false); // Save project
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[10], false); // Load project
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[11], false); // Change wave
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 0.7f); // Sustain 1
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0083333f); // Release 1
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[14], false, 0.0f); // Wavetype 1
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[15], false, 0.0f); // Wavetype 2
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[16], false, 0.06667f); // Attack 2 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[17], false, 0.06667f); // Decay 2 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[18], false, 0.7f); // Sustain 2 (value is sent as is)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[19], false, 0.0083333f); // Release 2 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[20], false, 0.0f); // Gain 2 (value is sent as is)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[21], false, 0.0f); // Wavetype 3
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[22], false, 0.06667f); // Attack 3 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[23], false, 0.06667f); // Decay 3 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[24], false, 0.7f); // Sustain 3 (value is sent as is)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[25], false, 0.0083333f); // Release 3 (value * 3 is sent)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[26], false, 0.0f); // Gain 3 (value is sent as is)
     engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
-    // BPM, atack, decay, gain sliders
+    // BPM
     rects.push_back({10.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 1.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 2.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 3.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
-    rects.push_back({10.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
+    // OSC1 Settings
+    rects.push_back({140.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 14.0f, F_BUTTON_CW});
+    rects.push_back({140.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 2.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 3.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
     // WAV Save name, jump size, split size text boxes
     rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
     // Export WAV, export MIDI, save project, load project buttons
-    rects.push_back({140.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
-    rects.push_back({140.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});
-    rects.push_back({140.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 9.0f, F_BUTTON_CW});
-    rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 10.0f, F_BUTTON_CW});
-    rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 11.0f, F_BUTTON_CW});
+    rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
+    rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});
+    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 9.0f, F_BUTTON_CW});
+    rects.push_back({10.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 10.0f, F_BUTTON_CW});
+    rects.push_back({10.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 11.0f, F_BUTTON_CW});
+    // OSC2 Settings
+    rects.push_back({270.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 15.0f, F_BUTTON_CW});
+    rects.push_back({270.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 16.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 17.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 18.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 19.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 20.0f, F_SLIDER_CW});
+    // OSC3 Settings
+    rects.push_back({400.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 21.0f, F_BUTTON_CW});
+    rects.push_back({400.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 22.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 23.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 24.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 25.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
 
     bool running = true;
     bool playing = false;
@@ -1827,9 +1884,11 @@ int main(int, char**)
     int click = 0;
     int dx, dy;
     int sens = 15;
+    int currentProfile = 0;
     dx = dy = 0;
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
+    Profile profileSettings;
     while (running) {
         SDL_Event e;
         keys.clear();
@@ -1859,11 +1918,115 @@ int main(int, char**)
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
                             if (i == 5 || i == 6 || i == 7) selected = i;
                             buttons[i].hit = true;
-                            buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
+                            if (i != 14 && i != 15 && i != 21)
+                                buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
                             if (i == 1) {
                                 engine.setTempo(buttons[1].value * 180 + 20);
-                            } else if (i == 2 || i == 3 || i == 12 || i == 13) {
-                                engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
+                            } else if (i == 2 || i == 3 || i == 4 || (i >= 12 && i <= 26)) {
+                                // Set and send current profile
+                                if (i == 2) {
+                                    profileSettings.settings[0].attack = buttons[i].value * 3.0f;
+                                } else if (i == 3) {
+                                    profileSettings.settings[0].decay = buttons[i].value * 3.0f;
+                                } else if (i == 4) {
+                                    profileSettings.settings[0].gain = buttons[i].value;
+                                } else if (i == 12) {
+                                    profileSettings.settings[0].sustain = buttons[i].value;
+                                } else if (i == 13) {
+                                    profileSettings.settings[0].release = buttons[i].value;
+                                } else if (i == 14) {
+                                    buttons[i].value = buttons[i].value + 1.0f;
+                                    if (std::floor(buttons[i].value) == 5) {
+                                        printf("yes");
+                                        buttons[i].value = 0.0f;
+                                    }
+                                    int type = (int)buttons[i].value;
+                                    printf("type : %d", type);
+                                    fflush(stdout);
+                                    if (type == 0) {
+                                        profileSettings.settings[0].waveType = WaveformType::Sine;
+                                        sprintf(buttons[i].label, "OSC1: Sine");
+                                    } else if (type == 1) {
+                                        profileSettings.settings[0].waveType = WaveformType::Square;
+                                        sprintf(buttons[i].label, "OSC1: Square");
+                                    } else if (type == 2) {
+                                        profileSettings.settings[0].waveType = WaveformType::Saw;
+                                        sprintf(buttons[i].label, "OSC1: Saw");
+                                    } else if (type == 3) {
+                                        profileSettings.settings[0].waveType = WaveformType::Triangle;
+                                        sprintf(buttons[i].label, "OSC1: Triangle");
+                                    } else if (type == 4) {
+                                        profileSettings.settings[0].waveType = WaveformType::Noise;
+                                        sprintf(buttons[i].label, "OSC1: Noise");
+                                    }
+                                } else if (i == 15) {
+                                    buttons[i].value = buttons[i].value + 1.0f;
+                                    if (std::floor(buttons[i].value) == 5) {
+                                        buttons[i].value = 0.0f;
+                                    }
+                                    int type = (int)buttons[i].value;
+                                    if (type == 0) {
+                                        profileSettings.settings[1].waveType = WaveformType::Sine;
+                                        sprintf(buttons[i].label, "OSC2: Sine");
+                                    } else if (type == 1) {
+                                        profileSettings.settings[1].waveType = WaveformType::Square;
+                                        sprintf(buttons[i].label, "OSC2: Square");
+                                    } else if (type == 2) {
+                                        profileSettings.settings[1].waveType = WaveformType::Saw;
+                                        sprintf(buttons[i].label, "OSC2: Saw");
+                                    } else if (type == 3) {
+                                        profileSettings.settings[1].waveType = WaveformType::Triangle;
+                                        sprintf(buttons[i].label, "OSC2: Triangle");
+                                    } else if (type == 4) {
+                                        profileSettings.settings[1].waveType = WaveformType::Noise;
+                                        sprintf(buttons[i].label, "OSC2: Noise");
+                                    }
+                                } else if (i == 16) {
+                                    profileSettings.settings[1].attack = buttons[i].value * 3.0f;
+                                } else if (i == 17) {
+                                    profileSettings.settings[1].decay = buttons[i].value * 3.0f;
+                                } else if (i == 18) {
+                                    profileSettings.settings[1].sustain = buttons[i].value;
+                                } else if (i == 19) {
+                                    profileSettings.settings[1].release = buttons[i].value * 3.0f;
+                                } else if (i == 20) {
+                                    profileSettings.settings[1].gain = buttons[i].value;
+                                } else if (i == 21) {
+                                    buttons[i].value = buttons[i].value + 1.0f;
+                                    if (std::floor(buttons[i].value) == 5) {
+                                        buttons[i].value = 0.0f;
+                                    }
+                                    int type = (int)buttons[i].value;
+                                    if (type == 0) {
+                                        profileSettings.settings[2].waveType = WaveformType::Sine;
+                                        sprintf(buttons[i].label, "OSC3: Sine");
+                                    } else if (type == 1) {
+                                        profileSettings.settings[2].waveType = WaveformType::Square;
+                                        sprintf(buttons[i].label, "OSC3: Square");
+                                    } else if (type == 2) {
+                                        profileSettings.settings[2].waveType = WaveformType::Saw;
+                                        sprintf(buttons[i].label, "OSC3: Saw");
+                                    } else if (type == 3) {
+                                        profileSettings.settings[2].waveType = WaveformType::Triangle;
+                                        sprintf(buttons[i].label, "OSC3: Triangle");
+                                    } else if (type == 4) {
+                                        profileSettings.settings[2].waveType = WaveformType::Noise;
+                                        sprintf(buttons[i].label, "OSC3: Noise");
+                                    }
+                                } else if (i == 22) {
+                                    profileSettings.settings[2].attack = buttons[i].value * 3.0f;
+                                } else if (i == 23) {
+                                    profileSettings.settings[2].decay = buttons[i].value * 3.0f;
+                                } else if (i == 24) {
+                                    profileSettings.settings[2].sustain = buttons[i].value;
+                                } else if (i == 25) {
+                                    profileSettings.settings[2].release = buttons[i].value * 3.0f;
+                                } else if (i == 26) {
+                                    profileSettings.settings[2].gain = buttons[i].value;
+                                }
+                                printf("SP");
+                                engine.setProfile(profileSettings, currentProfile);
+                                // engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
                             } else if (i == 4) {
                                 engine.setGain(buttons[4].value);
                             }
@@ -1880,6 +2043,74 @@ int main(int, char**)
                 char key = e.key.keysym.sym;
                 keys.push_back(key);
                 if (key == SDLK_ESCAPE) running = false;
+
+                if (key >= 48 && key <= 57) {
+                    currentProfile = (int)key - 48;
+                    profileSettings = engine.getProfile(currentProfile);
+                    switch (profileSettings.settings[0].waveType) {
+                        case (WaveformType::Sine):
+                            buttons[14].value = 0.0f;
+                            break;
+                        case (WaveformType::Square):
+                            buttons[14].value = 1.0f;
+                            break;
+                        case (WaveformType::Saw):
+                            buttons[14].value = 2.0f;
+                            break;
+                        case (WaveformType::Triangle):
+                            buttons[14].value = 3.0f;
+                            break;
+                        default:
+                            buttons[14].value = 4.0f;
+                    }
+                    switch (profileSettings.settings[1].waveType) {
+                        case (WaveformType::Sine):
+                            buttons[15].value = 0.0f;
+                            break;
+                        case (WaveformType::Square):
+                            buttons[15].value = 1.0f;
+                            break;
+                        case (WaveformType::Saw):
+                            buttons[15].value = 2.0f;
+                            break;
+                        case (WaveformType::Triangle):
+                            buttons[15].value = 3.0f;
+                            break;
+                        default:
+                            buttons[15].value = 4.0f;
+                    }
+                    switch (profileSettings.settings[2].waveType) {
+                        case (WaveformType::Sine):
+                            buttons[21].value = 0.0f;
+                            break;
+                        case (WaveformType::Square):
+                            buttons[21].value = 1.0f;
+                            break;
+                        case (WaveformType::Saw):
+                            buttons[21].value = 2.0f;
+                            break;
+                        case (WaveformType::Triangle):
+                            buttons[21].value = 3.0f;
+                            break;
+                        default:
+                            buttons[21].value = 4.0f;
+                    }
+                    buttons[2].value = profileSettings.settings[0].attack / 3.0f;
+                    buttons[3].value = profileSettings.settings[0].decay / 3.0f;
+                    buttons[4].value = profileSettings.settings[0].gain;
+                    buttons[12].value = profileSettings.settings[0].sustain;
+                    buttons[13].value = profileSettings.settings[0].release / 3.0f;
+                    buttons[16].value = profileSettings.settings[1].attack / 3.0f;
+                    buttons[17].value = profileSettings.settings[1].decay / 3.0f;
+                    buttons[18].value = profileSettings.settings[1].sustain;
+                    buttons[19].value = profileSettings.settings[1].release / 3.0f;
+                    buttons[20].value = profileSettings.settings[1].gain;
+                    buttons[22].value = profileSettings.settings[2].attack / 3.0f;
+                    buttons[23].value = profileSettings.settings[2].decay / 3.0f;
+                    buttons[24].value = profileSettings.settings[2].sustain;
+                    buttons[25].value = profileSettings.settings[2].release / 3.0f;
+                    buttons[26].value = profileSettings.settings[2].gain;
+                }
                 if (selected != -1) {
                     if (key >= 32 && key <= 126 && (selected == 5 || selected == 6 || selected == 7) && strlen(buttons[selected].text) <= 14) {
                         if (buttons[selected].text[0] == ' ') {
@@ -2074,7 +2305,7 @@ int main(int, char**)
                 if (sliderPoint != -1.0f)
                     renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
             }
-            printf("1");
+            // printf("1");
 
             CurrentBox screenNw;
             screenNw.x1 = nw.x1 * dw;

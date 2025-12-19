@@ -41,6 +41,7 @@ struct SeqEvent {
     float beat = 0.0f;     // beat position
     int   type = 0;        // for future extension
     float value = 0.0f;    // frequency or other value
+    int profile = 0;
 };
 
 // ===============================
@@ -86,6 +87,18 @@ struct Message {
     std::vector<SeqEvent>* events = nullptr; // pointer to new event list
 };
 
+struct OSCSettings  {
+    WaveformType waveType;
+    float attack;
+    float decay;
+    float sustain;
+    float release;
+    float gain;
+};
+
+struct Profile {
+    OSCSettings settings[3];
+};
 
 // =========================================================
 // =============== LOCK-FREE MESSAGE QUEUE =================
@@ -157,7 +170,10 @@ public:
     void setTempo(float bpm);
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
+    void setProfile(Profile& p, int n);
+    Profile getProfile(int n);
 
+    Profile profiles[10];
 
     // Replace the entire event list
     // (Audio thread uses double-buffer swap)
@@ -206,8 +222,11 @@ private:
     static constexpr size_t MAX_VOICES = 64;
     std::array<float, MAX_VOICES> voiceFreqs{};
     std::array<float, MAX_VOICES> voicePhases{};
-    std::array<float, MAX_VOICES> voiceEnvs{};
-    std::array<uint8_t, MAX_VOICES> voiceStates{}; // 0=off,1=attack,2=sustain/decay,3=release
+    // std::array<float, MAX_VOICES> voiceEnvs{};
+    // std::array<uint8_t, MAX_VOICES> voiceStates{}; // 0=off,1=attack,2=sustain/decay,3=release
+    float voiceEnvs[64][3];
+    float voiceStates[64][3];
+    std::array<uint8_t, MAX_VOICES> voiceProfiles{};
 
     float divisorSmooth = 1.0f;  // for dividing by voice count smoothly
 

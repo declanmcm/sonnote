@@ -35,7 +35,6 @@ AudioEngine::~AudioEngine() {
 
 bool freeze = false;
 
-
 // ======================================================
 // ================== JACK CALLBACK ======================
 // ======================================================
@@ -63,6 +62,15 @@ bool AudioEngine::start() {
 
     jack = new JackState;
     jack->engine = this;
+
+    OSCSettings startingProfile = {WaveformType::Sine, 0.2f, 0.2f, 0.7f, 0.025f, 0.16f};
+    for (int i = 0; i < 10; i++) {
+        profiles[i].settings[0] = startingProfile;
+        profiles[i].settings[1] = startingProfile;
+        profiles[i].settings[2] = startingProfile;
+        profiles[i].settings[1].gain = 0.0f;
+        profiles[i].settings[2].gain = 0.0f;
+    }
 
     const char* clientName = "AudioEngine";
     jack_status_t status;
@@ -191,6 +199,15 @@ void AudioEngine::setADSR(const ADSRParams& a) {
     messageQueue.push(m);
 }
 
+void AudioEngine::setProfile(Profile& p, int n) {
+    profiles[n] = p;
+    printf("RP");
+}
+
+Profile AudioEngine::getProfile(int n) {
+    return profiles[n];
+}
+
 void AudioEngine::toggleFreeze() {
     freeze = !freeze;
 }
@@ -253,10 +270,13 @@ void AudioEngine::applyMessages() {
             nextEventIndex = 0;
             // Clear voices
             for (size_t i = 0; i < MAX_VOICES; ++i) {
-                voiceStates[i] = 0;
-                voiceEnvs[i] = 0.0f;
+                for (int j = 0; j < 3; j++) {
+                    voiceStates[i][j] = 0;
+                    voiceEnvs[i][j] = 0.0f;
+                }
                 voicePhases[i] = 0.0f;
                 voiceFreqs[i] = 0.0f;
+                voiceProfiles[i] = 0;
             }
             divisorSmooth = 1.0f;
             break;
@@ -362,10 +382,12 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
     }
 
     const float sr = sampleRate;
-    const float atkStep = (adsr.attack > 1e-6) ? (1.0f / (float)(adsr.attack  * sr)) : 1.0f;
-    const float relStep = (adsr.release > 1e-6) ? (1.0f / (float)(adsr.release * sr)) : 1.0f;
-    const float decStep = (adsr.decay   > 1e-6) ? (1.0f / (float)(adsr.decay   * sr)) : 1.0f;
-    printf("steps: (%f, %f)\n", atkStep, decStep);
+    // const float atkStep = (adsr.attack > 1e-6) ? (1.0f / (float)(adsr.attack  * sr)) : 1.0f;
+    // const float relStep = (adsr.release > 1e-6) ? (1.0f / (float)(adsr.release * sr)) : 1.0f;
+    // const float decStep = (adsr.decay   > 1e-6) ? (1.0f / (float)(adsr.decay   * sr)) : 1.0f;
+
+
+    // printf("steps: (%f, %f)\n", atkStep, decStep);
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
@@ -405,7 +427,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                         // NOTE ON
                         size_t voiceIndex = MAX_VOICES;
                         for (size_t v = 0; v < MAX_VOICES; ++v) {
-                            if (voiceStates[v] == 0) {
+                            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
                                 voiceIndex = v;
                                 break;
                             }
@@ -415,17 +437,21 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
                         voiceFreqs[voiceIndex]  = ev.value;
                         voicePhases[voiceIndex] = 0.0f;
-                        voiceEnvs[voiceIndex]   = 0.0f;
-                        voiceStates[voiceIndex] = 1;
+                        for (int i = 0; i < 3; i++) {
+                            voiceEnvs[voiceIndex][i]   = 0.0f;
+                            voiceStates[voiceIndex][i] = 1;
+                        }
+                        voiceProfiles[voiceIndex] = ev.profile;
                     }
                     else {
                         // NOTE OFF
                         for (size_t v = 0; v < MAX_VOICES; ++v) {
-                            if (voiceStates[v] != 0 &&
-                                std::abs(voiceFreqs[v] - ev.value) < 1e-4f &&
-                                voiceStates[v] != 3)
+                            if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || voiceStates[v][2] != 0) &&
+                                std::abs(voiceFreqs[v] - ev.value) < 1e-4f)
                             {
-                                voiceStates[v] = 3;
+                                voiceStates[v][0] = 3;
+                                voiceStates[v][1] = 3;
+                                voiceStates[v][2] = 3;
                                 break;
                             }
                         }
@@ -449,33 +475,40 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         // --- Per-voice synthesis (similar to old data_callback) ---
         int activeCount = 0;
         for (size_t v = 0; v < MAX_VOICES; ++v) {
-            if (voiceStates[v] == 0) continue; // inactive
+            // printf("voiceStates: %d, %d, %d\n", voiceStates[v][0], voiceStates[v][1], voiceStates[2]);
+            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) continue; // inactive
 
             activeCount++;
 
-            // Envelope update
-            if (voiceStates[v] == 1) {
-                // Attack
-                voiceEnvs[v] += atkStep;
-                if (voiceEnvs[v] >= 1.0f) {
-                    voiceEnvs[v] = 1.0f;
-                    voiceStates[v] = 2; // sustain/decay
-                }
-            } else if (voiceStates[v] == 2) {
-                // Decay toward sustain
-                if (voiceEnvs[v] > adsr.sustain) {
-                    voiceEnvs[v] -= decStep;
-                    if (voiceEnvs[v] <= adsr.sustain) {
-                        voiceEnvs[v] = adsr.sustain;
+            for (int i = 0; i < 3; i++) {
+                // Envelope update OSC i
+                if (voiceStates[v][i] == 1) {
+                    // Attack
+                    float atkStep = (profiles[voiceProfiles[v]].settings[i].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].attack  * sr)) : 1.0f;
+                    voiceEnvs[v][i] += atkStep;
+                    if (voiceEnvs[v][i] >= 1.0f) {
+                        voiceEnvs[v][i] = 1.0f;
+                        voiceStates[v][i] = 2; // sustain/decay
                     }
-                }
-            } else if (voiceStates[v] == 3) {
-                // Release
-                voiceEnvs[v] -= relStep;
-                if (voiceEnvs[v] <= 0.0f) {
-                    voiceEnvs[v] = 0.0f;
-                    voiceStates[v] = 0; // off
-                    continue;
+                } else if (voiceStates[v][i] == 2) {
+                    // Decay toward sustain
+                    float decStep = (profiles[voiceProfiles[v]].settings[i].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].decay  * sr)) : 1.0f;
+                    if (voiceEnvs[v][i] > adsr.sustain) {
+                        voiceEnvs[v][i] -= decStep;
+                        if (voiceEnvs[v][i] <= adsr.sustain) {
+                            voiceEnvs[v][i] = adsr.sustain;
+                        }
+                    }
+                } else if (voiceStates[v][i] == 3) {
+                    // Release
+                    float relStep = (profiles[voiceProfiles[v]].settings[i].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].release * sr)) : 1.0f;
+                    printf("relStep[%d]: %f\n", i, relStep);
+                    fflush(stdout);
+                    voiceEnvs[v][i] -= relStep;
+                    if (voiceEnvs[v][i] <= 0.0f) {
+                        voiceEnvs[v][i] = 0.0f;
+                        voiceStates[v][i] = 0; // off
+                    }
                 }
             }
 
@@ -487,8 +520,13 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             if (phase >= 1.0f) phase -= 1.0f;
             voicePhases[v] = phase;
 
-            float voiceSample = generateSample(waveform, phase) * voiceEnvs[v];
-            s += voiceSample;
+            for (int i = 0; i < 3; i++) {
+                float voiceSample = generateSample(profiles[voiceProfiles[v]].settings[i].waveType, phase) * voiceEnvs[v][i] * profiles[voiceProfiles[v]].settings[i].gain;
+
+                s += voiceSample;
+                // printf("s: %f gain: %f\n", s, profiles[voiceProfiles[v]].settings[i].gain);
+                fflush(stdout);
+            }
         }
 
         // Smooth divisor (like old "divisor" logic)
@@ -505,13 +543,14 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         }
 
         // Apply global gain
-        s *= gain;
+        // s *= gain;
 
         // Clamp
         if (s > 1.0f) s = 1.0f;
         if (s < -1.0f) s = -1.0f;
 
         outL[i] = s;
+        // printf("s: %f\n", s);
         outR[i] = s;
         toPrint[printIndex] = s;
         printIndex++;
