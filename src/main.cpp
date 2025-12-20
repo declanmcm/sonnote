@@ -535,11 +535,10 @@ std::unique_ptr<TreeNode> readTreeNode(std::ifstream& f)
     return node;
 }
 
-
 // --- Write binary song file ---
 bool save_song(const std::string& path,
                const std::vector<Note>& notes,
-               const std::vector<FocusChange>& focusChanges, const TreeNode& root)
+               const std::vector<FocusChange>& focusChanges, const TreeNode& root, Profile* profiles)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -554,6 +553,7 @@ bool save_song(const std::string& path,
         f.write(reinterpret_cast<const char*>(&n.beat_on), sizeof(float));
         f.write(reinterpret_cast<const char*>(&n.beat_off), sizeof(float));
         f.write(reinterpret_cast<const char*>(&n.octave), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&n.profile), sizeof(int));
     }
 
     // Focus changes
@@ -567,6 +567,25 @@ bool save_song(const std::string& path,
     // Time divisions
     writeTreeNode(f, root);
 
+    uint32_t profileCount = 10;
+    f.write(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 3; j++) {
+            OSCSettings osc = profiles[i].settings[j];
+
+            // Write enum as fixed-width integer
+            int32_t wave = static_cast<int32_t>(osc.waveType);
+            f.write(reinterpret_cast<char*>(&wave), sizeof(wave));
+
+            f.write(reinterpret_cast<const char*>(&osc.attack),  sizeof(float));
+            f.write(reinterpret_cast<const char*>(&osc.decay),   sizeof(float));
+            f.write(reinterpret_cast<const char*>(&osc.sustain), sizeof(float));
+            f.write(reinterpret_cast<const char*>(&osc.release), sizeof(float));
+            f.write(reinterpret_cast<const char*>(&osc.gain),    sizeof(float));
+            printf("sustain: %f\n", osc.sustain);
+        }
+    }
+
     f.close();
     return true;
 }
@@ -575,7 +594,7 @@ bool save_song(const std::string& path,
 bool load_song(const std::string& path,
                std::vector<Note>& notes,
                std::vector<FocusChange>& focusChanges,
-               std::unique_ptr<TreeNode>& root)
+               std::unique_ptr<TreeNode>& root, Profile* profiles)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -594,6 +613,7 @@ bool load_song(const std::string& path,
         f.read(reinterpret_cast<char*>(&notes[i].beat_on), sizeof(float));
         f.read(reinterpret_cast<char*>(&notes[i].beat_off), sizeof(float));
         f.read(reinterpret_cast<char*>(&notes[i].octave), sizeof(float));
+        f.read(reinterpret_cast<char*>(&notes[i].profile), sizeof(int));
     }
 
     // Focus changes
@@ -607,6 +627,33 @@ bool load_song(const std::string& path,
 
     // --- Tree root ---
     root = readTreeNode(f);
+
+
+    uint32_t profileCount;
+    f.read(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
+
+    if (profileCount != 10) {
+        // you can decide whether to error or clamp
+        return false;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 3; j++) {
+            OSCSettings* osc = &(profiles[i].settings[j]);
+
+            int32_t wave;
+            f.read(reinterpret_cast<char*>(&wave), sizeof(wave));
+            osc->waveType = static_cast<WaveformType>(wave);
+
+            f.read(reinterpret_cast<char*>(&osc->attack),  sizeof(float));
+            if (i == 0 && j == 0)
+                printf("read attack: %f\n", osc->attack);
+            f.read(reinterpret_cast<char*>(&osc->decay),   sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->sustain), sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->release), sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->gain),    sizeof(float));
+        }
+    }
 
     f.close();
     return true;
@@ -1107,7 +1154,7 @@ struct Canvas2D {
             if (k == '9')
                 return 9;
         }
-        return 0;
+        return -1;
     }
 
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
@@ -1287,6 +1334,7 @@ struct Canvas2D {
                 int number = numberContained(keys);
 
                 if (number != -1) {
+                    printf("non-zero profile\n");
                     notes[index].profile = number;
                 }
                 
@@ -1924,106 +1972,90 @@ int main(int, char**)
                                 engine.setTempo(buttons[1].value * 180 + 20);
                             } else if (i == 2 || i == 3 || i == 4 || (i >= 12 && i <= 26)) {
                                 // Set and send current profile
-                                if (i == 2) {
-                                    profileSettings.settings[0].attack = buttons[i].value * 3.0f;
-                                } else if (i == 3) {
-                                    profileSettings.settings[0].decay = buttons[i].value * 3.0f;
-                                } else if (i == 4) {
-                                    profileSettings.settings[0].gain = buttons[i].value;
-                                } else if (i == 12) {
-                                    profileSettings.settings[0].sustain = buttons[i].value;
-                                } else if (i == 13) {
-                                    profileSettings.settings[0].release = buttons[i].value;
-                                } else if (i == 14) {
-                                    buttons[i].value = buttons[i].value + 1.0f;
-                                    if (std::floor(buttons[i].value) == 5) {
-                                        printf("yes");
-                                        buttons[i].value = 0.0f;
+                                profileSettings.settings[0].attack = buttons[2].value * 3.0f;
+                                profileSettings.settings[0].decay = buttons[3].value * 3.0f;
+                                profileSettings.settings[0].gain = buttons[4].value;
+                                profileSettings.settings[0].sustain = buttons[12].value;
+                                profileSettings.settings[0].release = buttons[13].value * 3.0f;
+                                if (i == 14) {
+                                    buttons[14].value = buttons[14].value + 1.0f;
+                                    if (std::floor(buttons[14].value) == 5) {
+                                        buttons[14].value = 0.0f;
                                     }
-                                    int type = (int)buttons[i].value;
-                                    printf("type : %d", type);
-                                    fflush(stdout);
-                                    if (type == 0) {
-                                        profileSettings.settings[0].waveType = WaveformType::Sine;
-                                        sprintf(buttons[i].label, "OSC1: Sine");
-                                    } else if (type == 1) {
-                                        profileSettings.settings[0].waveType = WaveformType::Square;
-                                        sprintf(buttons[i].label, "OSC1: Square");
-                                    } else if (type == 2) {
-                                        profileSettings.settings[0].waveType = WaveformType::Saw;
-                                        sprintf(buttons[i].label, "OSC1: Saw");
-                                    } else if (type == 3) {
-                                        profileSettings.settings[0].waveType = WaveformType::Triangle;
-                                        sprintf(buttons[i].label, "OSC1: Triangle");
-                                    } else if (type == 4) {
-                                        profileSettings.settings[0].waveType = WaveformType::Noise;
-                                        sprintf(buttons[i].label, "OSC1: Noise");
-                                    }
-                                } else if (i == 15) {
-                                    buttons[i].value = buttons[i].value + 1.0f;
-                                    if (std::floor(buttons[i].value) == 5) {
-                                        buttons[i].value = 0.0f;
-                                    }
-                                    int type = (int)buttons[i].value;
-                                    if (type == 0) {
-                                        profileSettings.settings[1].waveType = WaveformType::Sine;
-                                        sprintf(buttons[i].label, "OSC2: Sine");
-                                    } else if (type == 1) {
-                                        profileSettings.settings[1].waveType = WaveformType::Square;
-                                        sprintf(buttons[i].label, "OSC2: Square");
-                                    } else if (type == 2) {
-                                        profileSettings.settings[1].waveType = WaveformType::Saw;
-                                        sprintf(buttons[i].label, "OSC2: Saw");
-                                    } else if (type == 3) {
-                                        profileSettings.settings[1].waveType = WaveformType::Triangle;
-                                        sprintf(buttons[i].label, "OSC2: Triangle");
-                                    } else if (type == 4) {
-                                        profileSettings.settings[1].waveType = WaveformType::Noise;
-                                        sprintf(buttons[i].label, "OSC2: Noise");
-                                    }
-                                } else if (i == 16) {
-                                    profileSettings.settings[1].attack = buttons[i].value * 3.0f;
-                                } else if (i == 17) {
-                                    profileSettings.settings[1].decay = buttons[i].value * 3.0f;
-                                } else if (i == 18) {
-                                    profileSettings.settings[1].sustain = buttons[i].value;
-                                } else if (i == 19) {
-                                    profileSettings.settings[1].release = buttons[i].value * 3.0f;
-                                } else if (i == 20) {
-                                    profileSettings.settings[1].gain = buttons[i].value;
-                                } else if (i == 21) {
-                                    buttons[i].value = buttons[i].value + 1.0f;
-                                    if (std::floor(buttons[i].value) == 5) {
-                                        buttons[i].value = 0.0f;
-                                    }
-                                    int type = (int)buttons[i].value;
-                                    if (type == 0) {
-                                        profileSettings.settings[2].waveType = WaveformType::Sine;
-                                        sprintf(buttons[i].label, "OSC3: Sine");
-                                    } else if (type == 1) {
-                                        profileSettings.settings[2].waveType = WaveformType::Square;
-                                        sprintf(buttons[i].label, "OSC3: Square");
-                                    } else if (type == 2) {
-                                        profileSettings.settings[2].waveType = WaveformType::Saw;
-                                        sprintf(buttons[i].label, "OSC3: Saw");
-                                    } else if (type == 3) {
-                                        profileSettings.settings[2].waveType = WaveformType::Triangle;
-                                        sprintf(buttons[i].label, "OSC3: Triangle");
-                                    } else if (type == 4) {
-                                        profileSettings.settings[2].waveType = WaveformType::Noise;
-                                        sprintf(buttons[i].label, "OSC3: Noise");
-                                    }
-                                } else if (i == 22) {
-                                    profileSettings.settings[2].attack = buttons[i].value * 3.0f;
-                                } else if (i == 23) {
-                                    profileSettings.settings[2].decay = buttons[i].value * 3.0f;
-                                } else if (i == 24) {
-                                    profileSettings.settings[2].sustain = buttons[i].value;
-                                } else if (i == 25) {
-                                    profileSettings.settings[2].release = buttons[i].value * 3.0f;
-                                } else if (i == 26) {
-                                    profileSettings.settings[2].gain = buttons[i].value;
                                 }
+                                int type = (int)buttons[14].value;
+                                if (type == 0) {
+                                    profileSettings.settings[0].waveType = WaveformType::Sine;
+                                    sprintf(buttons[14].label, "OSC1: Sine");
+                                } else if (type == 1) {
+                                    profileSettings.settings[0].waveType = WaveformType::Square;
+                                    sprintf(buttons[14].label, "OSC1: Square");
+                                } else if (type == 2) {
+                                    profileSettings.settings[0].waveType = WaveformType::Saw;
+                                    sprintf(buttons[14].label, "OSC1: Saw");
+                                } else if (type == 3) {
+                                    profileSettings.settings[0].waveType = WaveformType::Triangle;
+                                    sprintf(buttons[14].label, "OSC1: Triangle");
+                                } else if (type == 4) {
+                                    profileSettings.settings[0].waveType = WaveformType::Noise;
+                                    sprintf(buttons[14].label, "OSC1: Noise");
+                                }
+                                if (i == 15) {
+                                    buttons[15].value = buttons[15].value + 1.0f;
+                                    if (std::floor(buttons[15].value) == 5) {
+                                        buttons[15].value = 0.0f;
+                                    }
+                                }
+                                type = (int)buttons[15].value;
+                                if (type == 0) {
+                                    profileSettings.settings[1].waveType = WaveformType::Sine;
+                                    sprintf(buttons[15].label, "OSC2: Sine");
+                                } else if (type == 1) {
+                                    profileSettings.settings[1].waveType = WaveformType::Square;
+                                    sprintf(buttons[15].label, "OSC2: Square");
+                                } else if (type == 2) {
+                                    profileSettings.settings[1].waveType = WaveformType::Saw;
+                                    sprintf(buttons[15].label, "OSC2: Saw");
+                                } else if (type == 3) {
+                                    profileSettings.settings[1].waveType = WaveformType::Triangle;
+                                    sprintf(buttons[15].label, "OSC2: Triangle");
+                                } else if (type == 4) {
+                                    profileSettings.settings[1].waveType = WaveformType::Noise;
+                                    sprintf(buttons[15].label, "OSC2: Noise");
+                                }
+                                profileSettings.settings[1].attack = buttons[16].value * 3.0f;
+                                profileSettings.settings[1].decay = buttons[17].value * 3.0f;
+                                profileSettings.settings[1].sustain = buttons[18].value;
+                                profileSettings.settings[1].release = buttons[19].value * 3.0f;
+                                profileSettings.settings[1].gain = buttons[20].value;
+                                if (i == 21) {
+                                    buttons[i].value = buttons[21].value + 1.0f;
+                                    if (std::floor(buttons[i].value) == 5) {
+                                        buttons[i].value = 0.0f;
+                                    }
+                                }
+                                type = (int)buttons[21].value;
+                                if (type == 0) {
+                                    profileSettings.settings[2].waveType = WaveformType::Sine;
+                                    sprintf(buttons[21].label, "OSC3: Sine");
+                                } else if (type == 1) {
+                                    profileSettings.settings[2].waveType = WaveformType::Square;
+                                    sprintf(buttons[21].label, "OSC3: Square");
+                                } else if (type == 2) {
+                                    profileSettings.settings[2].waveType = WaveformType::Saw;
+                                    sprintf(buttons[21].label, "OSC3: Saw");
+                                } else if (type == 3) {
+                                    profileSettings.settings[2].waveType = WaveformType::Triangle;
+                                    sprintf(buttons[21].label, "OSC3: Triangle");
+                                } else if (type == 4) {
+                                    profileSettings.settings[2].waveType = WaveformType::Noise;
+                                    sprintf(buttons[21].label, "OSC3: Noise");
+                                }
+                                profileSettings.settings[2].attack = buttons[22].value * 3.0f;
+                                profileSettings.settings[2].decay = buttons[23].value * 3.0f;
+                                profileSettings.settings[2].sustain = buttons[24].value;
+                                profileSettings.settings[2].release = buttons[25].value * 3.0f;
+                                profileSettings.settings[2].gain = buttons[26].value;
                                 printf("SP");
                                 engine.setProfile(profileSettings, currentProfile);
                                 // engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
@@ -2050,50 +2082,65 @@ int main(int, char**)
                     switch (profileSettings.settings[0].waveType) {
                         case (WaveformType::Sine):
                             buttons[14].value = 0.0f;
+                            sprintf(buttons[14].label, "OSC1: Sine");
                             break;
                         case (WaveformType::Square):
                             buttons[14].value = 1.0f;
+                            sprintf(buttons[14].label, "OSC1: Square");
                             break;
                         case (WaveformType::Saw):
                             buttons[14].value = 2.0f;
+                            sprintf(buttons[14].label, "OSC1: Saw");
                             break;
                         case (WaveformType::Triangle):
                             buttons[14].value = 3.0f;
+                            sprintf(buttons[14].label, "OSC1: Triangle");
                             break;
                         default:
                             buttons[14].value = 4.0f;
+                            sprintf(buttons[14].label, "OSC1: Noise");
                     }
                     switch (profileSettings.settings[1].waveType) {
                         case (WaveformType::Sine):
                             buttons[15].value = 0.0f;
+                            sprintf(buttons[15].label, "OSC2: Sine");
                             break;
                         case (WaveformType::Square):
                             buttons[15].value = 1.0f;
+                            sprintf(buttons[15].label, "OSC2: Square");
                             break;
                         case (WaveformType::Saw):
                             buttons[15].value = 2.0f;
+                            sprintf(buttons[15].label, "OSC2: Saw");
                             break;
                         case (WaveformType::Triangle):
                             buttons[15].value = 3.0f;
+                            sprintf(buttons[15].label, "OSC2: Triangle");
                             break;
                         default:
                             buttons[15].value = 4.0f;
+                            sprintf(buttons[15].label, "OSC2: Noise");
                     }
                     switch (profileSettings.settings[2].waveType) {
                         case (WaveformType::Sine):
                             buttons[21].value = 0.0f;
+                            sprintf(buttons[21].label, "OSC3: Sine");
                             break;
                         case (WaveformType::Square):
                             buttons[21].value = 1.0f;
+                            sprintf(buttons[21].label, "OSC3: Square");
                             break;
                         case (WaveformType::Saw):
                             buttons[21].value = 2.0f;
+                            sprintf(buttons[21].label, "OSC3: Saw");
                             break;
                         case (WaveformType::Triangle):
                             buttons[21].value = 3.0f;
+                            sprintf(buttons[21].label, "OSC3: Triangle");
                             break;
                         default:
                             buttons[21].value = 4.0f;
+                            sprintf(buttons[21].label, "OSC3: Noise");
                     }
                     buttons[2].value = profileSettings.settings[0].attack / 3.0f;
                     buttons[3].value = profileSettings.settings[0].decay / 3.0f;
@@ -2185,13 +2232,30 @@ int main(int, char**)
         }
 
         if (buttons[9].hit) { // if save project button is pressed
-            save_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, *gBeatOctCanvas.getSplits());
+            Profile ps[10];
+            for (int i = 0; i < 10; i++) {
+                ps[i] = engine.getProfile(i);
+                if (i == 0) {
+                    printf("attack: %f\n", ps[i].settings[0].attack);
+                    uint32_t val_number32;
+                    memcpy(&val_number32, &ps[i].settings[0].attack, sizeof(val_number32));
+                    printf("attackNum: %08x", val_number32);
+                }
+            }
+            save_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, *gBeatOctCanvas.getSplits(), ps);
             buttons[9].hit = false;
         }
 
         if (buttons[10].hit) { // If load project button is pressed
             std::unique_ptr<TreeNode> loadedSplits;
-            load_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, loadedSplits);
+            Profile ps[10];
+            load_song("session.son", gBeatOctCanvas.notes, gBeatOctCanvas.foci, loadedSplits, ps);
+            for (int i = 0; i < 10; i++) {
+                if (i == 0) {
+                    printf("attack: %f", ps[i].settings[0].attack);
+                }
+                engine.setProfile(ps[i], i);
+            }
             gBeatOctCanvas.setSplits(std::move(loadedSplits));
             buttons[10].hit = false;
         }

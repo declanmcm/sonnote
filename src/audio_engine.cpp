@@ -201,7 +201,6 @@ void AudioEngine::setADSR(const ADSRParams& a) {
 
 void AudioEngine::setProfile(Profile& p, int n) {
     profiles[n] = p;
-    printf("RP");
 }
 
 Profile AudioEngine::getProfile(int n) {
@@ -493,10 +492,10 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 } else if (voiceStates[v][i] == 2) {
                     // Decay toward sustain
                     float decStep = (profiles[voiceProfiles[v]].settings[i].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].decay  * sr)) : 1.0f;
-                    if (voiceEnvs[v][i] > adsr.sustain) {
+                    if (voiceEnvs[v][i] > profiles[voiceProfiles[v]].settings[i].sustain) {
                         voiceEnvs[v][i] -= decStep;
-                        if (voiceEnvs[v][i] <= adsr.sustain) {
-                            voiceEnvs[v][i] = adsr.sustain;
+                        if (voiceEnvs[v][i] <= profiles[voiceProfiles[v]].settings[i].sustain) {
+                            voiceEnvs[v][i] = profiles[voiceProfiles[v]].settings[i].sustain;
                         }
                     }
                 } else if (voiceStates[v][i] == 3) {
