@@ -1933,6 +1933,7 @@ int main(int, char**)
     int dx, dy;
     int sens = 15;
     int currentProfile = 0;
+    bool windowActive = true;
     dx = dy = 0;
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
@@ -1942,6 +1943,17 @@ int main(int, char**)
         keys.clear();
         dx = dy = 0;
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_WINDOWEVENT) {
+                switch (e.window.event) {
+                    case SDL_WINDOWEVENT_FOCUS_GAINED:
+                        windowActive = true;
+                        break;
+
+                    case SDL_WINDOWEVENT_FOCUS_LOST:
+                        windowActive = false;
+                        break;
+                }
+            }
             rerender = true;
             if (e.type == SDL_QUIT) running = false;
             if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
@@ -2223,7 +2235,20 @@ int main(int, char**)
         }
 
         if (buttons[0].hit) {
-            engine.exportWav(buttons[5].text, 10.0f);
+            float max = -1.0f;
+            for (int i = 0; i < (int)gBeatOctCanvas.notes.size(); i++) {
+                if (gBeatOctCanvas.notes[i].beat_off > max) max = gBeatOctCanvas.notes[i].beat_off;
+            }
+
+            float lengthSecs = (60.0 / (float)bpm) * (max - playhead_time);
+            if (lengthSecs > 0.0) {
+                auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, 48000, playhead_time);
+                    
+                engine.setEvents(ev);
+                SDL_Delay(50);
+                engine.exportWav(buttons[5].text, playhead_time, lengthSecs);
+            }
+            buttons[0].hit = false;
         }
 
         if (buttons[8].hit) { // if export midi button is pressed
@@ -2283,7 +2308,7 @@ int main(int, char**)
 
         // Refer to notes for what was here
         // Clear vertex list and rebuild from rectangles
-        if (rerender) {
+        if (windowActive && rerender) {
             renderer.vertices.clear();
             int dw, dh;
             SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
@@ -2387,6 +2412,8 @@ int main(int, char**)
             renderer.drawFrame();
             if (size_changed) size_changed = false;
             rerender = false;
+        } else {
+            SDL_Delay(50);
         }
     }
 

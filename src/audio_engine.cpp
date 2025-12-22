@@ -255,7 +255,6 @@ void AudioEngine::applyMessages() {
             break;
 
         case MessageType::SetADSR:
-            printf("hi\n");
             adsr = msg.adsr;
             break;
 
@@ -421,38 +420,36 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 const SeqEvent& ev = activeEvents[nextEventIndex];
 
                 // Only trigger if we *passed* this beat within this audio block
-                if (ev.beat > lastBeat && ev.beat <= currentBeat) {
-                    if (ev.type == 1) {
-                        // NOTE ON
-                        size_t voiceIndex = MAX_VOICES;
-                        for (size_t v = 0; v < MAX_VOICES; ++v) {
-                            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
-                                voiceIndex = v;
-                                break;
-                            }
+                if (ev.type == 1) {
+                    // NOTE ON
+                    size_t voiceIndex = MAX_VOICES;
+                    for (size_t v = 0; v < MAX_VOICES; ++v) {
+                        if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
+                            voiceIndex = v;
+                            break;
                         }
-                        if (voiceIndex == MAX_VOICES)
-                            voiceIndex = 0; // steal voice 0
-
-                        voiceFreqs[voiceIndex]  = ev.value;
-                        voicePhases[voiceIndex] = 0.0f;
-                        for (int i = 0; i < 3; i++) {
-                            voiceEnvs[voiceIndex][i]   = 0.0f;
-                            voiceStates[voiceIndex][i] = 1;
-                        }
-                        voiceProfiles[voiceIndex] = ev.profile;
                     }
-                    else {
-                        // NOTE OFF
-                        for (size_t v = 0; v < MAX_VOICES; ++v) {
-                            if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || voiceStates[v][2] != 0) &&
-                                std::abs(voiceFreqs[v] - ev.value) < 1e-4f)
-                            {
-                                voiceStates[v][0] = 3;
-                                voiceStates[v][1] = 3;
-                                voiceStates[v][2] = 3;
-                                break;
-                            }
+                    if (voiceIndex == MAX_VOICES)
+                        voiceIndex = 0; // steal voice 0
+
+                    voiceFreqs[voiceIndex]  = ev.value;
+                    voicePhases[voiceIndex] = 0.0f;
+                    for (int i = 0; i < 3; i++) {
+                        voiceEnvs[voiceIndex][i]   = 0.0f;
+                        voiceStates[voiceIndex][i] = 1;
+                    }
+                    voiceProfiles[voiceIndex] = ev.profile;
+                }
+                else {
+                    // NOTE OFF
+                    for (size_t v = 0; v < MAX_VOICES; ++v) {
+                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || voiceStates[v][2] != 0) &&
+                            std::abs(voiceFreqs[v] - ev.value) < 1e-4f)
+                        {
+                            voiceStates[v][0] = 3;
+                            voiceStates[v][1] = 3;
+                            voiceStates[v][2] = 3;
+                            break;
                         }
                     }
                 }
@@ -501,8 +498,6 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 } else if (voiceStates[v][i] == 3) {
                     // Release
                     float relStep = (profiles[voiceProfiles[v]].settings[i].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].release * sr)) : 1.0f;
-                    printf("relStep[%d]: %f\n", i, relStep);
-                    fflush(stdout);
                     voiceEnvs[v][i] -= relStep;
                     if (voiceEnvs[v][i] <= 0.0f) {
                         voiceEnvs[v][i] = 0.0f;
@@ -524,7 +519,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
                 s += voiceSample;
                 // printf("s: %f gain: %f\n", s, profiles[voiceProfiles[v]].settings[i].gain);
-                fflush(stdout);
+                // fflush(stdout);
             }
         }
 
@@ -551,25 +546,25 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         outL[i] = s;
         // printf("s: %f\n", s);
         outR[i] = s;
-        toPrint[printIndex] = s;
-        printIndex++;
-        if (printIndex == 100) printIndex = 0;
+        // toPrint[printIndex] = s;
+        // printIndex++;
+        // if (printIndex == 100) printIndex = 0;
 
-        if (countdown == 0) {
-            printf("hey");
-            // Print to file
-            FILE* out = fopen("out.csv", "w+");
-            char str[16];
-            for (int i = 0; i < 99; i++) {
-                printIndex++;
-                if (printIndex == 100) printIndex = 0;
-                sprintf(str, "%f,", toPrint[printIndex]);
-                fputs(str, out);
-            }
-            sprintf(str, "%f", toPrint[++printIndex]);
-            fputs(str, out);
-            fclose(out);
-        }
+        // if (countdown == 0) {
+        //     printf("hey");
+        //     // Print to file
+        //     FILE* out = fopen("out.csv", "w+");
+        //     char str[16];
+        //     for (int i = 0; i < 99; i++) {
+        //         printIndex++;
+        //         if (printIndex == 100) printIndex = 0;
+        //         sprintf(str, "%f,", toPrint[printIndex]);
+        //         fputs(str, out);
+        //     }
+        //     sprintf(str, "%f", toPrint[++printIndex]);
+        //     fputs(str, out);
+        //     fclose(out);
+        // }
 
         if (!freeze)
             sampleCounter++;
@@ -585,7 +580,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 // Purely offline rendering.
 //
 
-bool AudioEngine::exportWav(const char* path, float durationSeconds)
+bool AudioEngine::exportWav(const char* path, float playhead_time, float durationSeconds)
 {
     // ========== SETUP LIBSNDFILE ==========
     SF_INFO info{};
@@ -600,6 +595,7 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
     }
 
     const uint64_t totalFrames = (uint64_t)(durationSeconds * sampleRate);
+    printf("duration: %f, totalFrames: %d, sampleRate: %f\n", durationSeconds, totalFrames, sampleRate);
 
     std::vector<float> buffer(totalFrames * 2, 0.0f);
 
@@ -609,8 +605,13 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
     // Local polyphonic arrays
     std::vector<float> freq(MAX_VOICES, 0.0f);
     std::vector<float> phase(MAX_VOICES, 0.0f);
-    std::vector<float> env(MAX_VOICES, 0.0f);
-    std::vector<uint8_t> state(MAX_VOICES, 0); // 0=off,1=attack,2=sustain/decay,3=release
+    std::vector<uint8_t> voicePs(MAX_VOICES, 0);
+    // std::vector<float> env(MAX_VOICES, 0.0f);
+    float env[MAX_VOICES][3];
+    uint8_t state[MAX_VOICES][3];
+    memset(env,   0, sizeof(env));
+    memset(state, 0, sizeof(state));
+    // std::vector<uint8_t> state(MAX_VOICES, 0); // 0=off,1=attack,2=sustain/decay,3=release
 
     float divisorSmooth = 1.0f;
 
@@ -626,15 +627,21 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
 
     // For wrap-around event playback
     bool hasEvents = !events.empty();
+    if (activeEvents.empty()) {
+        printf("empty\n");
+    }
     if (!hasEvents) {
         // No events? Write silence.
         sf_writef_float(snd, buffer.data(), totalFrames);
         sf_close(snd);
+        printf("hey!\n");
         return true;
     }
 
     // ========== PER-SAMPLE OFFLINE RENDER LOOP ==========
-    uint64_t sc = 0; // offline sample counter
+    uint64_t sc = playhead_time * samplesPerBeat; // offline sample counter
+    int totalZero = 0;
+    int totalNonZero = 0;
 
     for (uint64_t i = 0; i < totalFrames; ++i)
     {
@@ -642,30 +649,36 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
 
         // --- Sequencer / Event triggering ---
         double beat = double(sc) / samplesPerBeat;
-
         while (evIndex < events.size() && events[evIndex].beat <= beat) {
             const SeqEvent& ev = events[evIndex];
+
 
             if (ev.type == 1) {
                 // NOTE ON: find free voice
                 size_t v = MAX_VOICES;
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
-                    if (state[k] == 0) { v = k; break; }
+                    if (state[k][0] == 0 && state[k][1] == 0 && state[k][2] == 0) { 
+                        v = k; break; 
+                    }
                 }
                 if (v == MAX_VOICES) v = 0; // steal voice 0
 
                 freq[v]  = ev.value;
                 phase[v] = 0.0f;
-                env[v]   = 0.0f;
-                state[v] = 1; // attack
+                for (int i = 0; i < 3; i++) {
+                    env[v][i] = 0.0f;
+                    state[v][i] = 1;
+                }
+                voicePs[v] = ev.profile;
             } else {
                 // NOTE OFF: release matching voice
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
-                    if (state[k] != 0 &&
-                        fabsf(freq[k] - ev.value) < 1e-4f &&
-                        state[k] != 3)
+                    if ((state[k][0] != 0 || state[k][1] != 0 || state[k][2] != 0) &&
+                        fabsf(freq[k] - ev.value) < 1e-4f)
                     {
-                        state[k] = 3; // release
+                        state[k][0] = 3;
+                        state[k][1] = 3;
+                        state[k][2] = 3;
                         break;
                     }
                 }
@@ -678,52 +691,61 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
         // --- Polyphonic synthesis ---
         int activeVoices = 0;
 
-        float atkStep = (adsr.attack  > 0) ? (1.0f / (adsr.attack  * sr)) : 1.0f;
-        float relStep = (adsr.release > 0) ? (1.0f / (adsr.release * sr)) : 1.0f;
-        float decStep = (adsr.decay   > 0) ? (1.0f / (adsr.decay   * sr)) : 1.0f;
+        // float atkStep = (adsr.attack  > 0) ? (1.0f / (adsr.attack  * sr)) : 1.0f;
+        // float relStep = (adsr.release > 0) ? (1.0f / (adsr.release * sr)) : 1.0f;
+        // float decStep = (adsr.decay   > 0) ? (1.0f / (adsr.decay   * sr)) : 1.0f;
 
         for (size_t v = 0; v < MAX_VOICES; ++v)
         {
-            if (state[v] == 0)
+            if (state[v][0] == 0 && state[v][1] == 0 && state[v][2] == 0)
                 continue;
 
             activeVoices++;
+            for (int i = 0; i < 3; i++) {
+                // Envelope update
+                if (state[v][i] == 1) {
+                    float atkStep = (profiles[voicePs[v]].settings[i].attack > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].attack  * sr)) : 1.0f;
+                    env[v][i] += atkStep;
+                    if (env[v][i] >= 1.0f) {
+                        env[v][i] = 1.0f;
+                        state[v][i] = 2; // decay/sustain
+                    }
+                } 
+                else if (state[v][i] == 2) {
+                    float decStep = (profiles[voicePs[v]].settings[i].decay   > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].decay  * sr)) : 1.0f;
+                    if (env[v][i] > profiles[voicePs[v]].settings[i].sustain) {
+                        env[v][i] -= decStep;
+                        if (env[v][i] <= profiles[voicePs[v]].settings[i].sustain)
+                            env[v][i] = profiles[voicePs[v]].settings[i].sustain;
+                    }
+                } else if (state[v][i] == 3) {
+                    float relStep = (profiles[voicePs[v]].settings[i].release > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].release * sr)) : 1.0f;
+                    env[v][i] -= relStep;
+                    if (env[v][i] <= 0.0f) {
+                        env[v][i] = 0;
+                        state[v][i] = 0;
+                    }
+                }
+            }
 
-            // Envelope update
-            if (state[v] == 1) {
-                env[v] += atkStep;
-                if (env[v] >= 1.0f) {
-                    env[v] = 1.0f;
-                    state[v] = 2; // decay/sustain
-                }
-            } 
-            else if (state[v] == 2) {
-                if (env[v] > adsr.sustain) {
-                    env[v] -= decStep;
-                    if (env[v] <= adsr.sustain)
-                        env[v] = adsr.sustain;
-                }
-            }
-            else if (state[v] == 3) {
-                env[v] -= relStep;
-                if (env[v] <= 0.0f) {
-                    env[v] = 0;
-                    state[v] = 0;
-                    continue;
-                }
-            }
 
             // Phase + waveform
             phase[v] += freq[v] / sr;
             if (phase[v] >= 1.0f) phase[v] -= 1.0f;
-
-            float voiceSample =
-                generateSample(waveform, phase[v]) * env[v];
-
-            mix += voiceSample;
+            
+            for (int i = 0; i < 3; i++) {
+                float voiceSample =
+                    generateSample(profiles[voicePs[v]].settings[i].waveType, phase[v]) * env[v][i] * profiles[voicePs[v]].settings[i].gain;
+                if (voiceSample< 1e-6) {
+                    totalZero++;
+                } else {
+                    totalNonZero++;
+                }
+                mix += voiceSample;
+            }
         }
 
-        // --- voice count smoothing (your divisor trick) ---
+        // --- voice count smoothing ---
         if (activeVoices > 0) {
             if (fabs(divisorSmooth - (float)activeVoices) > 1e-6f) {
                 divisorSmooth += ((float)activeVoices - divisorSmooth) / 100.0f;
@@ -736,7 +758,7 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
         }
 
         // global gain
-        mix *= gain;
+        // mix *= gain;
 
         // clamp
         if (mix > 1.0f) mix = 1.0f;
@@ -747,6 +769,9 @@ bool AudioEngine::exportWav(const char* path, float durationSeconds)
 
         sc++;
     }
+
+    printf("totalZero: %d\n", totalZero);
+    printf("totatNonZero: %d\n", totalNonZero);
 
     // ========== WRITE TO FILE ==========
     sf_writef_float(snd, buffer.data(), totalFrames);

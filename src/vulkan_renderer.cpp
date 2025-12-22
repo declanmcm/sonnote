@@ -68,7 +68,7 @@ void VulkanRenderer::drawFrame() {
     // --- Rebuild the command buffer every frame ---
     VkCommandBuffer cmd = commandBuffers[imageIndex];
 
-    vkResetCommandBuffer(cmd, 0);
+    vkResetCommandPool(device, commandPool, 0);
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &beginInfo);
 

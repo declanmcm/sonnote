@@ -183,7 +183,7 @@ public:
     void resetSampleCounter();
 
     // Export WAV file using libsndfile
-    bool exportWav(const char* path, float durationSeconds);
+    bool exportWav(const char* path, float playhead_time, float durationSeconds);
 
 private:
     // =================================
