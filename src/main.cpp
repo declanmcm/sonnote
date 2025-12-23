@@ -890,6 +890,7 @@ struct Canvas2D {
     bool hover_valid = false;
     Vec2 hoverW{0,0};
     Vec2 unsnappedHoverW{0,0};
+    float anchorWXexact = 0.0f;
 
     TreeNode* getSplits() {
         return splits.get();
@@ -1318,6 +1319,26 @@ struct Canvas2D {
                 } 
             }
 
+            if (containsKey(keys, 's')) {
+                if (split_start != -1.0f) {
+                    float split_end = hoverW.x;
+                    if ((split_end > split_start) && std::ceil(split_end) - std::floor(split_start) == 1) {
+                        // Split time into specified amount
+                        int current_beat = std::floor(split_start);
+                        TreeNode* beat_node = findNode(splits.get(), current_beat);
+                        if (!beat_node) {
+                            // Create entry for that beat
+                            splits.get()->addChild(current_beat);
+                        }
+                        find_division(findNode(splits.get(), current_beat), parseDivisor(split), current_beat, current_beat + 1.0f, split_start, split_end);
+                        printTree(splits.get());
+                    }
+                    split_start = -1.0f;
+                } else {
+                    split_start = hoverW.x;
+                }
+            }
+
             if (match_found) {
                 // Drag start or end of note
                 if (containsKey(keys, 'l')) {
@@ -1348,25 +1369,6 @@ struct Canvas2D {
                     notes[index].origin = std::abs(notes[index].origin) < 1e-6 ? notes[index].octave : notes[index].origin;
                     notes[index].octave = notes[index].octave + (std::log2(parseDivisor(jump)));
                 }
-                if (containsKey(keys, 's')) {
-                    if (split_start != -1.0f) {
-                        float split_end = hoverW.x;
-                        if ((split_end > split_start) && std::ceil(split_end) - std::floor(split_start) == 1) {
-                            // Split time into specified amount
-                            int current_beat = std::floor(split_start);
-                            TreeNode* beat_node = findNode(splits.get(), current_beat);
-                            if (!beat_node) {
-                                // Create entry for that beat
-                                splits.get()->addChild(current_beat);
-                            }
-                            find_division(findNode(splits.get(), current_beat), parseDivisor(split), current_beat, current_beat + 1.0f, split_start, split_end);
-                            printTree(splits.get());
-                        }
-                        split_start = -1.0f;
-                    } else {
-                        split_start = hoverW.x;
-                    }
-                }
                 if (containsKey(keys, 'a')) {
                     notes[index].selected = !(notes[index].selected);
                 }
@@ -1378,7 +1380,7 @@ struct Canvas2D {
                 }
                 
                 // Delete the focus if the note had focus on it
-                if (containsKey(keys, 'f') || containsKey(keys, 'l') || containsKey(keys, 'd')) {
+                if (containsKey(keys, 'f') || containsKey(keys, 'l') || containsKey(keys, 'd') || containsKey(keys, 'j')) {
                     std::vector<FocusChange> newFoci;
                     int count = 0;
                     for (int i = 0; i < (int)foci.size(); i++) {
@@ -1755,11 +1757,20 @@ struct Canvas2D {
                 if (hover_valid) {
                     if (dragging) {
                         currently_dragged.octave = hoverW.y;
+                        if (snap_harmonics) {
+                            for (int i = 1; i < (int)foci.size(); i++) {
+                                if (foci[i - 1].time <= unsnappedHoverW.x && foci[i].time >= unsnappedHoverW.x) {
+                                    currently_dragged.origin = foci[i - 1].octave;
+                                    break;
+                                }
+                            }
+                        }
                         notes.push_back(currently_dragged);
                         dragging = false;
                     } else {
                         placing = true;
                         anchorW = hoverW;
+                        anchorWXexact= unsnappedHoverW.x;
                     }
                 }
             } else {
@@ -1776,12 +1787,9 @@ struct Canvas2D {
                         if (snap_harmonics) {
                             // Check whether there's any focus at the anchor
                             for (int i = 1; i < (int)foci.size(); i++) {
-                                if (i == 0) 
-                                    continue;
-
                                 // printf("foci[i - 1].time: %f, anchorW.x: %f, foci[i].time: %f\n", foci[i - 1].time, anchorW.x, foci[i].time);
                                 
-                                if (foci[i - 1].time <= anchorW.x && foci[i].time >= anchorW.x) {
+                                if (foci[i - 1].time <= anchorWXexact && foci[i].time >= anchorWXexact) {
                                     n.origin = foci[i - 1].octave;
                                     break;
                                 }
