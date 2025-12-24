@@ -92,11 +92,11 @@ target_link_libraries(app PRIVATE
 
 # Some Linux toolchains need these explicitly
 if (UNIX AND NOT APPLE)
-  target_link_libraries(app PRIVATE dl pthread)
+  target_link_libraries(app PRIVATE dl pthread fftw3f sndfile)
 endif()
 
 # Optional: stricter warnings for your code (not third-party)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic -g)
+  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -g)
 endif()
 

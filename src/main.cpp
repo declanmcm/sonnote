@@ -15,6 +15,8 @@
 #include <map>
 #include <memory>
 #include <iostream>
+#include <sndfile.h>
+#include <fftw3.h>
 
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -100,6 +102,10 @@ struct CurrentBox {
 
 #define NW_HEIGHT 0.75f
 
+constexpr int FFT_SIZE = 2048;
+constexpr int HOP_SIZE = 512;
+constexpr int NUM_BINS = FFT_SIZE / 2 + 1;
+
 TextRenderer g_textRenderer;
 VulkanDeviceContext g_deviceContext; // You'd need to populate this
 VkRenderPass g_renderPass;           // Your main render pass
@@ -124,6 +130,267 @@ TreeNode* findNode(TreeNode* node, int target) {
     }
     return nullptr;
 }
+
+struct AudioData {
+    int sampleRate = 0;
+    std::vector<float> mono;   // [-1,1] float samples
+};
+
+inline AudioData loadWavMono(const std::string& path)
+{
+    SF_INFO info{};
+    SNDFILE* f = sf_open(path.c_str(), SFM_READ, &info);
+    if (!f) throw std::runtime_error("sf_open failed");
+
+    std::vector<float> interleaved((size_t)info.frames * (size_t)info.channels);
+    sf_readf_float(f, interleaved.data(), info.frames);
+    sf_close(f);
+
+    AudioData out;
+    out.sampleRate = info.samplerate;
+    out.mono.resize((size_t)info.frames);
+
+    if (info.channels == 1) {
+        out.mono = std::move(interleaved);
+    } else {
+        for (sf_count_t i = 0; i < info.frames; ++i) {
+            double s = 0.0;
+            for (int ch = 0; ch < info.channels; ++ch)
+                s += interleaved[(size_t)i * info.channels + ch];
+            out.mono[(size_t)i] = (float)(s / info.channels);
+        }
+    }
+    return out;
+}
+
+struct SpectrogramState {
+    bool loaded = false;
+    float durationSeconds = 0.0f;
+    int textureWidth = 0;   // columns
+};
+
+SpectrogramState spectrogram;
+
+struct STFTMag {
+    int sampleRate = 0;
+    int fftSize = 0;
+    int hopSize = 0;
+    int numBins = 0;           // fftSize/2+1
+    int numFrames = 0;
+    std::vector<float> mag;    // flattened: mag[frame*numBins + bin]
+};
+
+inline std::vector<float> makeHann(int n)
+{
+    std::vector<float> w(n);
+    for (int i = 0; i < n; ++i)
+        w[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(n - 1)));
+    return w;
+}
+
+inline STFTMag computeSTFT_FFTW(
+    const std::vector<float>& samples,
+    int sampleRate,
+    int fftSize = 2048,
+    int hopSize = 512
+) {
+    if ((int)samples.size() < fftSize) throw std::runtime_error("audio too short for fftSize");
+
+    STFTMag out;
+    out.sampleRate = sampleRate;
+    out.fftSize = fftSize;
+    out.hopSize = hopSize;
+    out.numBins = fftSize / 2 + 1;
+    out.numFrames = ((int)samples.size() - fftSize) / hopSize + 1;
+    out.mag.assign((size_t)out.numFrames * (size_t)out.numBins, 0.0f);
+
+    auto window = makeHann(fftSize);
+
+    std::vector<float> in((size_t)fftSize);
+    std::vector<fftwf_complex> spec((size_t)out.numBins);
+
+    fftwf_plan plan = fftwf_plan_dft_r2c_1d(
+        fftSize, in.data(), spec.data(), FFTW_MEASURE
+    );
+
+    for (int frame = 0; frame < out.numFrames; ++frame) {
+        int offset = frame * hopSize;
+
+        for (int i = 0; i < fftSize; ++i)
+            in[(size_t)i] = samples[(size_t)offset + (size_t)i] * window[(size_t)i];
+
+        fftwf_execute(plan);
+
+        float* dst = out.mag.data() + (size_t)frame * (size_t)out.numBins;
+        for (int b = 0; b < out.numBins; ++b) {
+            float re = spec[(size_t)b][0];
+            float im = spec[(size_t)b][1];
+            dst[(size_t)b] = sqrtf(re * re + im * im);
+        }
+    }
+
+    fftwf_destroy_plan(plan);
+    return out;
+}
+
+inline void magToDbInPlace(STFTMag& stft, float floorDb = -80.0f)
+{
+    for (float& v : stft.mag) {
+        float db = 20.0f * log10f(v + 1e-9f);
+        if (db < floorDb) db = floorDb;
+        v = db;
+    }
+}
+
+inline void normalize01InPlace(std::vector<float>& a)
+{
+    float mn = 1e30f, mx = -1e30f;
+    for (float v : a) { mn = std::min(mn, v); mx = std::max(mx, v); }
+    float range = (mx - mn);
+    if (range < 1e-12f) range = 1.0f;
+    for (float& v : a) v = (v - mn) / range;
+}
+
+struct LogSpec {
+    int width = 0;   // time columns (frames or downsampled)
+    int height = 0;  // log rows
+    std::vector<float> v; // [y*width + x] in [0,1]
+};
+
+// helper
+inline float binHz(int bin, int sampleRate, int fftSize)
+{
+    return (float)bin * (float)sampleRate / (float)fftSize;
+}
+
+inline LogSpec remapToLogFreq(
+    const STFTMag& stft,
+    int rows = 512,
+    float fMin = 20.0f,
+    float fMax = 20000.0f
+) {
+    LogSpec out;
+    out.width  = stft.numFrames;
+    out.height = rows;
+    out.v.assign((size_t)out.width * (size_t)out.height, 0.0f);
+
+    // Precompute bin edges for each log row:
+    // row r covers [f0,f1) where f is exponentially spaced.
+    std::vector<int> binLo((size_t)rows), binHi((size_t)rows);
+
+    const float logMin = logf(fMin);
+    const float logMax = logf(fMax);
+
+    for (int r = 0; r < rows; ++r) {
+        float t0 = (float)r / (float)rows;
+        float t1 = (float)(r + 1) / (float)rows;
+        float f0 = expf(logMin + (logMax - logMin) * t0);
+        float f1 = expf(logMin + (logMax - logMin) * t1);
+
+        int lo = (int)floorf(f0 * stft.fftSize / stft.sampleRate);
+        int hi = (int)ceilf (f1 * stft.fftSize / stft.sampleRate);
+
+        lo = std::max(lo, 0);
+        hi = std::min(hi, stft.numBins - 1);
+        if (hi <= lo) hi = std::min(lo + 1, stft.numBins - 1);
+
+        binLo[(size_t)r] = lo;
+        binHi[(size_t)r] = hi;
+    }
+
+    // Average magnitude in each band
+    for (int x = 0; x < stft.numFrames; ++x) {
+        const float* frame = stft.mag.data() + (size_t)x * (size_t)stft.numBins;
+
+        for (int r = 0; r < rows; ++r) {
+            int lo = binLo[(size_t)r];
+            int hi = binHi[(size_t)r];
+
+            double sum = 0.0;
+            int count = 0;
+            for (int b = lo; b <= hi; ++b) { sum += frame[(size_t)b]; count++; }
+
+            // IMPORTANT: If you want low freq at bottom, flip r in storage or shader.
+            out.v[(size_t)r * (size_t)out.width + (size_t)x] = (float)(sum / std::max(1, count));
+        }
+    }
+
+    // normalize to 0..1 (assumes input is already dB-ish)
+    normalize01InPlace(out.v);
+    return out;
+}
+
+inline LogSpec downsampleTimeMax(const LogSpec& in, int targetWidth)
+{
+    if (targetWidth >= in.width) return in;
+
+    LogSpec out;
+    out.width  = targetWidth;
+    out.height = in.height;
+    out.v.assign((size_t)out.width * (size_t)out.height, 0.0f);
+
+    for (int y = 0; y < in.height; ++y) {
+        for (int x = 0; x < targetWidth; ++x) {
+            int x0 = (int)((int64_t)x     * in.width / targetWidth);
+            int x1 = (int)((int64_t)(x+1) * in.width / targetWidth);
+            if (x1 <= x0) x1 = x0 + 1;
+
+            float m = 0.0f;
+            for (int xi = x0; xi < x1; ++xi) {
+                m = std::max(m, in.v[(size_t)y * (size_t)in.width + (size_t)xi]);
+            }
+            out.v[(size_t)y * (size_t)out.width + (size_t)x] = m;
+        }
+    }
+    return out;
+}
+
+struct GrayImage {
+    int w=0, h=0;
+    std::vector<uint8_t> px; // size w*h
+};
+
+inline GrayImage toR8(const LogSpec& spec, bool flipY = true)
+{
+    GrayImage img;
+    img.w = spec.width;
+    img.h = spec.height;
+    img.px.resize((size_t)img.w * (size_t)img.h);
+
+    for (int y = 0; y < img.h; ++y) {
+        int sy = flipY ? (img.h - 1 - y) : y; // flip so low freq is bottom if desired
+        for (int x = 0; x < img.w; ++x) {
+            float v = spec.v[(size_t)sy * (size_t)img.w + (size_t)x];
+            int iv = (int)lrintf(v * 255.0f);
+            iv = std::min(255, std::max(0, iv));
+            img.px[(size_t)y * (size_t)img.w + (size_t)x] = (uint8_t)iv;
+        }
+    }
+    return img;
+}
+
+inline GrayImage buildSpectrogramTextureR8(
+    const std::string& wavPath,
+    int fftSize = 2048,
+    int hopSize = 512,
+    int logRows = 512,
+    int targetWidth = 4096,
+    float floorDb = -80.0f,
+    float fMin = 20.0f,
+    float fMax = 20000.0f
+) {
+    AudioData a = loadWavMono(wavPath);
+
+    STFTMag stft = computeSTFT_FFTW(a.mono, a.sampleRate, fftSize, hopSize);
+    magToDbInPlace(stft, floorDb);
+
+    // note: remapToLogFreq expects stft.mag in “some scale”; dB works best.
+    LogSpec logSpec = remapToLogFreq(stft, logRows, fMin, fMax);
+    LogSpec ds = downsampleTimeMax(logSpec, targetWidth);
+
+    return toR8(ds, /*flipY=*/true);
+}
+
 
 float perfectIntervals[] = {
     3.0 / 2.0, // Fifth
@@ -1931,6 +2198,35 @@ int main(int, char**)
     rects.push_back({400.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 25.0f, F_SLIDER_CW});
     rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
 
+    // 1) Build spectrogram on CPU
+    GrayImage img = buildSpectrogramTextureR8(
+        "file.wav",
+        2048,        // FFT size
+        512,         // hop
+        512,         // log rows
+        4096,        // texture width
+        -80.0f,      // dB floor
+        20.0f,
+        20000.0f
+    );
+
+    AudioData audio = loadWavMono("file.wav");
+
+    renderer.createSpectrogramPipeline();
+
+    // 2) Upload to GPU
+    renderer.uploadSpectrogramR8(
+        img.px.data(),
+        img.w,
+        img.h
+    );
+
+    // --- Cache metadata for rendering ---
+    spectrogram.loaded = true;
+    spectrogram.durationSeconds =
+        (float)audio.mono.size() / (float)audio.sampleRate;
+    spectrogram.textureWidth = img.w;
+
     bool running = true;
     bool playing = false;
     bool size_changed = false;
@@ -2417,7 +2713,7 @@ int main(int, char**)
             gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
 
             renderer.updateVertexData();
-            renderer.drawFrame();
+            renderer.drawFrame((int)screenNw.x1, (int)screenNw.y1, (int)(screenNw.x2 - screenNw.x1), (int)(screenNw.y2 - screenNw.y1));
             if (size_changed) size_changed = false;
             rerender = false;
         } else {

@@ -26,6 +26,11 @@ struct Vertex {
     float color[3];
 };
 
+
+// Size (enough for a few quads)
+static constexpr VkDeviceSize TRANSIENT_QUAD_BUFFER_SIZE =
+    sizeof(Vertex) * 64;
+
 static std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
     if (!file.is_open()) throw std::runtime_error("failed to open file!");
@@ -41,7 +46,7 @@ public:
     VulkanRenderer(SDL_Window* window);
     ~VulkanRenderer();
 
-    void drawFrame();
+    void drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canvasW, uint32_t canvasH);
 
     void addText(const char* text, float x, float y, float scale, const glm::vec4& colour);
 
@@ -136,9 +141,161 @@ public:
     uint32_t getWindowWidth() const { return windowWidth; }
     uint32_t getWindowHeight() const { return windowHeight; }
 
+    void createSpectrogramPipeline(); // call after createRenderPass()
+    void uploadSpectrogramR8(const uint8_t* data, int w, int h);
+
+    void createTransientQuadBuffer()
+    {
+        createVulkanBuffer(device, physicalDevice,
+            TRANSIENT_QUAD_BUFFER_SIZE,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            transientQuadBuffer,
+            transientQuadMemory, 
+            &transientQuadMapped
+        );
+    }
+
+    void updateTransientVertexBuffer(
+        const Vertex* data,
+        size_t sizeBytes
+    ) {
+        if (sizeBytes > TRANSIENT_QUAD_BUFFER_SIZE) {
+            throw std::runtime_error("Transient quad buffer overflow");
+        }
+
+        memcpy(transientQuadMapped, data, sizeBytes);
+    }
+
+    void destroyTransientQuadBuffer()
+    {
+        if (transientQuadMapped) {
+            vkUnmapMemory(device, transientQuadMemory);
+            transientQuadMapped = nullptr;
+        }
+
+        vkDestroyBuffer(device, transientQuadBuffer, nullptr);
+        vkFreeMemory(device, transientQuadMemory, nullptr);
+    }
+
     VkDevice getDevice() {
         return device;
     }
+
+    void createImage2D(
+    int w, int h,
+    VkFormat format,
+    VkImageUsageFlags usage,
+    VkImage& image,
+    VkDeviceMemory& memory
+    ) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.extent = { (uint32_t)w, (uint32_t)h, 1 };
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.format = format;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ci.usage = usage;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateImage(device, &ci, nullptr, &image) != VK_SUCCESS)
+            throw std::runtime_error("createImage2D failed");
+
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device, image, &req);
+
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (vkAllocateMemory(device, &ai, nullptr, &memory) != VK_SUCCESS)
+            throw std::runtime_error("vkAllocateMemory image failed");
+
+        vkBindImageMemory(device, image, memory, 0);
+    }
+
+    VkImageView createImageView2D(VkImage image, VkFormat format)
+    {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vi.subresourceRange.baseMipLevel = 0;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.baseArrayLayer = 0;
+        vi.subresourceRange.layerCount = 1;
+
+        VkImageView view{};
+        if (vkCreateImageView(device, &vi, nullptr, &view) != VK_SUCCESS)
+            throw std::runtime_error("createImageView2D failed");
+        return view;
+    }
+
+    void transitionImageLayout(
+        VkImage image, VkFormat,
+        VkImageLayout oldLayout, VkImageLayout newLayout
+    ) {
+        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily);
+
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = oldLayout;
+        b.newLayout = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.baseMipLevel = 0;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.baseArrayLayer = 0;
+        b.subresourceRange.layerCount = 1;
+
+        VkPipelineStageFlags srcStage = 0, dstStage = 0;
+
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            b.srcAccessMask = 0;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+                newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else {
+            throw std::runtime_error("unsupported layout transition");
+        }
+
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+        endSingleTimeCommands(device, cmd, graphicsQueue, graphicsFamily);
+    }
+
+    void copyBufferToImage(VkBuffer buffer, VkImage image, int w, int h)
+    {
+        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily);
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;   // tightly packed
+        region.bufferImageHeight = 0; // tightly packed
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {0,0,0};
+        region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
+
+        vkCmdCopyBufferToImage(cmd, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        endSingleTimeCommands(device, cmd, graphicsQueue, graphicsFamily);
+    }
+
+
 
 private:
     SDL_Window* window;
@@ -177,6 +334,27 @@ private:
 
     std::vector<Text> texts;
 
+    // --- Spectrogram texture resources ---
+    VkImage spectroImage{};
+    VkDeviceMemory spectroMemory{};
+    VkImageView spectroView{};
+    VkSampler spectroSampler{};
+
+    VkDescriptorSetLayout spectroSetLayout{};
+    VkDescriptorPool spectroDescPool{};
+    VkDescriptorSet spectroDescSet{};
+
+    VkPipelineLayout spectroPipelineLayout{};
+    VkPipeline spectroPipeline{};
+    
+    // Transient quad buffer
+    VkBuffer transientQuadBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory transientQuadMemory = VK_NULL_HANDLE;
+    void* transientQuadMapped = nullptr;
+
+    bool hasSpectrogram = false;
+    int spectroW = 0, spectroH = 0;
+
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
         VkDebugUtilsMessageTypeFlagsEXT             messageType,
@@ -195,11 +373,13 @@ private:
         std::vector<const char*> extensions(extCount);
         SDL_Vulkan_GetInstanceExtensions(window, &extCount, extensions.data());
 
-        VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        VkApplicationInfo appInfo{};
+        appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "Sonnote";
         appInfo.apiVersion = VK_API_VERSION_1_0;
 
-        VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        VkInstanceCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = extCount;
         createInfo.ppEnabledExtensionNames = extensions.data();

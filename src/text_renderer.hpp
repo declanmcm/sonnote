@@ -45,12 +45,15 @@ struct GlyphMetric {
     float advance; 
 };
 
-
 struct TextVertex {
     glm::vec2 pos; // Screen-space position
     glm::vec2 uv;  // Texture coordinate
     glm::vec4 colour;
 };
+
+VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyIndex);
+void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, uint32_t queueFamilyIndex);
+void createVulkanBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory, void** mappedData);
 
 // --- Main Text Renderer Class ---
 
