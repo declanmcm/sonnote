@@ -1434,11 +1434,23 @@ struct Canvas2D {
 
         bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
 
+        // printf("keys: ");
+        // for (int i = 0; i < (int)keys.size(); i++) {
+        //     printf("%08x,", keys[i]);
+        // }
+        // printf("\n");
+
         // --- Panning with RMB drag ---
         if (hovered && dx != 0 || dy != 0) {
-            // Convert pixel delta → world delta
-            x0 -= dx / sx;
-            y0 -= dy / sy; // + because dragging down increases screen y but decreases world y
+            if (containsKey(keys, '~')) {
+                printf("hi\n");
+                sx += dx;
+                sy += dy;
+            } else {
+                // Convert pixel delta → world delta
+                x0 -= dx / sx;
+                y0 -= dy / sy; // + because dragging down increases screen y but decreases world y
+            }
         }
 
         if (hovered && click == 2 && std::abs(prevHover.x) > 1e-6) {
@@ -2226,15 +2238,16 @@ int main(int, char**)
     );
 
     // --- Cache metadata for rendering ---
-    spectrogram.loaded = true;
-    spectrogram.durationSeconds =
-        (float)audio.mono.size() / (float)audio.sampleRate;
-    spectrogram.textureWidth = img.w;
+    // spectrogram.loaded = true;
+    // spectrogram.durationSeconds =
+    //     (float)audio.mono.size() / (float)audio.sampleRate;
+    // spectrogram.textureWidth = img.w;
 
     bool running = true;
     bool playing = false;
     bool size_changed = false;
     bool rerender = true;
+    bool ctrl = false;
     int selected = -1;
     int bpm = 110;
     int click = 0;
@@ -2249,6 +2262,9 @@ int main(int, char**)
     while (running) {
         SDL_Event e;
         keys.clear();
+        if (ctrl) {
+            keys.push_back('~');
+        }
         dx = dy = 0;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_WINDOWEVENT) {
@@ -2393,7 +2409,11 @@ int main(int, char**)
             }
             if (e.type == SDL_KEYDOWN) {
                 char key = e.key.keysym.sym;
-                keys.push_back(key);
+                if (e.key.keysym.sym == SDLK_LCTRL) {
+                    ctrl = true;
+                } else {
+                    keys.push_back(key);
+                }
                 if (key == SDLK_ESCAPE) running = false;
 
                 if (key >= 48 && key <= 57) {
@@ -2492,6 +2512,11 @@ int main(int, char**)
                     if (key == 'n') {
                         engine.toggleFreeze();
                     }
+                }
+            }
+            if (e.type == SDL_KEYUP) {
+                if (e.key.keysym.sym == SDLK_LCTRL) {
+                    ctrl = false;
                 }
             }
             if (e.type == SDL_MOUSEMOTION) {
