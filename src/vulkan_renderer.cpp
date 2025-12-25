@@ -304,26 +304,55 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // ============================================================
-    // 1) LIMIT DRAWING TO NOTE CANVAS
-    // ============================================================
-    VkRect2D canvasScissor{};
-    canvasScissor.offset = { canvasX, canvasY };
-    canvasScissor.extent = {
-        (uint32_t)canvasW,
-        (uint32_t)canvasH
-    };
-    vkCmdSetScissor(cmd, 0, 1, &canvasScissor);
+    // // ============================================================
+    // // 1) LIMIT DRAWING TO NOTE CANVAS
+    // // ============================================================
+    // VkRect2D canvasScissor{};
+    // canvasScissor.offset = { canvasX, canvasY };
+    // canvasScissor.extent = {
+    //     (uint32_t)canvasW,
+    //     (uint32_t)canvasH
+    // };
+    // vkCmdSetScissor(cmd, 0, 1, &canvasScissor);
+
+    VkClearValue clearColor = {0.1f, 0.1f, 0.1f, 1.0f};
+    VkRenderPassBeginInfo rpInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rpInfo.renderPass = renderPass;
+    rpInfo.framebuffer = framebuffers[imageIndex];
+    rpInfo.renderArea.offset = {0, 0};
+    rpInfo.renderArea.extent = swapchainExtent;
+    rpInfo.clearValueCount = 1;
+    rpInfo.pClearValues = &clearColor;
+
+    vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     // ============================================================
     // 2) BLACK BACKGROUND (normal pipeline)
     // ============================================================
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-    float x0 = (canvasX / swapchainExtent.width) * 2.0f - 1.0f;
-    float x1 = ((canvasX + canvasW) / swapchainExtent.width) * 2.0f - 1.0f;
-    float y0 = (canvasY / swapchainExtent.height) * 2.0f - 1.0f;
-    float y1 = ((canvasY + canvasH) / swapchainExtent.height) * 2.0f - 1.0f;
+    VkViewport viewport{};
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.width  = (float)swapchainExtent.width;
+    viewport.height = (float)swapchainExtent.height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = swapchainExtent;
+
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    float x0 = ((float)canvasX / swapchainExtent.width) * 2.0f - 1.0f;
+    float x1 = ((float)(canvasX + canvasW) / swapchainExtent.width) * 2.0f - 1.0f;
+    float y0 = ((float)canvasY / swapchainExtent.height) * (-2.0f) + 1.0f;
+    float y1 = ((float)(canvasY + canvasH) / swapchainExtent.height) * (-2.0f) + 1.0f;
+
+    printf("x, y: (%f, %f, %f, %f)\n", x0, x1, y0, y1);
+    printf("canvas: (%d, %d, %d,%d)\n", canvasX, canvasY, canvasW, canvasH);
 
     // CPU geometry
     Vertex blackQuad[6] = {
@@ -338,11 +367,20 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
     updateTransientVertexBuffer(blackQuad, sizeof(blackQuad));
     VkBuffer buffers[] = { transientQuadBuffer };
     VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
+    // vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
+    // vkCmdDraw(cmd, 6, 1, 0, 0);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    if (!vertices.empty() && (int)vertices.size() >= 12) {
+        VkBuffer tempBuffers[] = {vertexBuffer};
+        VkDeviceSize tempOffsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, tempBuffers, offsets);
+        vkCmdDraw(cmd, 12, 1, 0, 0);
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, spectroPipeline);
 
     if (hasSpectrogram) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, spectroPipeline);
 
         vkCmdBindDescriptorSets(
             cmd,
@@ -375,46 +413,21 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
         vkCmdDraw(cmd, 6, 1, 0, 0);
     }
 
-    // ============================================================
-    // 4) RESTORE FULL SCISSOR
-    // ============================================================
-    VkRect2D fullScissor{};
-    fullScissor.offset = {0,0};
-    fullScissor.extent = swapchainExtent;
-    vkCmdSetScissor(cmd, 0, 1, &fullScissor);
+    // // ============================================================
+    // // 4) RESTORE FULL SCISSOR
+    // // ============================================================
+    // VkRect2D fullScissor{};
+    // fullScissor.offset = {0,0};
+    // fullScissor.extent = swapchainExtent;
+    // vkCmdSetScissor(cmd, 0, 1, &fullScissor);
 
-    VkClearValue clearColor = {0.08f, 0.09f, 0.11f, 1.0f};
-    VkRenderPassBeginInfo rpInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rpInfo.renderPass = renderPass;
-    rpInfo.framebuffer = framebuffers[imageIndex];
-    rpInfo.renderArea.offset = {0, 0};
-    rpInfo.renderArea.extent = swapchainExtent;
-    rpInfo.clearValueCount = 1;
-    rpInfo.pClearValues = &clearColor;
-
-    vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-    VkViewport viewport{};
-    viewport.x = 0;
-    viewport.y = 0;
-    viewport.width  = (float)swapchainExtent.width;
-    viewport.height = (float)swapchainExtent.height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = swapchainExtent;
-
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-    if (!vertices.empty()) {
-        VkBuffer buffers[] = {vertexBuffer};
-        VkDeviceSize offsets[] = {0};
-        vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+    if (!vertices.empty() && (int)vertices.size() > 12) {
+        VkBuffer tempBuffers[] = {vertexBuffer};
+        VkDeviceSize tempOffsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, tempBuffers, tempOffsets);
+        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size() - 12), 1, 12, 0);
     }
 
     // Begin staging all text strings

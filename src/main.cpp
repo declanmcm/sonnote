@@ -2210,6 +2210,10 @@ int main(int, char**)
         20000.0f
     );
 
+    // for (int i = 0; i < (int)img.px.size(); i++) {
+    //     printf("%d ", img.px[i]);
+    // }
+
     AudioData audio = loadWavMono("file.wav");
 
     renderer.createSpectrogramPipeline();
@@ -2713,7 +2717,7 @@ int main(int, char**)
             gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
 
             renderer.updateVertexData();
-            renderer.drawFrame((int)screenNw.x1, (int)screenNw.y1, (int)(screenNw.x2 - screenNw.x1), (int)(screenNw.y2 - screenNw.y1));
+            renderer.drawFrame(std::floor(screenNw.x1), std::floor(screenNw.y1), std::floor(screenNw.x2 - screenNw.x1), std::floor(screenNw.y2 - screenNw.y1));
             if (size_changed) size_changed = false;
             rerender = false;
         } else {
