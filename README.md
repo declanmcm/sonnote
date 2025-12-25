@@ -6,7 +6,7 @@
 
 ## Overview
 
-**Sonnote** is a standalone program using ImGui (going forwards Vulkan) and JACK to provide a composition tool based on pure intervals.
+**Sonnote** is a standalone program using Vulkan and JACK to provide a composition tool based on pure intervals.
 
 ## Compilation
 
