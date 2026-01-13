@@ -9,14 +9,14 @@
 #include <sstream>
 #include <fstream>
 #include <cmath>
-#include <vector>
-#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <iostream>
 #include <sndfile.h>
 #include <fftw3.h>
+#include "exprtk.hpp"
+#include "audio_engine.hpp"
 
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -27,8 +27,6 @@
 #endif
 
 
-#include "audio_engine.hpp"
-
 struct Note {
     float beat_on;   // inclusive
     float beat_off;  // exclusive
@@ -37,6 +35,206 @@ struct Note {
     float origin;
     bool selected;
     int profile;
+};
+
+exprtk::symbol_table<double> table;
+exprtk::parser<double> parser;
+double b = 0.0f;
+double t = 0.0f;
+
+#define EV_TEMPO_START 2
+#define EV_NOTE_START 1
+#define EV_NOTE_END 0
+#define EV_BEAT 3
+
+// Using AVL tree
+// Can be note (on/off)
+struct Event {
+    float beat;
+    exprtk::expression<double> function;
+    int height;
+    Event* left;
+    Event* right;
+    int id;
+    float origin;
+    bool selected;
+    bool finalEv;
+    bool isConstant;
+    int velocity;
+    int profile;
+    int type;
+
+    Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t) {
+        function.register_symbol_table(table);
+        if (!parser.compile(expr_string, function)) {
+            throw std::runtime_error("Expression parse error: " + parser.error());
+        }
+        left = NULL;
+        right = NULL;
+    }
+};
+
+class EventTree {
+public:
+    void insert(Event* value) {
+        root = insert(root, value);
+    }
+
+    void remove(float key) {
+        root = remove(root, key);
+    }
+
+    void inorder() const {
+        inorder(root);
+        std::cout << "\n";
+    }
+
+    Event* root;
+
+private:
+
+    // ---------- Utilities ----------
+    int height(Event*& n) {
+        return n ? n->height : 0;
+    }
+
+    int balanceFactor(Event*& n) {
+        return n ? height(n->left) - height(n->right) : 0;
+    }
+
+    void updateHeight(Event* n) {
+        n->height = 1 + std::max(height(n->left), height(n->right));
+    }
+
+    // ---------- Rotations ----------
+    Event* rotateRight(Event* y) {
+        auto x = y->left;
+        auto T2 = x->right;
+
+        x->right = y;
+        x->right->left = T2;
+
+        updateHeight(x->right);
+        updateHeight(x);
+
+        return x;
+    }
+
+    Event* rotateLeft(Event* x) {
+        auto y = x->right;
+        auto T2 = y->left;
+
+        y->left = x;
+        y->left->right = T2;
+
+        updateHeight(y->left);
+        updateHeight(y);
+
+        return y;
+    }
+
+    // ---------- Insert ----------
+    Event* insert(Event* node, Event* value) {
+        if (!node) {
+            // Event* copy = (Event*)malloc(sizeof(Event));
+            // if (copy == NULL) {
+            //     return NULL;
+            // }
+            // memcpy(copy, value, sizeof(Event));
+            // copy->function = value->function;
+            return value;
+        }
+
+        if (value->beat < node->beat)
+            node->left = insert(node->left, value);
+        else if (value->beat > node->beat)
+            node->right = insert(node->right, value);
+        else
+            node->right = insert(node->right, value);
+
+        updateHeight(node);
+
+        int balance = balanceFactor(node);
+
+        // LL
+        if (balance > 1 && value->beat < node->left->beat)
+            return rotateRight(node);
+
+        // RR
+        if (balance < -1 && value->beat > node->right->beat)
+            return rotateLeft(node);
+
+        // LR
+        if (balance > 1 && value->beat > node->left->beat) {
+            node->left = rotateLeft(node->left);
+            return rotateRight(node);
+        }
+
+        // RL
+        if (balance < -1 && value->beat < node->right->beat) {
+            node->right = rotateRight(node->right);
+            return rotateLeft(node);
+        }
+
+        return node;
+    }
+
+    // ---------- Delete ----------
+    Event* remove(Event* node, float key) {
+        if (!node) return nullptr;
+
+        if (key < node->beat)
+            node->left = remove(node->left, key);
+        else if (key > node->beat)
+            node->right = remove(node->right, key);
+        else {
+            if (!node->left || !node->right)
+                return node->left ? node->left : node->right;
+
+            Event* minNode = minValueNode(node->right);
+            node->beat = minNode->beat;
+            node->right = remove(node->right, minNode->beat);
+        }
+
+        updateHeight(node);
+        return rebalance(node);
+    }
+
+    Event* minValueNode(Event* node) {
+        while (node->left)
+            node = node->left;
+        return node;
+    }
+
+    Event* rebalance(Event* node) {
+        int balance = balanceFactor(node);
+
+        if (balance > 1 && balanceFactor(node->left) >= 0)
+            return rotateRight(node);
+
+        if (balance > 1 && balanceFactor(node->left) < 0) {
+            node->left = rotateLeft(node->left);
+            return rotateRight(node);
+        }
+
+        if (balance < -1 && balanceFactor(node->right) <= 0)
+            return rotateLeft(node);
+
+        if (balance < -1 && balanceFactor(node->right) > 0) {
+            node->right = rotateRight(node->right);
+            return rotateLeft(node);
+        }
+
+        return node;
+    }
+
+    // ---------- Traversal ----------
+    void inorder(const Event* node) const {
+        if (!node) return;
+        inorder(node->left);
+        std::cout << node->beat << " ";
+        inorder(node->right);
+    }
 };
 
 struct FocusChange {
@@ -426,6 +624,9 @@ static char split[64] = "";
 // 5.25
 // 5.375
 // 5.027777
+
+// TODO: Add focus modes for example use a hotkey to cycle through the octaves of the harmonic series
+// Or just show the harmonics all the way up.
 
 // + 0.125
 // - 0.3472222
@@ -1092,10 +1293,8 @@ void floatToFraction(float value, int& num, int& den, int maxDen = 10000) {
     // Simplify
     int g = gcd(num, den);
     num /= g;
-    den /= g;
+   den /= g;
 }
-
-
 
 char buttonLabels[27][32] = {"Export WAV", 
     "BPM:          ", 
@@ -1146,9 +1345,12 @@ struct Canvas2D {
     std::unique_ptr<TreeNode> splits = std::make_unique<TreeNode>(-1);
     std::vector<FocusChange> foci;
 
+    EventTree events;
+
     bool placing = false;
     float lengthOrigin = 0.0f;
     Vec2 anchorW{0,0};
+    Event* anchor = (Event*)malloc(sizeof(Event));
     float split_start = -1.0f;
 
     Note currently_dragged;
@@ -1169,6 +1371,13 @@ struct Canvas2D {
 
     void setSplits(std::unique_ptr<TreeNode> newSplits) {
         splits = std::move(newSplits);
+    }
+
+    void setBPM(char* expr, float beat) {
+        // Event toInsert = Event(beat, expr, EV_TEMPO_START);
+        Event* toInsert =  new Event(beat, expr, EV_TEMPO_START);
+        printf("val: %f\n", toInsert->function.value());
+        events.insert(toInsert);
     }
 
     void addCanvasRect(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float rx, float ry, float rw, float rh, float r, float g, float b) {
@@ -1253,7 +1462,77 @@ struct Canvas2D {
         return list;
     }
 
+    float integrate(const exprtk::expression<double>& function, float t1, float t2) {
+        return 0.0f;
+    }
+
+    float snap_beat(const Event* node, float v, float closest) {
+        if (!node) return 999999999.0f;
+        float current = snap_beat(node->left, v, closest);
+        if (node->type == EV_BEAT) {
+            if (std::abs(node->beat - v) > std::abs(current - v)) {
+                return current;
+            } else {
+                current = node->beat;
+            }
+        }
+        current = snap_beat(node->right, v, current);
+        return current;
+    }
+
+    float accum_beats(Event* node, float acc, float v, Event* last) {
+        if (!node) return acc;
+        float current = accum_beats(node->left, acc, v, last);
+        if (node->type == EV_TEMPO_START) {
+            printf("yo! beat: %f, value: %f\n", node->beat, node->function.value());
+            // Tempo change event
+            if (node->finalEv) {
+                // This is the last tempo event, will return
+                if (node->beat > v) {
+                    if (last && last->isConstant)
+                        current += (last->function.value() / 60.0) * (v - last->beat);
+                    else 
+                        current += integrate(last->function, last->beat, v);
+                } else {
+                    if (last && last->isConstant)
+                        current += (last->function.value() / 60.0) * (node->beat - last->beat);
+                    else 
+                        current += integrate(last->function, last->beat, node->beat);
+
+                    if (node->isConstant)
+                        current += (node->function.value() / 60.0) * (v - node->beat);
+                    else
+                        current += integrate(node->function, node->beat, v);
+                }
+                return current;
+            } else {
+                // Node isn't the final event
+                if (node->beat > v) {
+                    // Current time is less than current node's time
+                    // Find value up to v and return
+                    if (last && last->isConstant)
+                        current += (last->function.value() / 60.0) * (v - last->beat);
+                    else
+                        current += integrate(last->function, last->beat, v);
+                    return current;
+                } else {
+                    // Keep going, current node's time is less than current time
+                    if (last && last->isConstant)
+                        current += (last->function.value() / 60.0) * (node->beat - last->beat);
+                    else
+                        current += integrate(last->function, last->beat, v);
+                }
+            }
+            last = node;
+        }
+        return accum_beats(node->right, current, v, last);
+    }
+
+    // TODO: Call a function that calculates the current beat from time v (secs)
+    // then snaps to the closest beat division found in the tree, returns it
     float snap_split(float v) {
+        // float beats = accum_beats(events.root, v, nullptr);
+
         TreeNode* current_beat = findNode(splits.get(), std::floor(v));
         std::vector<float> points;
         if (!current_beat) {
@@ -1507,6 +1786,13 @@ struct Canvas2D {
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
+        
+        Vec2 w = screenToWorld(topLeft, hover);
+        printf("rawHover: %f\n", w.x);
+        float currentBeat = accum_beats(events.root, 0.0f, w.x, nullptr);
+        printf("beat: %f\n", currentBeat);
+        float snappedBeat = snap_beat(events.root, currentBeat, 999999999.0f);
+
         // Hover snapped position (for preview dot / rubber band)
         hover_valid = false;
         if (hovered) {
@@ -1714,6 +2000,15 @@ struct Canvas2D {
             }
         }
 
+        // TODO: Convert time to beats by using tempo events.
+
+        // Canvas axes are time (seconds), frequency (octaves)
+        // Beat divisions are stored in units of beats
+        // Notes are stored in units of beats
+        // Tempo changes are stored in units of seconds
+        // Have to constantly convert world x coordinate into beats for hover snap, should be a relatively simple calculation
+
+        // draw_events(events, renderer);
 
         if (hovered && click == 2 && !placing) {
             // Find closest note
@@ -1843,153 +2138,6 @@ struct Canvas2D {
                 }
             }
         }
-        
-
-        // Existing notes as blue lines
-        int focusIndex = 0;
-        Note closest;
-        closest.octave = -1.0f;
-        float distance = 9999.0f;
-        for (const Note& n : notes) {
-            float x0w = n.beat_on, x1w = n.beat_off;
-            float y   = n.octave;
-            // Calculate distance
-            float current_distance = 0.0f;
-            if (hoverW.x >= n.beat_on && hoverW.x <= n.beat_off) {
-                current_distance = std::abs(y - hoverW.y);
-            } else if (hoverW.x < n.beat_on) {
-                current_distance = std::sqrt(std::pow(2, hoverW.x - n.beat_on) + std::pow(2, hoverW.y - y));
-            } else {
-                current_distance = std::sqrt(std::pow(2, hoverW.x - n.beat_off) + std::pow(2, hoverW.y - y));
-            }
-            if (current_distance < distance) {
-                closest = n;
-                distance = current_distance;
-            }
-            // rectangle from (x0w,y±h/2) to (x1w,y±h/2); choose fixed  (e.g., 0.6 octave)
-            // float halfH = 1.0/24.0;
-            Vec2 a = worldToScreen(topLeft, { x0w, y});
-            Vec2 b = worldToScreen(topLeft, { x1w, y});
-            // // ensure correct corners
-            Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
-            Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            if (n.selected)
-                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, selCol[0], selCol[1], selCol[2]);
-            else
-                addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, noteCol[0], noteCol[1], noteCol[2]);
-
-            float tri_size = 6.0f;
-            Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
-            Vec2 p2(a.x, a.y - tri_size / 2); // top base corner
-            Vec2 p3(a.x, a.y); // bottom base corner
-
-            // dl->AddTriangleFilled(p1, p2, p3, noteCol);
-        }
-
-        // Add an origin line for the closest note
-        if (closest.octave >= 0.0f) {
-            int res = 0;
-            if (std::abs(closest.origin) > 1e-6) {
-                Vec2 a = worldToScreen(topLeft, { closest.beat_on, closest.octave});
-                Vec2 c = worldToScreen(topLeft, {closest.beat_on, closest.origin});
-                addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y, 2, c.y - a.y, 0.353, 1.0, 0.353);
-                // Text describing the relationship
-                bool down = false;
-                float diff = closest.octave - closest.origin;
-                if (diff < 0) {
-                    down = true;
-                    diff *= -1;
-                }
-                int octaves = (int)std::floor(diff);
-                diff -= octaves;
-                float ratio = std::pow(2, diff);
-                int num, den;
-                if (down) {
-                    floatToFraction(ratio, den, num);
-                } else {
-                    floatToFraction(ratio, num, den);
-                }
-                if (den == 1) {
-                    res = sprintf(originText, "x %d", num);
-                } else {
-                    res = sprintf(originText, "x %d / %d", num, den);
-                }
-                if (octaves != 0) {
-                    if (down) {
-                        res += sprintf(originText + res, " (- %d octaves)", octaves);
-                    } else {
-                        res += sprintf(originText + res, " (+ %d octaves)", octaves);
-                    }
-                }
-            }
-            if (res != 0) {
-                res += sprintf(originText + res, ", ");
-            }
-            sprintf(originText + res, "profile %d", closest.profile);
-            renderer.addText(originText, 10, 10, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-        }
-
-        // Draw focus areas on top of existing notes
-        for (int i = 0; i < (int)foci.size() - 1; i++) {
-            if (foci[i].octave == 0.0f) {
-                continue;
-            }
-            float x0w = foci[i].time;
-            float x1w = foci[i + 1].time;
-            float y = foci[i].octave;
-            float halfH = 1.0 / 24.0;
-            Vec2 a = worldToScreen(topLeft, { x0w, y });
-            Vec2 b = worldToScreen(topLeft, { x1w, y });
-            // ensure correct corners
-            Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
-            Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
-            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, focusCol[0], focusCol[1], focusCol[2]);
-            // dl->AddRect(rmin, rmax, IM_COL32(100,60,30,220), 6.0f, 0, 2.0f);
-
-            // float tri_size = 6.0f;
-            // Vec2 p1(a.x + tri_size, a.y);                       // tip of triangle
-            // Vec2 p2(a.x, a.y - tri_size / 2); // top base corner
-            // Vec2 p3(a.x, a.y); // bottom base corner
-
-            // dl->AddTriangleFilled(p1, p2, p3, focusCol);
-
-            // addCanvasRect(renderer, topLeft, bottomRight, {a.x, a.y}, {b.x, a.y}, focusCol);
-
-            if (snap_harmonics) {
-                float startOctave = foci[i].octave;
-                float endOctave = foci[i].octave;
-                if (startOctave < octStart) {
-                    while ((startOctave + 1) < octStart) {
-                        startOctave += 1;
-                    }
-                }
-                while (startOctave > octStart) {
-                    startOctave -= 1;
-                }
-                if (endOctave > octEnd) {
-                    while ((endOctave - 1) > octEnd) {
-                        endOctave -= 1;
-                    }
-                }
-                while (endOctave < octEnd) {
-                    endOctave += 1;
-                }
-                for (float o = startOctave; o <= endOctave; o++) {
-                    if (o != foci[i].octave) {
-                        Vec2 s0 = worldToScreen(topLeft, { wB.x, o});
-                        addCanvasRect(renderer, topLeft, bottomRight, rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
-                    }
-                    for (int i = 0; i < sizeof(perfectIntervals) / 4; i++) {
-                        float currentOctave = o + std::log2(perfectIntervals[i]);
-                        if (currentOctave > octStart && currentOctave < octEnd) {
-                            Vec2 s0 = worldToScreen(topLeft, { wB.x, currentOctave});
-                            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, s0.y, rmax.x - rmin.x, 1, gridCol[0], gridCol[1], gridCol[2]);
-                        }
-                    }
-                }
-                std::fflush(stdout);
-            }
-        }
 
         // Rubber-band preview (after first click)
         if (placing && hover_valid) {
@@ -2035,20 +2183,13 @@ struct Canvas2D {
                 // First click: start note (snap already applied above)
                 if (hover_valid) {
                     if (dragging) {
-                        currently_dragged.octave = hoverW.y;
-                        if (snap_harmonics) {
-                            for (int i = 1; i < (int)foci.size(); i++) {
-                                if (foci[i - 1].time <= unsnappedHoverW.x && foci[i].time >= unsnappedHoverW.x) {
-                                    currently_dragged.origin = foci[i - 1].octave;
-                                    break;
-                                }
-                            }
-                        }
-                        notes.push_back(currently_dragged);
-                        dragging = false;
+                        // TODO: Handle dragging
                     } else {
                         placing = true;
-                        anchorW = hoverW;
+                        // anchorW = hoverW;
+                        char expression[50];
+                        sprintf(expression, "%f", octave_to_freq(hoverW.y));
+                        *anchor = Event(hoverW.x, expression, EV_NOTE_START);
                         anchorWXexact= unsnappedHoverW.x;
                     }
                 }
@@ -2057,11 +2198,7 @@ struct Canvas2D {
                 if (hover_valid) {
                     float a = anchorW.x, b = hoverW.x;
                     if (a != b) {
-                        Note n;
-                        n.beat_on  = std::min(a, b);
-                        n.beat_off = std::max(a, b);   // exclusive
-                        n.octave   = anchorW.y;        // octave fixed at first click
-                        n.origin = lengthOrigin; // If the note was resized, use the origin from before
+                        float newOrigin = lengthOrigin; // If the note was resized, use the origin from before
                         lengthOrigin = 0.0f;
                         if (snap_harmonics) {
                             // Check whether there's any focus at the anchor
@@ -2069,38 +2206,29 @@ struct Canvas2D {
                                 // printf("foci[i - 1].time: %f, anchorW.x: %f, foci[i].time: %f\n", foci[i - 1].time, anchorW.x, foci[i].time);
                                 
                                 if (foci[i - 1].time <= anchorWXexact && foci[i].time >= anchorWXexact) {
-                                    n.origin = foci[i - 1].octave;
+                                    newOrigin = foci[i - 1].octave;
                                     break;
                                 }
                             }
                         }
-                        notes.push_back(n);
+
+                        Event e = Event(hoverW.x, "1", EV_NOTE_START);
+                        e.function = anchor->function;
+                        if (anchor->beat > hoverW.x) {
+                            anchor->type = EV_NOTE_END;
+                            e.origin = newOrigin;
+                        } else if (hoverW.x > anchor->beat) {
+                            e.type = EV_NOTE_END;
+                            anchor->origin = newOrigin;
+                        }
+                        events.insert(&e);
+                        events.insert(anchor);
+                        events.inorder();
                     }
                 }
                 placing = false;
             }
         }
-
-        // HUD: controls + current mouse coords in world units
-        if (hovered) {
-            Vec2 w = screenToWorld(topLeft, hover);
-            // ImGui::SetCursorScreenPos({topLeft.x + 8, bottomRight.y - 50});
-            // ImGui::BeginGroup();
-            // ImGui::Text("Mouse: beat %.3f, oct %.3f", w.x, w.y);
-            // ImGui::SameLine();
-            // ImGui::SetNextItemWidth(80); ImGui::InputFloat("dx", &snap_x, 0.0f, 0.0f, "%.2f");
-            // ImGui::SameLine();
-            // ImGui::SetNextItemWidth(80); ImGui::InputFloat("dy", &snap_y, 0.0f, 0.0f, "%.2f");
-            // ImGui::EndGroup();
-        } else {
-            // Put the cursor back to layout after InvisibleButton
-            // ImGui::Dummy(Vec2(0,0));
-        }
-
-        // ImGui::Checkbox("Snap", &snap_to_grid);
-        // ImGui::Checkbox("Harmonic Snap", &snap_harmonics);
-
-        // ImGui::End();
     }
 };
 
@@ -2123,6 +2251,9 @@ int main(int, char**)
 
     VulkanRenderer renderer = VulkanRenderer(window);
 
+    table.add_variable("b", b);
+    table.add_variable("t", t);
+    table.add_constants();
 
     // Audio
     AudioEngine engine;
@@ -2131,6 +2262,9 @@ int main(int, char**)
         return 1;
     }
     std::cout << "Audio engine started." << std::endl;
+
+    // Add tempo change event at beginning
+    gBeatOctCanvas.setBPM("110", 0.0f);
 
     engine.setGain(0.4f);
     engine.setWaveform(WaveformType::Sine);
@@ -2144,7 +2278,7 @@ int main(int, char**)
 
     std::vector<Button> buttons;
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false); // Export wav
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f); // BPM
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f); // BPM (110)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f); // Attack 1 (value * 3 is sent)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f); // Decay 1 (value * 3 is sent)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.16f); // Gain 1 (value is sent as is)
@@ -2211,31 +2345,31 @@ int main(int, char**)
     rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
 
     // 1) Build spectrogram on CPU
-    GrayImage img = buildSpectrogramTextureR8(
-        "file.wav",
-        2048,        // FFT size
-        512,         // hop
-        512,         // log rows
-        4096,        // texture width
-        -80.0f,      // dB floor
-        20.0f,
-        20000.0f
-    );
+    // GrayImage img = buildSpectrogramTextureR8(
+    //     "file.wav",
+    //     2048,        // FFT size
+    //     512,         // hop
+    //     512,         // log rows
+    //     4096,        // texture width
+    //     -80.0f,      // dB floor
+    //     20.0f,
+    //     20000.0f
+    // );
 
-    // for (int i = 0; i < (int)img.px.size(); i++) {
-    //     printf("%d ", img.px[i]);
-    // }
+    // // for (int i = 0; i < (int)img.px.size(); i++) {
+    // //     printf("%d ", img.px[i]);
+    // // }
 
-    AudioData audio = loadWavMono("file.wav");
+    // AudioData audio = loadWavMono("file.wav");
 
     renderer.createSpectrogramPipeline();
 
-    // 2) Upload to GPU
-    renderer.uploadSpectrogramR8(
-        img.px.data(),
-        img.w,
-        img.h
-    );
+    // // 2) Upload to GPU
+    // renderer.uploadSpectrogramR8(
+    //     img.px.data(),
+    //     img.w,
+    //     img.h
+    // );
 
     // --- Cache metadata for rendering ---
     // spectrogram.loaded = true;
