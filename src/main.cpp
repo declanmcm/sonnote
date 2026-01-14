@@ -1793,6 +1793,10 @@ struct Canvas2D {
         printf("beat: %f\n", currentBeat);
         float snappedBeat = snap_beat(events.root, currentBeat, 999999999.0f);
 
+        if (std::abs(currentBeat - std::round(currentBeat)) < std::abs(currentBeat - snappedBeat))
+            snappedBeat =  std::round(currentBeat);
+        printf("snappedBeat: %f\n", snappedBeat);
+
         // Hover snapped position (for preview dot / rubber band)
         hover_valid = false;
         if (hovered) {
@@ -2189,8 +2193,8 @@ struct Canvas2D {
                         // anchorW = hoverW;
                         char expression[50];
                         sprintf(expression, "%f", octave_to_freq(hoverW.y));
-                        *anchor = Event(hoverW.x, expression, EV_NOTE_START);
-                        anchorWXexact= unsnappedHoverW.x;
+                        anchor = new Event(snappedBeat, expression, EV_NOTE_START);
+                        anchorWXexact= currentBeat;
                     }
                 }
             } else {
@@ -2212,16 +2216,16 @@ struct Canvas2D {
                             }
                         }
 
-                        Event e = Event(hoverW.x, "1", EV_NOTE_START);
-                        e.function = anchor->function;
-                        if (anchor->beat > hoverW.x) {
+                        Event* e = new Event(snappedBeat, "1", EV_NOTE_START);
+                        e->function = anchor->function;
+                        if (anchor->beat > snappedBeat) {
                             anchor->type = EV_NOTE_END;
-                            e.origin = newOrigin;
-                        } else if (hoverW.x > anchor->beat) {
-                            e.type = EV_NOTE_END;
+                            e->origin = newOrigin;
+                        } else if (snappedBeat > anchor->beat) {
+                            e->type = EV_NOTE_END;
                             anchor->origin = newOrigin;
                         }
-                        events.insert(&e);
+                        events.insert(e);
                         events.insert(anchor);
                         events.inorder();
                     }
