@@ -351,8 +351,8 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
     float y0 = ((float)canvasY / swapchainExtent.height) * (-2.0f) + 1.0f;
     float y1 = ((float)(canvasY + canvasH) / swapchainExtent.height) * (-2.0f) + 1.0f;
 
-    printf("x, y: (%f, %f, %f, %f)\n", x0, x1, y0, y1);
-    printf("canvas: (%d, %d, %d,%d)\n", canvasX, canvasY, canvasW, canvasH);
+    // printf("x, y: (%f, %f, %f, %f)\n", x0, x1, y0, y1);
+    // printf("canvas: (%d, %d, %d,%d)\n", canvasX, canvasY, canvasW, canvasH);
 
     // CPU geometry
     Vertex blackQuad[6] = {
