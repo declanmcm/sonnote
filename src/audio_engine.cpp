@@ -1,9 +1,6 @@
-#include "audio_engine.hpp"
-
 #include <jack/jack.h>
 #include <jack/thread.h>
 #include <sndfile.h>
-
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -11,6 +8,7 @@
 #include <sys/mman.h>
 #include <sched.h>
 #include <iostream>
+#include "audio_engine.hpp"
 
 struct AudioEngine::JackState {
         jack_client_t* client = nullptr;
@@ -211,13 +209,11 @@ void AudioEngine::toggleFreeze() {
     freeze = !freeze;
 }
 
-void AudioEngine::setEvents(const std::vector<SeqEvent>& newEvents) {
-    // Allocate vector on control thread to avoid RT alloc
-    auto* v = new std::vector<SeqEvent>(newEvents);
-
+void AudioEngine::setEvents(EventTree* newEvents) {
+    b = 0.0f;
     Message m;
     m.type = MessageType::ReplaceEvents;
-    m.events = v;
+    m.events = newEvents;
     messageQueue.push(m);
 }
 
@@ -273,7 +269,7 @@ void AudioEngine::applyMessages() {
                     voiceEnvs[i][j] = 0.0f;
                 }
                 voicePhases[i] = 0.0f;
-                voiceFreqs[i] = 0.0f;
+                voiceFreqs[i] = nullptr;
                 voiceProfiles[i] = 0;
             }
             divisorSmooth = 1.0f;
@@ -281,7 +277,6 @@ void AudioEngine::applyMessages() {
 
         case MessageType::ReplaceEvents:
             stagingEvents = *msg.events;
-            delete msg.events;
             hasPendingEventSwap = true;
             break;
         }
@@ -289,14 +284,8 @@ void AudioEngine::applyMessages() {
 
     // Swap event list outside message loop
     if (hasPendingEventSwap) {
-        activeEvents.swap(stagingEvents);
+        activeEvents = stagingEvents; 
         hasPendingEventSwap = false;
-
-        // Sort events by beat
-        std::sort(activeEvents.begin(), activeEvents.end(),
-                  [](const SeqEvent& a, const SeqEvent& b) {
-                      return a.beat < b.beat;
-                  });
 
         nextEventIndex = 0;
     }
@@ -395,14 +384,15 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
         // --- Sequencer: map sampleCounter → beat and fire events when crossing beat positions ---
         currentBeat = double(sampleCounter) / samplesPerBeat;
+        b = currentBeat;
 
         // Trigger all events whose beat <= current beat (looping)
-        if (!activeEvents.empty() && !freeze) {
+        if (!freeze) {
 
             // double lastBeat = currentBeat;
             // currentBeat = beat;  // update for envelope or external code, if needed
 
-            size_t count = activeEvents.size();
+            //size_t count = activeEvents.size();
 
             // If beat jumped backwards (tempo change) or we reset
             // we restart scanning from index 0
@@ -412,15 +402,19 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
             if (countdown < 51) countdown--;
 
+            Event* currentEv = activeEvents.root;
+            while (currentEv->left) {
+              currentEv = currentEv->left;
+            }
+
             // Consume events while currentBeat passes their beat positions
-            while (nextEventIndex < count &&
-                activeEvents[nextEventIndex].beat <= currentBeat)
+            while (currentEv &&
+                currentEv->beat <= currentBeat)
             {
                 countdown--;
-                const SeqEvent& ev = activeEvents[nextEventIndex];
 
                 // Only trigger if we *passed* this beat within this audio block
-                if (ev.type == 1) {
+                if (currentEv->type == EV_NOTE_START) {
                     // NOTE ON
                     size_t voiceIndex = MAX_VOICES;
                     for (size_t v = 0; v < MAX_VOICES; ++v) {
@@ -432,19 +426,21 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                     if (voiceIndex == MAX_VOICES)
                         voiceIndex = 0; // steal voice 0
 
-                    voiceFreqs[voiceIndex]  = ev.value;
+                    voiceFreqs[voiceIndex]  = &(currentEv->function);
                     voicePhases[voiceIndex] = 0.0f;
+                    voiceIDs[voiceIndex] = currentEv->id;
                     for (int i = 0; i < 3; i++) {
                         voiceEnvs[voiceIndex][i]   = 0.0f;
                         voiceStates[voiceIndex][i] = 1;
                     }
-                    voiceProfiles[voiceIndex] = ev.profile;
+                    voiceProfiles[voiceIndex] = currentEv->profile;
                 }
                 else {
                     // NOTE OFF
                     for (size_t v = 0; v < MAX_VOICES; ++v) {
-                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || voiceStates[v][2] != 0) &&
-                            std::abs(voiceFreqs[v] - ev.value) < 1e-4f)
+                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \ 
+                              voiceStates[v][2] != 0) &&
+                            currentEv->id == voiceIDs[v])
                         {
                             voiceStates[v][0] = 3;
                             voiceStates[v][1] = 3;
@@ -454,7 +450,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                     }
                 }
 
-                nextEventIndex++;
+                currentEv = next_note(currentEv);
 
                 // Loop the sequence
                 // if (nextEventIndex >= count) {
@@ -507,7 +503,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             }
 
             // Phase & sample
-            const float freq = voiceFreqs[v];
+            const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->value() - 4.0f);
             float phase = voicePhases[v];
 
             phase += freq / sr;
@@ -621,13 +617,11 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
     double samplesPerBeat  = secondsPerBeat * sampleRate;
 
     // Pre-sort events (offline safety, though normally sorted already)
-    std::vector<SeqEvent> events = activeEvents;
-    std::sort(events.begin(), events.end(),
-              [](auto& a, auto& b){ return a.beat < b.beat; });
+    EventTree events = activeEvents;
 
     // For wrap-around event playback
-    bool hasEvents = !events.empty();
-    if (activeEvents.empty()) {
+    bool hasEvents = events.root ? true : false;
+    if (activeEvents.root) {
         printf("empty\n");
     }
     if (!hasEvents) {
@@ -643,17 +637,22 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
     int totalZero = 0;
     int totalNonZero = 0;
 
+    Event* currentEv = events.root;
+    while (currentEv->left)
+      currentEv = currentEv->left;
+
     for (uint64_t i = 0; i < totalFrames; ++i)
     {
         float mix = 0.0f;
 
         // --- Sequencer / Event triggering ---
         double beat = double(sc) / samplesPerBeat;
-        while (evIndex < events.size() && events[evIndex].beat <= beat) {
-            const SeqEvent& ev = events[evIndex];
+        b = beat;
+        while (currentEv && currentEv->beat <= beat) {
+            //const SeqEvent& ev; // TODO Remove
 
 
-            if (ev.type == 1) {
+            if (currentEv->type == EV_NOTE_START) {
                 // NOTE ON: find free voice
                 size_t v = MAX_VOICES;
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
@@ -663,18 +662,18 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
                 }
                 if (v == MAX_VOICES) v = 0; // steal voice 0
 
-                freq[v]  = ev.value;
+                freq[v]  = currentEv->function.value();
                 phase[v] = 0.0f;
                 for (int i = 0; i < 3; i++) {
                     env[v][i] = 0.0f;
                     state[v][i] = 1;
                 }
-                voicePs[v] = ev.profile;
+                voicePs[v] = currentEv->profile;
             } else {
                 // NOTE OFF: release matching voice
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
                     if ((state[k][0] != 0 || state[k][1] != 0 || state[k][2] != 0) &&
-                        fabsf(freq[k] - ev.value) < 1e-4f)
+                        fabsf(freq[k] - currentEv->function.value()) < 1e-4f)
                     {
                         state[k][0] = 3;
                         state[k][1] = 3;
@@ -685,7 +684,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
             }
 
             // advance to next event
-            evIndex++;
+            currentEv = next_note(currentEv); 
         }
 
         // --- Polyphonic synthesis ---

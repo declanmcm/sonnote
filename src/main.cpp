@@ -39,71 +39,9 @@ struct Note {
 
 exprtk::symbol_table<double> table;
 exprtk::parser<double> parser;
-double b = 0.0f;
-double t = 0.0f;
+double b;
+double t;
 
-#define EV_TEMPO 2
-#define EV_NOTE_START 1
-#define EV_NOTE_END 0
-#define EV_BEAT 3
-#define EV_FOCUS 4
-
-// Using AVL tree
-struct Event {
-    float beat;
-    float time;
-    std::string string_expr;
-    exprtk::expression<double> function;
-    int height;
-    Event* left;
-    Event* right;
-    Event *next;
-    float origin;
-    bool selected;
-    bool finalEv;
-    int velocity;
-    int profile;
-    int type;
-    uint32_t id;
-
-    Event(float b, int t) : beat(b), type(t) {
-        left = NULL;
-        right = NULL;
-        next = NULL;
-        height = 0;
-        id = 0;
-        profile = 0;
-    }
-
-    Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t) {
-        function.register_symbol_table(table);
-        if (!parser.compile(expr_string, function)) {
-            throw std::runtime_error("Expression parse error: " + parser.error());
-        }
-        string_expr = expr_string;
-        left = NULL;
-        right = NULL;
-        next = NULL;
-        height = 0;
-        id = -1;
-        profile = 0;
-    }
-
-    void update_function(const std::string& expr_string) {
-        function.register_symbol_table(table);
-        if (!parser.compile(expr_string, function)) {
-            throw std::runtime_error("Expression parse error: " + parser.error());
-        }
-        string_expr = expr_string;
-    }
-
-    bool isConstant() {
-        for (int i = 0; i < string_expr.length(); i++) {
-            if (string_expr[i] == 't' || string_expr[i] == 'b') return false;
-        }
-        return true;
-    }
-};
 
 void do_order(Event* current, Event*& previous) {
     if (!current) return;
@@ -131,212 +69,28 @@ Event* next_focus(Event* ev) {
     return ev;
 }
 
+Event* next_note(Event* ev) {
+  if (ev)
+    ev = ev->next;
+  while (ev && !(ev->type == EV_NOTE_START || ev->type == EV_NOTE_END))
+    ev = ev->next;
+  return ev;
+}
+
 float integrate(const exprtk::expression<double>& function, float t1, float t2) {
     // TODO: Implement step integration here
     return 0.0f;
 }
+
 
 float integrate_until(const exprtk::expression<double>& function, float t1, float y) {
     // TODO: Integrate until equal to y and then return t2
     return 0.0f;
 }
 
-class EventTree {
-public:
-    void insert(Event* value) {
-        root = insert(root, value);
-        ordered = false;
-    }
 
-    void remove(float key, int id) {
-        root = remove(root, key, id);
-        ordered = false;
-    }
 
-    void inorder() const {
-        inorder(root, 0);
-        std::cout << "\n";
-    }
 
-    void create_order() {
-        if (!ordered) {
-            Event* previous = nullptr;
-            do_order(root, previous);
-            ordered = true;
-        }
-    }
-
-    Event* root;
-    bool ordered;
-
-private:
-
-    // ---------- Utilities ----------
-    int height(Event*& n) {
-        return n ? n->height : 0;
-    }
-
-    int balanceFactor(Event*& n) {
-        return n ? height(n->left) - height(n->right) : 0;
-    }
-
-    void updateHeight(Event* n) {
-        n->height = 1 + std::max(height(n->left), height(n->right));
-    }
-
-    // ---------- Rotations ----------
-    Event* rotateRight(Event* y) {
-        auto x = y->left;
-        auto T2 = x->right;
-
-        x->right = y;
-        x->right->left = T2;
-
-        updateHeight(x->right);
-        updateHeight(x);
-
-        return x;
-    }
-
-    Event* rotateLeft(Event* x) {
-        auto y = x->right;
-        auto T2 = y->left;
-
-        y->left = x;
-        y->left->right = T2;
-
-        updateHeight(y->left);
-        updateHeight(y);
-
-        return y;
-    }
-
-    // ---------- Insert ----------
-    Event* insert(Event* node, Event* value) {
-        if (!node) {
-            // Event* copy = (Event*)malloc(sizeof(Event));
-            // if (copy == NULL) {
-            //     return NULL;
-            // }
-            // memcpy(copy, value, sizeof(Event));
-            // copy->function = value->function;
-            return value;
-        }
-
-        if (value->beat < node->beat)
-            node->left = insert(node->left, value);
-        else if (value->beat > node->beat)
-            node->right = insert(node->right, value);
-        else
-            node->right = insert(node->right, value);
-
-        updateHeight(node);
-
-        int balance = balanceFactor(node);
-        printf("balance: %d\n", balance);
-
-        // LL
-        if (balance > 1 && value->beat < node->left->beat)
-            return rotateRight(node);
-
-        // RR
-        if (balance < -1 && value->beat > node->right->beat)
-            return rotateLeft(node);
-
-        // LR
-        if (balance > 1 && value->beat > node->left->beat) {
-            node->left = rotateLeft(node->left);
-            return rotateRight(node);
-        }
-
-        // RL
-        if (balance < -1 && value->beat < node->right->beat) {
-            node->right = rotateRight(node->right);
-            return rotateLeft(node);
-        }
-
-        return node;
-    }
-
-    // ---------- Delete ----------
-    Event* remove(Event* node, float key, int id) {
-        if (!node) return nullptr;
-
-        if (key < node->beat)
-            node->left = remove(node->left, key, id);
-        else if (key > node->beat)
-            node->right = remove(node->right, key, id);
-        else if (std::abs(key - node->beat) < 1e-6) {
-            if (node->id == id) {
-                if (node->left && node->right) {
-                    Event* left = node->left;
-                    Event* right = node->right;
-                    node = minValueNode(node->right);
-                    node->right = remove(right, node->beat, node->id);
-                    node->left = left;
-                } else if (node->left) {
-                    node = node->left;
-                } else if (node->right) {
-                    node = node->right;
-                } else { 
-                    node = nullptr;
-                }
-            } else {
-                if (node->left && node->right) {
-                    node->left = remove(node->left, key, id);
-                    node->right = remove(node->right, key, id);
-                } else if (node->left)
-                    node->left = remove(node->left, key, id);
-                else if (node->right)
-                    node->right = remove(node->right, key, id);
-            }
-        }
-
-        if (node) {
-            updateHeight(node);
-            return rebalance(node);
-        } else
-            return node;
-    }
-
-    Event* minValueNode(Event* node) {
-        while (node->left)
-            node = node->left;
-        return node;
-    }
-
-    Event* rebalance(Event* node) {
-        int balance = balanceFactor(node);
-
-        if (balance > 1 && balanceFactor(node->left) >= 0)
-            return rotateRight(node);
-
-        if (balance > 1 && balanceFactor(node->left) < 0) {
-            node->left = rotateLeft(node->left);
-            return rotateRight(node);
-        }
-
-        if (balance < -1 && balanceFactor(node->right) <= 0)
-            return rotateLeft(node);
-
-        if (balance < -1 && balanceFactor(node->right) > 0) {
-            node->right = rotateRight(node->right);
-            return rotateLeft(node);
-        }
-
-        return node;
-    }
-
-    // ---------- Traversal ----------
-    void inorder(const Event* node, uint8_t level) const {
-        if (!node) return;
-        inorder(node->left, level + 1);
-        printf("%f (%d) ", node->beat, level);
-        printf("\n");
-        // std::cout << node->beat << "(" << level << ") ";
-        inorder(node->right, level + 1);
-    }
-};
 
 float calc_time(EventTree* times, float noteBeat) {
     Event* currentTempoEv = times->root;
@@ -2153,7 +1907,7 @@ struct Canvas2D {
             }
             
             if (containsKey(keys, 'd') || containsKey(keys, 'f') || \
-                  containsKey(keys, 'l') {
+                  containsKey(keys, 'l')) {
                 // Delete the note because it will be replaced
                 beatEvents.inorder();
                 beatEvents.remove(closest->beat, closest->id);
@@ -2920,11 +2674,9 @@ int main(int, char**)
                 // Build events from current points
                 uint32_t sr = 48000; // if you don’t have gDevice here, store it globally or pass it out
 
-                auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, sr, playhead_time);
-                
-                printf("first; %f\n", ev[0].beat);
+                gBeatOctCanvas.beatEvents.create_order();
 
-                engine.setEvents(ev);
+                engine.setEvents(&(gBeatOctCanvas.beatEvents));
                 engine.resetSampleCounter();
                 engine.setPlayState(true);
             } else {
@@ -2941,9 +2693,8 @@ int main(int, char**)
 
             float lengthSecs = (60.0 / (float)bpm) * (max - playhead_time);
             if (lengthSecs > 0.0) {
-                auto ev = build_events_from_notes(gBeatOctCanvas.notes, bpm, 48000, playhead_time);
-                    
-                engine.setEvents(ev);
+                                   
+                engine.setEvents(&gBeatOctCanvas.beatEvents);
                 SDL_Delay(50);
                 engine.exportWav(buttons[5].text, playhead_time, lengthSecs);
             }
