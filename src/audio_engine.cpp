@@ -17,6 +17,8 @@ struct AudioEngine::JackState {
         AudioEngine* engine = nullptr;
     };
 
+Event* currentEv;
+
 // ======================================================
 // =============== AUDIO ENGINE CONSTRUCTOR =============
 // ======================================================
@@ -209,7 +211,7 @@ void AudioEngine::toggleFreeze() {
     freeze = !freeze;
 }
 
-void AudioEngine::setEvents(EventTree* newEvents) {
+void AudioEngine::setEvents(EventTree* newEvents) { 
     b = 0.0f;
     Message m;
     m.type = MessageType::ReplaceEvents;
@@ -284,7 +286,11 @@ void AudioEngine::applyMessages() {
 
     // Swap event list outside message loop
     if (hasPendingEventSwap) {
-        activeEvents = stagingEvents; 
+        activeEvents = stagingEvents;
+        currentEv = activeEvents.root;
+        while (currentEv->left) {
+          currentEv = currentEv->left;
+        }
         hasPendingEventSwap = false;
 
         nextEventIndex = 0;
@@ -402,19 +408,16 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
             if (countdown < 51) countdown--;
 
-            Event* currentEv = activeEvents.root;
-            while (currentEv->left) {
-              currentEv = currentEv->left;
-            }
-
             // Consume events while currentBeat passes their beat positions
             while (currentEv &&
                 currentEv->beat <= currentBeat)
             {
-                countdown--;
+                countdown--; 
 
                 // Only trigger if we *passed* this beat within this audio block
                 if (currentEv->type == EV_NOTE_START) {
+                    printf("note on: %d\n", currentEv->id);
+
                     // NOTE ON
                     size_t voiceIndex = MAX_VOICES;
                     for (size_t v = 0; v < MAX_VOICES; ++v) {
@@ -437,11 +440,13 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 }
                 else {
                     // NOTE OFF
+                    printf("note off: %d\n", currentEv->id);
                     for (size_t v = 0; v < MAX_VOICES; ++v) {
                         if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \ 
                               voiceStates[v][2] != 0) &&
                             currentEv->id == voiceIDs[v])
                         {
+                          printf("heylo\n");
                             voiceStates[v][0] = 3;
                             voiceStates[v][1] = 3;
                             voiceStates[v][2] = 3;
@@ -472,38 +477,39 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
             activeCount++;
 
-            for (int i = 0; i < 3; i++) {
+            for (int e = 0; e < 3; e++) {
                 // Envelope update OSC i
-                if (voiceStates[v][i] == 1) {
+                if (voiceStates[v][e] == 1) {
                     // Attack
-                    float atkStep = (profiles[voiceProfiles[v]].settings[i].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].attack  * sr)) : 1.0f;
-                    voiceEnvs[v][i] += atkStep;
-                    if (voiceEnvs[v][i] >= 1.0f) {
-                        voiceEnvs[v][i] = 1.0f;
-                        voiceStates[v][i] = 2; // sustain/decay
+                    float atkStep = (profiles[voiceProfiles[v]].settings[e].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].attack  * sr)) : 1.0f;
+                    voiceEnvs[v][e] += atkStep;
+                    if (voiceEnvs[v][e] >= 1.0f) {
+                        voiceEnvs[v][e] = 1.0f;
+                        voiceStates[v][e] = 2; // sustain/decay
                     }
-                } else if (voiceStates[v][i] == 2) {
+                } else if (voiceStates[v][e] == 2) {
                     // Decay toward sustain
-                    float decStep = (profiles[voiceProfiles[v]].settings[i].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].decay  * sr)) : 1.0f;
-                    if (voiceEnvs[v][i] > profiles[voiceProfiles[v]].settings[i].sustain) {
-                        voiceEnvs[v][i] -= decStep;
-                        if (voiceEnvs[v][i] <= profiles[voiceProfiles[v]].settings[i].sustain) {
-                            voiceEnvs[v][i] = profiles[voiceProfiles[v]].settings[i].sustain;
+                    float decStep = (profiles[voiceProfiles[v]].settings[e].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].decay  * sr)) : 1.0f;
+                    if (voiceEnvs[v][e] > profiles[voiceProfiles[v]].settings[e].sustain) {
+                        voiceEnvs[v][e] -= decStep;
+                        if (voiceEnvs[v][e] <= profiles[voiceProfiles[v]].settings[e].sustain) {
+                            voiceEnvs[v][e] = profiles[voiceProfiles[v]].settings[e].sustain;
                         }
                     }
-                } else if (voiceStates[v][i] == 3) {
+                } else if (voiceStates[v][e] == 3) {
                     // Release
-                    float relStep = (profiles[voiceProfiles[v]].settings[i].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[i].release * sr)) : 1.0f;
-                    voiceEnvs[v][i] -= relStep;
-                    if (voiceEnvs[v][i] <= 0.0f) {
-                        voiceEnvs[v][i] = 0.0f;
-                        voiceStates[v][i] = 0; // off
+                    float relStep = (profiles[voiceProfiles[v]].settings[e].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].release * sr)) : 1.0f;
+                    voiceEnvs[v][e] -= relStep;
+                    if (voiceEnvs[v][e] <= 0.0f) {
+                        voiceEnvs[v][e] = 0.0f;
+                        voiceStates[v][e] = 0; // off
                     }
                 }
             }
 
             // Phase & sample
             const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->value() - 4.0f);
+            printf("voice %d freq: %f\n", v, freq); 
             float phase = voicePhases[v];
 
             phase += freq / sr;
