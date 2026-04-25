@@ -65,7 +65,8 @@ struct Event {
     int height;
     Event* left;
     Event* right;
-    Event *next;
+    Event* next_ev;
+    Event* parent;
     float origin;
     bool selected;
     bool finalEv;
@@ -77,7 +78,8 @@ struct Event {
     Event(float b, int t) : beat(b), type(t) {
         left = NULL;
         right = NULL;
-        next = NULL;
+        parent = NULL;
+        next_ev = NULL;
         height = 0;
         id = 0;
         profile = 0;
@@ -91,7 +93,8 @@ struct Event {
         string_expr = expr_string;
         left = NULL;
         right = NULL;
-        next = NULL;
+        parent = NULL;
+        next_ev = NULL;
         height = 0;
         id = -1;
         profile = 0;
@@ -145,6 +148,13 @@ public:
         }
     }
 
+    Event* get_first() {
+      Event* current = root;
+      while (current && current->left)
+        current = current->left;
+      return current;
+    }
+
     Event* root = nullptr;
     bool ordered;
 
@@ -192,22 +202,25 @@ private:
 
     // ---------- Insert ----------
     Event* insert(Event* node, Event* value) {
-        if (!node) {
-            // Event* copy = (Event*)malloc(sizeof(Event));
-            // if (copy == NULL) {
-            //     return NULL;
-            // }
-            // memcpy(copy, value, sizeof(Event));
-            // copy->function = value->function;
+        if (!node)
             return value;
-        }
 
-        if (value->beat < node->beat)
+        Event* newNode;
+        if (value->beat < node->beat) {
+          if (node->left) {
             node->left = insert(node->left, value);
-        else if (value->beat > node->beat)
+          } else {
+            value->parent = node;
+            node->left = value;
+          }
+        } else {
+          if (node->right) {
             node->right = insert(node->right, value);
-        else
-            node->right = insert(node->right, value);
+          } else {
+            value->parent = node;
+            node->right = value;
+          }
+        }
 
         updateHeight(node);
 
