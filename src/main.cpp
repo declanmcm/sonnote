@@ -1019,8 +1019,20 @@ bool save_song(const std::string& path,
 
     current = beatEvents.get_first();
 
+    char expr[40];
+    float v;
+    int t;
+    int l;
     while (current) {
-      f.write(reinterpret_cast<const char*>(current), sizeof(Event));
+      v = current->beat;
+      sprintf(expr, "%s", current->string_expr.c_str());
+      l = strlen(expr);
+      printf("expr: %s, len: %d\n", expr, l);
+      t = current->type;
+      f.write(reinterpret_cast<const char*>(&v), sizeof(float));
+      f.write(reinterpret_cast<const char*>(&l), sizeof(int));
+      f.write(expr, l);
+      f.write(reinterpret_cast<const char*>(&t), sizeof(int));
       current = next(current);
     }
 
@@ -1039,7 +1051,14 @@ bool save_song(const std::string& path,
     current = timeEvents.get_first();
 
     while (current) {
-      f.write(reinterpret_cast<const char*>(current), sizeof(Event));
+      v = current->beat;
+      sprintf(expr, "%s", current->string_expr.c_str());
+      l = strlen(expr);
+      t = current->type;
+      f.write(reinterpret_cast<const char*>(&v), sizeof(float));
+      f.write(reinterpret_cast<const char*>(&l), sizeof(int));
+      f.write(expr, l);
+      f.write(reinterpret_cast<const char*>(&t), sizeof(int));
       current = next(current);
     }
 
@@ -1086,23 +1105,59 @@ bool load_song(const std::string& path,
 
     // Read beat events
 
-    uint32_t eventCount;
-    Event* current;
-    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+    printf("ready to read beatEvents");
+    std::fflush(stdout);
 
+    uint32_t eventCount;
+    Event* current = (Event*)malloc(sizeof(Event));
+    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+    printf("beatEvents size: %d\n", eventCount);
+    std::fflush(stdout);
+
+    float v;
+    char expr[40];
+    int t, l;
     for (int i = 0; i < eventCount; i++) {
-      f.read(reinterpret_cast<char*>(current), sizeof(current));
-      beatEvents->insert(current);
+      printf("event %d\n", i);
+      std::fflush(stdout);
+      f.read(reinterpret_cast<char*>(&v), sizeof(float));
+      f.read(reinterpret_cast<char*>(&l), sizeof(int));
+      f.read(expr, l);
+      expr[l + 1] = '\0';
+      f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      Event* toInsert;
+      if (l != 0)
+        toInsert = new Event(v, expr, t);
+      else
+        toInsert = new Event(v, t);
+      toInsert->time = calc_time(timeEvents, current->beat);
+      std::fflush(stdout);
+      beatEvents->insert(toInsert);
     }
+
+    printf("read beatEvent\n");
+    std::fflush(stdout);
 
     // Read time events
 
     f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
 
-    for (int i = 0; i < eventCount; i++) {
+    for (int i = 0; i < eventCount; i++) { 
+      f.read(reinterpret_cast<char*>(&v), sizeof(float));
+      f.read(reinterpret_cast<char*>(&l), sizeof(int));
+      f.read(expr, l);
+      expr[l + 1] = '\0';
+      f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      Event* toInsert;
+      if (l != 0)
+        toInsert = new Event(v, expr, t);
+      else
+        toInsert = new Event(v, t);
       f.read(reinterpret_cast<char*>(current), sizeof(current));
       timeEvents->insert(current);
     }
+
+    free(current);
 
     // --- Tree root ---
     root = readTreeNode(f);

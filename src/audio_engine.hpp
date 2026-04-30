@@ -126,6 +126,8 @@ float integrate_until(const exprtk::expression<double>& function, float t1, floa
 class EventTree {
 public:
     void insert(Event* value) {
+        printf("enter insert\n");
+        std::fflush(stdout);
         root = insert(root, value);
         ordered = false;
     }
