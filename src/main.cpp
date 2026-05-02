@@ -123,19 +123,21 @@ void do_order(Event* current, Event*& previous) {
 
 Event* next(Event* ev) {
   Event* current = NULL;
+  printf("N");
   if (ev->right != NULL) {
-    printf("IT IS NOT NULL!\n");
-    std::fflush(stdout);
     current = ev->right;
+    printf("1\n");
     while (current && current->left) {
-      current = current->left;
       printf("cID: %d\n", current->id);
+      current = current->left;
     }
   } else if (ev->parent && ev->parent->left == ev) {
+    printf("2\n");
     current = ev->parent;
   } else if (ev->parent && ev->parent->right == ev) {
+    printf("3\n");
     current = ev->parent;
-    while (current->parent && ev->parent->right == ev) {
+    while (current->parent && current->parent->right == current) {
       current = current->parent;
     }
     if (!current->parent)
@@ -143,6 +145,7 @@ Event* next(Event* ev) {
     else
       current = current->parent;
   }
+  std::fflush(stdout);
   return current;
 }
 
@@ -1088,112 +1091,6 @@ bool save_song(const std::string& path,
     return true;
 }
 
-// --- Load binary song file ---
-bool load_song(const std::string& path,
-               EventTree* beatEvents,
-               EventTree* timeEvents,
-               std::unique_ptr<TreeNode>& root, Profile* profiles)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    char magic[4];
-    f.read(magic, 4);
-    if (std::strncmp(magic, "SONN", 4) != 0) {
-        throw std::runtime_error("Invalid file format");
-    }
-
-    // Read beat events
-
-    printf("ready to read beatEvents");
-    std::fflush(stdout);
-
-    uint32_t eventCount;
-    Event* current = (Event*)malloc(sizeof(Event));
-    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
-    printf("beatEvents size: %d\n", eventCount);
-    std::fflush(stdout);
-
-    float v;
-    char expr[40];
-    int t, l;
-    for (int i = 0; i < eventCount; i++) {
-      printf("event %d\n", i);
-      std::fflush(stdout);
-      f.read(reinterpret_cast<char*>(&v), sizeof(float));
-      f.read(reinterpret_cast<char*>(&l), sizeof(int));
-      f.read(expr, l);
-      expr[l + 1] = '\0';
-      f.read(reinterpret_cast<char*>(&t), sizeof(t));
-      Event* toInsert;
-      if (l != 0)
-        toInsert = new Event(v, expr, t);
-      else
-        toInsert = new Event(v, t);
-      toInsert->time = calc_time(timeEvents, current->beat);
-      std::fflush(stdout);
-      beatEvents->insert(toInsert);
-    }
-
-    printf("read beatEvent\n");
-    std::fflush(stdout);
-
-    // Read time events
-
-    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
-
-    for (int i = 0; i < eventCount; i++) { 
-      f.read(reinterpret_cast<char*>(&v), sizeof(float));
-      f.read(reinterpret_cast<char*>(&l), sizeof(int));
-      f.read(expr, l);
-      expr[l + 1] = '\0';
-      f.read(reinterpret_cast<char*>(&t), sizeof(t));
-      Event* toInsert;
-      if (l != 0)
-        toInsert = new Event(v, expr, t);
-      else
-        toInsert = new Event(v, t);
-      f.read(reinterpret_cast<char*>(current), sizeof(current));
-      timeEvents->insert(current);
-    }
-
-    free(current);
-
-    // --- Tree root ---
-    root = readTreeNode(f);
-
-
-    uint32_t profileCount;
-    f.read(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
-
-    if (profileCount != 10) {
-        // you can decide whether to error or clamp
-        return false;
-    }
-
-    for (int i = 0; i < 10; i++) {
-        for (int j = 0; j < 3; j++) {
-            OSCSettings* osc = &(profiles[i].settings[j]);
-
-            int32_t wave;
-            f.read(reinterpret_cast<char*>(&wave), sizeof(wave));
-            osc->waveType = static_cast<WaveformType>(wave);
-
-            f.read(reinterpret_cast<char*>(&osc->attack),  sizeof(float));
-            if (i == 0 && j == 0)
-                printf("read attack: %f\n", osc->attack);
-            f.read(reinterpret_cast<char*>(&osc->decay),   sizeof(float));
-            f.read(reinterpret_cast<char*>(&osc->sustain), sizeof(float));
-            f.read(reinterpret_cast<char*>(&osc->release), sizeof(float));
-            f.read(reinterpret_cast<char*>(&osc->gain),    sizeof(float));
-        }
-    }
-
-    f.close();
-    return true;
-}
-
-
 static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& notes,
                                                      float bpm, uint32_t sampleRate, float playhead_time)
 {
@@ -1393,6 +1290,10 @@ struct Canvas2D {
     void setSplits(std::unique_ptr<TreeNode> newSplits) {
         splits = std::move(newSplits);
     }
+
+    Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
+
+    Event* createEv(float v, int t) { return new Event(v, t); }
 
     void setBPM(char* expr, float beat) {
         // Event toInsert = Event(beat, expr, EV_TEMPO);
@@ -2407,6 +2308,109 @@ struct Canvas2D {
     }
 };
 
+
+// --- Load binary song file ---
+bool load_song(const std::string& path,
+               Canvas2D* canvas,
+               std::unique_ptr<TreeNode>& root, Profile* profiles)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+
+    char magic[4];
+    f.read(magic, 4);
+    if (std::strncmp(magic, "SONN", 4) != 0) {
+        throw std::runtime_error("Invalid file format");
+    }
+
+    // Read beat events
+
+    printf("ready to read beatEvents");
+    std::fflush(stdout);
+
+    uint32_t eventCount;
+    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+    printf("beatEvents size: %d\n", eventCount);
+    std::fflush(stdout);
+
+    float v;
+    char expr[40];
+    int t, l;
+    for (int i = 0; i < eventCount; i++) {
+      printf("event %d\n", i);
+      std::fflush(stdout);
+      f.read(reinterpret_cast<char*>(&v), sizeof(float));
+      f.read(reinterpret_cast<char*>(&l), sizeof(int));
+      f.read(expr, l);
+      expr[l] = '\0';
+      f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      Event* toInsert;
+      if (l != 0)
+        toInsert = canvas->createEvExpr(v, expr, t);
+      else
+        toInsert = canvas->createEv(v, t);
+      toInsert->time = calc_time(&canvas->timeEvents, v);
+      std::fflush(stdout);
+      canvas->beatEvents.insert(toInsert);
+    }
+
+    printf("read beatEvent\n");
+    std::fflush(stdout);
+
+    // Read time events
+
+    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+
+    for (int i = 0; i < eventCount; i++) { 
+      f.read(reinterpret_cast<char*>(&v), sizeof(float));
+      f.read(reinterpret_cast<char*>(&l), sizeof(int));
+      f.read(expr, l);
+      expr[l] = '\0';
+      f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      Event* toInsert;
+      if (l != 0)
+        toInsert = canvas->createEvExpr(v, expr, t);
+      else
+        toInsert = canvas->createEv(v, t);
+      canvas->timeEvents.insert(toInsert);
+    }
+
+    // --- Tree root ---
+    root = readTreeNode(f);
+
+
+    uint32_t profileCount;
+    f.read(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
+
+    if (profileCount != 10) {
+        // you can decide whether to error or clamp
+        return false;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 3; j++) {
+            OSCSettings* osc = &(profiles[i].settings[j]);
+
+            int32_t wave;
+            f.read(reinterpret_cast<char*>(&wave), sizeof(wave));
+            osc->waveType = static_cast<WaveformType>(wave);
+
+            f.read(reinterpret_cast<char*>(&osc->attack),  sizeof(float));
+            if (i == 0 && j == 0)
+                printf("read attack: %f\n", osc->attack);
+            f.read(reinterpret_cast<char*>(&osc->decay),   sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->sustain), sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->release), sizeof(float));
+            f.read(reinterpret_cast<char*>(&osc->gain),    sizeof(float));
+        }
+    }
+
+    f.close();
+    return true;
+}
+
+
+
 static Canvas2D gBeatOctCanvas;
 
 int main(int, char**)
@@ -2912,7 +2916,7 @@ int main(int, char**)
         if (buttons[10].hit) { // If load project button is pressed
             std::unique_ptr<TreeNode> loadedSplits;
             Profile ps[10];
-            load_song("session.son", &gBeatOctCanvas.beatEvents, &gBeatOctCanvas.timeEvents, loadedSplits, ps);
+            load_song("session.son", &gBeatOctCanvas, loadedSplits, ps);
             for (int i = 0; i < 10; i++) {
                 if (i == 0) {
                     printf("attack: %f", ps[i].settings[0].attack);

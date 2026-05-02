@@ -129,6 +129,7 @@ public:
         printf("enter insert\n");
         std::fflush(stdout);
         root = insert(root, value);
+        root->parent = nullptr;
         ordered = false;
     }
 
@@ -167,6 +168,18 @@ private:
         return n ? n->height : 0;
     }
 
+    void reparent(Event* ev) {
+      if (ev) {
+        if (ev->left) {
+          ev->left->parent = ev;
+          reparent(ev->left);
+        } if (ev->right) {
+          ev->right->parent = ev;
+          reparent(ev->right);
+        }
+      }
+    }
+
     int balanceFactor(Event*& n) {
         return n ? height(n->left) - height(n->right) : 0;
     }
@@ -176,7 +189,7 @@ private:
     }
 
     // ---------- Rotations ----------
-    Event* rotateRight(Event* y) {
+    Event* rotateRight(Event* y, Event* p) {
         auto x = y->left;
         auto T2 = x->right;
 
@@ -185,11 +198,13 @@ private:
 
         updateHeight(x->right);
         updateHeight(x);
+        reparent(x);
+        x->parent = p;
 
         return x;
     }
 
-    Event* rotateLeft(Event* x) {
+    Event* rotateLeft(Event* x, Event* p) {
         auto y = x->right;
         auto T2 = y->left;
 
@@ -198,6 +213,8 @@ private:
 
         updateHeight(y->left);
         updateHeight(y);
+        reparent(y);
+        y->parent = p;
 
         return y;
     }
@@ -231,22 +248,22 @@ private:
 
         // LL
         if (balance > 1 && value->beat < node->left->beat)
-            return rotateRight(node);
+            return rotateRight(node, node->parent);
 
         // RR
         if (balance < -1 && value->beat > node->right->beat)
-            return rotateLeft(node);
+            return rotateLeft(node, node->parent);
 
         // LR
         if (balance > 1 && value->beat > node->left->beat) {
-            node->left = rotateLeft(node->left);
-            return rotateRight(node);
+            node->left = rotateLeft(node->left, node);
+            return rotateRight(node, node->parent);
         }
 
         // RL
         if (balance < -1 && value->beat < node->right->beat) {
-            node->right = rotateRight(node->right);
-            return rotateLeft(node);
+            node->right = rotateRight(node->right, node);
+            return rotateLeft(node, node->parent);
         }
 
         return node;
@@ -303,19 +320,19 @@ private:
         int balance = balanceFactor(node);
 
         if (balance > 1 && balanceFactor(node->left) >= 0)
-            return rotateRight(node);
+            return rotateRight(node, node->parent);
 
         if (balance > 1 && balanceFactor(node->left) < 0) {
-            node->left = rotateLeft(node->left);
-            return rotateRight(node);
+            node->left = rotateLeft(node->left, node);
+            return rotateRight(node, node->parent);
         }
 
         if (balance < -1 && balanceFactor(node->right) <= 0)
-            return rotateLeft(node);
+            return rotateLeft(node, node->parent);
 
         if (balance < -1 && balanceFactor(node->right) > 0) {
-            node->right = rotateRight(node->right);
-            return rotateLeft(node);
+            node->right = rotateRight(node->right, node);
+            return rotateLeft(node, node->parent);
         }
 
         return node;
