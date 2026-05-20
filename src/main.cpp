@@ -1026,6 +1026,7 @@ bool save_song(const std::string& path,
     float v;
     int t;
     int l;
+    uint32_t id;
     while (current) {
       v = current->beat;
       sprintf(expr, "%s", current->string_expr.c_str());
@@ -1036,6 +1037,7 @@ bool save_song(const std::string& path,
       f.write(reinterpret_cast<const char*>(&l), sizeof(int));
       f.write(expr, l);
       f.write(reinterpret_cast<const char*>(&t), sizeof(int));
+      f.write(reinterpret_cast<const char*>(&id), sizeof(uint32_t));
       current = next(current);
     }
 
@@ -1062,6 +1064,7 @@ bool save_song(const std::string& path,
       f.write(reinterpret_cast<const char*>(&l), sizeof(int));
       f.write(expr, l);
       f.write(reinterpret_cast<const char*>(&t), sizeof(int));
+      printf("write: %f, %d, %d\n", v, l, t);
       current = next(current);
     }
 
@@ -1818,7 +1821,11 @@ struct Canvas2D {
                         break;
                     }
                 }
+                printf("noteEv: %d, ", noteEv != nullptr);
+                if (noteEv)
+                printf("isConstant: %d\n", noteEv->isConstant());
                 if (noteEv && noteEv->isConstant()) {
+                    printf("yes display\n");
                     // printf("value: %f, times: %f, %f!\n", noteEv->function.value(), noteEv->time, currentBeatEv->time);
                     Vec2 a = worldToScreen(topLeft, { noteEv->time, noteEv->function.value() });
                     Vec2 b = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.value() });
@@ -1970,28 +1977,26 @@ struct Canvas2D {
                     noteEnd = next(noteEnd);
                 }
                 // Delete any foci that were on this note
-                Event* current = beatEvents.root;
+                Event* current = beatEvents.get_first();
                 Event* previous = nullptr;
-                while (current && current->left)
-                    current = current->left;
                 if (current->type != EV_FOCUS)
                   current = next_focus(current);
+                bool deleted = false;
                 while (current) {
                   // We can do this because a focus' string_expr is always
                   // copied from the note that was right clicked on
                   if (current->string_expr == closest->string_expr) {
-                    if (std::abs(current->beat - closest->beat) < 1e-6 \
-                        && (!previous || previous->function.value() != 0.0f)) {
+                    if (previous && previous->function.value() != 0.0f) {
                       current->update_function("0");
-                    } else if (std::abs(current->beat - noteEnd->beat) < 1e-6 && \
-                        current->function.value() == 0.0) {
+                    } else {
                       beatEvents.remove(current->beat, current->id);
-                    } else if (current->beat <= noteEnd->beat &&
-                        current->beat >= closest->beat) {
-                      beatEvents.remove(current->beat, current->id);
+                      deleted = true;
                     }
                   }
-                  previous = current;
+                  if (!deleted)
+                    previous = current;
+                  else
+                    deleted = false;
                   current = next_focus(current);
                 }
 
@@ -2336,6 +2341,7 @@ bool load_song(const std::string& path,
     float v;
     char expr[40];
     int t, l;
+    uint32_t id;
     for (int i = 0; i < eventCount; i++) {
       printf("event %d\n", i);
       std::fflush(stdout);
@@ -2344,15 +2350,19 @@ bool load_song(const std::string& path,
       f.read(expr, l);
       expr[l] = '\0';
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      f.read(reinterpret_cast<char*>(&id), sizeof(uint32_t));
+      printf("read: %f, %s, %d, %d\n", v, expr, l, t);
       Event* toInsert;
       if (l != 0)
         toInsert = canvas->createEvExpr(v, expr, t);
       else
         toInsert = canvas->createEv(v, t);
+      toInsert->id = id;
       toInsert->time = calc_time(&canvas->timeEvents, v);
       std::fflush(stdout);
       canvas->beatEvents.insert(toInsert);
     }
+    canvas->beatEvents.reparent_tree();
 
     printf("read beatEvent\n");
     std::fflush(stdout);
@@ -2374,6 +2384,8 @@ bool load_song(const std::string& path,
         toInsert = canvas->createEv(v, t);
       canvas->timeEvents.insert(toInsert);
     }
+
+    canvas->timeEvents.reparent_tree();
 
     // --- Tree root ---
     root = readTreeNode(f);

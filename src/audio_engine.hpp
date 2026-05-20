@@ -110,7 +110,11 @@ struct Event {
 
     bool isConstant() {
         for (int i = 0; i < string_expr.length(); i++) {
-            if (string_expr[i] == 't' || string_expr[i] == 'b') return false;
+            if (string_expr[i] == 't' || string_expr[i] == 'b') {
+              printf("t or b found\n");
+              std::fflush(stdout);
+              return false;
+            }
         }
         return true;
     }
@@ -135,6 +139,7 @@ public:
 
     void remove(float key, int id) {
         root = remove(root, key, id);
+        reparent_tree();
         ordered = false;
     }
 
@@ -149,6 +154,13 @@ public:
             do_order(root, previous);
             ordered = true;
         }
+    }
+
+    void reparent_tree() {
+      if (root) {
+        reparent(root);
+        root->parent = nullptr;
+      }
     }
 
     Event* get_first() {
