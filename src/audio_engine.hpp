@@ -148,6 +148,10 @@ public:
         std::cout << "\n";
     }
 
+    void find_loop() {
+      find_loop(root);
+    }
+
     void create_order() {
         if (!ordered) {
             Event* previous = nullptr;
@@ -175,6 +179,24 @@ public:
 
 private:
 
+    void find_loop(Event* node) {
+      printf("beat, id: %f, %d\n", node->beat, node->id);
+      std::fflush(stdout);
+      if (node->left) {
+        printf("left\n");
+        std::fflush(stdout);
+        find_loop(node->left);
+      }
+      if (node->right) {
+        printf("right\n");
+        std::fflush(stdout);
+        find_loop(node->right);
+      }
+      printf("up\n");
+    }
+
+
+
     // ---------- Utilities ----------
     int height(Event*& n) {
         return n ? n->height : 0;
@@ -185,7 +207,8 @@ private:
         if (ev->left) {
           ev->left->parent = ev;
           reparent(ev->left);
-        } if (ev->right) {
+        }
+        if (ev->right) {
           ev->right->parent = ev;
           reparent(ev->right);
         }

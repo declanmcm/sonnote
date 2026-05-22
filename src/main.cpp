@@ -1033,6 +1033,7 @@ bool save_song(const std::string& path,
       l = strlen(expr);
       printf("expr: %s, len: %d\n", expr, l);
       t = current->type;
+      id = current->id;
       f.write(reinterpret_cast<const char*>(&v), sizeof(float));
       f.write(reinterpret_cast<const char*>(&l), sizeof(int));
       f.write(expr, l);
@@ -1966,6 +1967,10 @@ struct Canvas2D {
 
             if (number != -1) {
                 closest->profile = number;
+            }
+
+            if (containsKey(keys, 'q')) {
+              beatEvents.inorder();
             }
 
             if (containsKey(keys, 'd') || containsKey(keys, 'f') || \
@@ -2929,6 +2934,7 @@ int main(int, char**)
             std::unique_ptr<TreeNode> loadedSplits;
             Profile ps[10];
             load_song("session.son", &gBeatOctCanvas, loadedSplits, ps);
+            gBeatOctCanvas.beatEvents.find_loop();
             for (int i = 0; i < 10; i++) {
                 if (i == 0) {
                     printf("attack: %f", ps[i].settings[0].attack);
