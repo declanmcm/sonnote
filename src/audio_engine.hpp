@@ -96,7 +96,7 @@ struct Event {
         parent = NULL;
         next_ev = NULL;
         height = 0;
-        id = -1;
+        id = 0;
         profile = 0;
     }
 
@@ -196,7 +196,6 @@ private:
     }
 
 
-
     // ---------- Utilities ----------
     int height(Event*& n) {
         return n ? n->height : 0;
@@ -281,25 +280,35 @@ private:
         int balance = balanceFactor(node);
         printf("balance: %d\n", balance);
 
+        if (balance > 1) {
+          if (balanceFactor(node->left) < 0)
+            node->left = rotateLeft(node->left, node);
+          return rotateRight(node, node->parent);
+        } else if (balance < -1) {
+          if (balanceFactor(node->right) > 0)
+            node->right = rotateRight(node->right, node);
+          return rotateLeft(node, node->parent);
+        }
+
         // LL
-        if (balance > 1 && value->beat < node->left->beat)
-            return rotateRight(node, node->parent);
+        //if (balance > 1 && value->beat < node->left->beat)
+        //    return rotateRight(node, node->parent);
 
         // RR
-        if (balance < -1 && value->beat > node->right->beat)
-            return rotateLeft(node, node->parent);
+        //if (balance < -1 && value->beat > node->right->beat)
+        //    return rotateLeft(node, node->parent);
 
         // LR
-        if (balance > 1 && value->beat > node->left->beat) {
-            node->left = rotateLeft(node->left, node);
-            return rotateRight(node, node->parent);
-        }
+        //if (balance > 1 && value->beat > node->left->beat) {
+        //    node->left = rotateLeft(node->left, node);
+        //    return rotateRight(node, node->parent);
+        //}
 
         // RL
-        if (balance < -1 && value->beat < node->right->beat) {
-            node->right = rotateRight(node->right, node);
-            return rotateLeft(node, node->parent);
-        }
+        //if (balance < -1 && value->beat < node->right->beat) {
+        //    node->right = rotateRight(node->right, node);
+        //    return rotateLeft(node, node->parent);
+        //}
 
         return node;
     }
@@ -377,7 +386,7 @@ private:
     void inorder(const Event* node, uint8_t level) const {
         if (!node) return;
         inorder(node->left, level + 1);
-        printf("%f (%d) ", node->beat, level);
+        printf("%f, %d (%d) ", node->beat, node->id, level);
         printf("\n");
         // std::cout << node->beat << "(" << level << ") ";
         inorder(node->right, level + 1);

@@ -1271,7 +1271,7 @@ struct Canvas2D {
     float anchorBeat = 0.0f;
     char anchorExpr[20];
     std::vector<uint32_t> spareIDs;
-    uint32_t nextID = 0;
+    uint32_t nextID = 1;
     float split_start = -1.0f;
 
     std::vector<Event*> currentEvsAtCursor;
@@ -1702,7 +1702,9 @@ struct Canvas2D {
         Vec2 size     = { std::abs(nw.x2 - nw.x1), std::abs(nw.y2 - nw.y1) };
         Vec2 bottomRight = { nw.x2, nw.y1 };
 
-        bool hovered = std::abs(hover.x + 1.0f) > 1e-06;
+        printf("raw hover: %f, %f\n", hover.x, hover.y);
+
+        bool hovered = hover.x > 1e-06 && hover.y > 1e-06;
 
         // --- Panning with RMB drag ---
         if (hovered && dx != 0 || dy != 0) {
@@ -1747,7 +1749,7 @@ struct Canvas2D {
         std::vector<float> currently_held;
         float end = 0.0f;
         std::sort(sorted.begin(), sorted.end(),
-                [](auto& a, auto& b){ 
+                [](auto& a, auto& b){
                     return a.beat_on < b.beat_on; });
         std::sort(sortedEnd.begin(), sortedEnd.end(),
                 [](auto&a, auto& b){
@@ -1769,10 +1771,10 @@ struct Canvas2D {
 
         // Draw playhead
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
-        addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]); 
+        addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         Vec2 w = screenToWorld(topLeft, hover);
-        float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL); 
+        float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
 
         if (std::abs(currentBeat - std::round(currentBeat)) < std::abs(currentBeat - snappedBeat))
@@ -2178,13 +2180,12 @@ struct Canvas2D {
             }
 
             bool focus_exists = insert > 0 && (!prev || (start->beat == prev->beat && start->function == prev->function)) && end->beat == currentFocus->beat && end->function == currentFocus->function;
-            // printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave);
-
+            // printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave));
             if (!focus_exists) {
                 if (removePrevious)
-                    beatEvents.remove(prev->beat, -1);
+                    beatEvents.remove(prev->beat, 0);
                 if (removeNext)
-                    beatEvents.remove(insertEv->beat, -1);
+                    beatEvents.remove(insertEv->beat, 0);
 
                 if (no_prev_or_closest_starts_after_prev && no_foci_or_after_foci_or_closest_ends_before_next) {
                     beatEvents.insert(start);
@@ -2322,7 +2323,7 @@ struct Canvas2D {
 // --- Load binary song file ---
 bool load_song(const std::string& path,
                Canvas2D* canvas,
-               std::unique_ptr<TreeNode>& root, Profile* profiles)
+               std::unique_ptr<TreeNode>& root, Profile* profiles, uint32_t* nextID)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -2347,6 +2348,7 @@ bool load_song(const std::string& path,
     char expr[40];
     int t, l;
     uint32_t id;
+    uint32_t next_id = 0;
     for (int i = 0; i < eventCount; i++) {
       printf("event %d\n", i);
       std::fflush(stdout);
@@ -2356,17 +2358,22 @@ bool load_song(const std::string& path,
       expr[l] = '\0';
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
       f.read(reinterpret_cast<char*>(&id), sizeof(uint32_t));
-      printf("read: %f, %s, %d, %d\n", v, expr, l, t);
+      printf("read: %f, %s, %d, %d, %d\n", v, expr, l, t, id);
       Event* toInsert;
       if (l != 0)
         toInsert = canvas->createEvExpr(v, expr, t);
       else
         toInsert = canvas->createEv(v, t);
       toInsert->id = id;
+      printf("id: %d, toInsert->id: %d\n", id, toInsert->id);
+      if (toInsert->id > next_id) {
+        next_id = toInsert->id;
+      }
       toInsert->time = calc_time(&canvas->timeEvents, v);
       std::fflush(stdout);
       canvas->beatEvents.insert(toInsert);
     }
+    *nextID = next_id + 1;
     canvas->beatEvents.reparent_tree();
 
     printf("read beatEvent\n");
@@ -2376,7 +2383,7 @@ bool load_song(const std::string& path,
 
     f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
 
-    for (int i = 0; i < eventCount; i++) { 
+    for (int i = 0; i < eventCount; i++) {
       f.read(reinterpret_cast<char*>(&v), sizeof(float));
       f.read(reinterpret_cast<char*>(&l), sizeof(int));
       f.read(expr, l);
@@ -2933,7 +2940,9 @@ int main(int, char**)
         if (buttons[10].hit) { // If load project button is pressed
             std::unique_ptr<TreeNode> loadedSplits;
             Profile ps[10];
-            load_song("session.son", &gBeatOctCanvas, loadedSplits, ps);
+            load_song("session.son", &gBeatOctCanvas, loadedSplits, ps, &gBeatOctCanvas.nextID);
+            printf("nextID: %d\n", gBeatOctCanvas.nextID);
+            gBeatOctCanvas.beatEvents.inorder();
             gBeatOctCanvas.beatEvents.find_loop();
             for (int i = 0; i < 10; i++) {
                 if (i == 0) {
