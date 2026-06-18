@@ -6,7 +6,8 @@
 #include <cstdint>
 #include <functional>
 #include <array>
-#include "exprtk.hpp"
+//#include "exprtk.hpp"
+#include "parser.hpp"
 
 // =============================================
 // ========== PUBLIC AUDIO ENGINE API ==========
@@ -45,7 +46,7 @@ struct SeqEvent {
     int profile = 0;
 };
 
-extern exprtk::symbol_table<double> table;
+//extern exprtk::symbol_table<double> table;
 extern exprtk::parser<double> parser;
 extern double b;
 extern double t;
@@ -67,6 +68,8 @@ struct Event {
     Event* right;
     Event* next_ev;
     Event* parent;
+    Event* beatParent;
+    uint8_t beatDivs;
     float origin;
     bool selected;
     bool finalEv;
@@ -121,8 +124,7 @@ struct Event {
 };
 
 void do_order(Event* current, Event*& previous);
-Event* next_tempo(Event* ev);
-Event* next_focus(Event* ev);
+Event* next_type(Event* ev, int type);
 Event* next_note(Event* ev);
 float integrate(const exprtk::expression<double>& function, float t1, float t2);
 float integrate_until(const exprtk::expression<double>& function, float t1, float y);
@@ -141,6 +143,11 @@ public:
         root = remove(root, key, id);
         reparent_tree();
         ordered = false;
+    }
+
+    void remove_all() {
+      while (root)
+        remove(root, root->beat, root->id);
     }
 
     void inorder() const {
@@ -290,26 +297,6 @@ private:
           return rotateLeft(node, node->parent);
         }
 
-        // LL
-        //if (balance > 1 && value->beat < node->left->beat)
-        //    return rotateRight(node, node->parent);
-
-        // RR
-        //if (balance < -1 && value->beat > node->right->beat)
-        //    return rotateLeft(node, node->parent);
-
-        // LR
-        //if (balance > 1 && value->beat > node->left->beat) {
-        //    node->left = rotateLeft(node->left, node);
-        //    return rotateRight(node, node->parent);
-        //}
-
-        // RL
-        //if (balance < -1 && value->beat < node->right->beat) {
-        //    node->right = rotateRight(node->right, node);
-        //    return rotateLeft(node, node->parent);
-        //}
-
         return node;
     }
 
@@ -333,7 +320,7 @@ private:
                     node = node->left;
                 } else if (node->right) {
                     node = node->right;
-                } else { 
+                } else {
                     node = nullptr;
                 }
             } else {
@@ -386,7 +373,7 @@ private:
     void inorder(const Event* node, uint8_t level) const {
         if (!node) return;
         inorder(node->left, level + 1);
-        printf("%f, %d (%d) ", node->beat, node->id, level);
+        printf("%f, %d (%d) - %s", node->beat, node->id, level, node->string_expr);
         printf("\n");
         // std::cout << node->beat << "(" << level << ") ";
         inorder(node->right, level + 1);

@@ -15,7 +15,7 @@
 #include <iostream>
 #include <sndfile.h>
 #include <fftw3.h>
-#include "exprtk.hpp"
+//#include "exprtk.hpp"
 #include "audio_engine.hpp"
 
 #if defined(__APPLE__)
@@ -149,25 +149,18 @@ Event* next(Event* ev) {
   return current;
 }
 
-Event* next_tempo(Event* ev) {
-    ev = next(ev);
-    while (ev && ev->type != EV_TEMPO)
-        ev = next(ev);
-    return ev;
-}
-
-Event* next_focus(Event* ev) {
-    if (ev)
-        ev = next(ev);
-    while (ev && ev->type != EV_FOCUS)
-        ev = next(ev);
-    return ev;
-}
-
 Event* next_note(Event* ev) {
   if (ev)
     ev = next(ev);
   while (ev && !(ev->type == EV_NOTE_START || ev->type == EV_NOTE_END))
+    ev = next(ev);
+  return ev;
+}
+
+Event* next_type(Event* ev, int type) {
+  if (ev)
+    ev = next(ev);
+  while (ev && ev->type != type)
     ev = next(ev);
   return ev;
 }
@@ -187,26 +180,26 @@ float integrate_until(const exprtk::expression<double>& function, float t1, floa
 float calc_time(EventTree* times, float noteBeat) {
     Event* currentTempoEv = times->get_first();
     if (currentTempoEv->type != EV_TEMPO)
-        currentTempoEv = next_tempo(currentTempoEv);
+        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
     float beats = 0.0f;
     while (currentTempoEv) {
         printf("tempoEv: %p\n", currentTempoEv);
         float currentTempoEvBeats = beats;
-        if (next_tempo(currentTempoEv)) {
+        if (next_type(currentTempoEv, EV_TEMPO)) {
             if (currentTempoEv->isConstant()) {
-                beats += (next_tempo(currentTempoEv)->time - currentTempoEv->time) * currentTempoEv->function.value();
+                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.value();
             } else {
-                beats += integrate(currentTempoEv->function, currentTempoEv->time, next_tempo(currentTempoEv)->time);
+                beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
             }
         }
-        if (!next_tempo(currentTempoEv) || beats > noteBeat) {
+        if (!next_type(currentTempoEv, EV_TEMPO) || beats > noteBeat) {
             if (currentTempoEv->isConstant()) {
                 return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.value() / 60.0);
             } else {
                 return integrate_until(currentTempoEv->function, currentTempoEv->time, noteBeat - currentTempoEvBeats);
             }
         }
-        currentTempoEv = next_tempo(currentTempoEv);
+        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
     }
 }
 
@@ -217,14 +210,14 @@ void calc_times(EventTree* times, EventTree* beats) {
         currentTempoEv = currentTempoEv->left;
     while (currentBeatEv->left)
         currentBeatEv = currentBeatEv->left;
-    currentTempoEv = next_tempo(currentTempoEv);
+    currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
     float beatAccum = 0.0f;
     while (currentTempoEv) {
         float currentTempoEvBeats = beatAccum;
         if (currentTempoEv->isConstant()) {
-            beatAccum += (next_tempo(currentTempoEv)->time - currentTempoEv->time) * currentTempoEv->function.value();
+            beatAccum += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.value();
         } else {
-            beatAccum += integrate(currentTempoEv->function, currentTempoEv->time, next_tempo(currentTempoEv)->time);
+            beatAccum += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
         }
         while (currentBeatEv) {
             if (beatAccum > currentBeatEv->beat) {
@@ -620,7 +613,7 @@ float playhead_time = 0.0f;
 bool play_triggered_from_space = false;
 
 static char jump[64] = "";
-static char split[64] = "";
+static char split_char[64] = "";
 
 // 5.25
 // 5.375
@@ -1008,45 +1001,17 @@ bool save_song(const std::string& path,
     // Magic header
     f.write("SONN", 4);
 
-    // Write number of beat events followed by beat Events in order
-
-    Event* current = beatEvents.get_first();
-
-    uint32_t eventCount = 0;
-    while (current) {
-      eventCount++;
-      current = next(current);
-    }
-
-    f.write(reinterpret_cast<const char*>(&eventCount), sizeof(eventCount));
-
-    current = beatEvents.get_first();
-
     char expr[40];
     float v;
     int t;
     int l;
     uint32_t id;
-    while (current) {
-      v = current->beat;
-      sprintf(expr, "%s", current->string_expr.c_str());
-      l = strlen(expr);
-      printf("expr: %s, len: %d\n", expr, l);
-      t = current->type;
-      id = current->id;
-      f.write(reinterpret_cast<const char*>(&v), sizeof(float));
-      f.write(reinterpret_cast<const char*>(&l), sizeof(int));
-      f.write(expr, l);
-      f.write(reinterpret_cast<const char*>(&t), sizeof(int));
-      f.write(reinterpret_cast<const char*>(&id), sizeof(uint32_t));
-      current = next(current);
-    }
+    uint32_t eventCount = 0;
 
     // Write number of time events followed by time Events in order
 
-    current = timeEvents.get_first();
+    Event* current = timeEvents.get_first();
 
-    eventCount = 0;
     while (current) {
       eventCount++;
       current = next(current);
@@ -1066,6 +1031,34 @@ bool save_song(const std::string& path,
       f.write(expr, l);
       f.write(reinterpret_cast<const char*>(&t), sizeof(int));
       printf("write: %f, %d, %d\n", v, l, t);
+      current = next(current);
+    }
+
+    // Write number of beat events followed by beat Events in order
+
+    current = beatEvents.get_first();
+    eventCount = 0;
+    while (current) {
+      eventCount++;
+      current = next(current);
+    }
+
+    f.write(reinterpret_cast<const char*>(&eventCount), sizeof(eventCount));
+
+    current = beatEvents.get_first();
+
+    while (current) {
+      v = current->beat;
+      sprintf(expr, "%s", current->string_expr.c_str());
+      l = strlen(expr);
+      printf("expr: %s, len: %d\n", expr, l);
+      t = current->type;
+      id = current->id;
+      f.write(reinterpret_cast<const char*>(&v), sizeof(float));
+      f.write(reinterpret_cast<const char*>(&l), sizeof(int));
+      f.write(expr, l);
+      f.write(reinterpret_cast<const char*>(&t), sizeof(int));
+      f.write(reinterpret_cast<const char*>(&id), sizeof(uint32_t));
       current = next(current);
     }
 
@@ -1774,12 +1767,14 @@ struct Canvas2D {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         Vec2 w = screenToWorld(topLeft, hover);
+        printf("timeEvents:");
+        timeEvents.inorder();
         float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
 
         if (std::abs(currentBeat - std::round(currentBeat)) < std::abs(currentBeat - snappedBeat))
             snappedBeat =  std::round(currentBeat);
-        printf("currentBeat: %f, snappedBeat: %f\n", currentBeat, snappedBeat);
+        printf("topLeft.x: %f, w.x: %f, currentBeat: %f, snappedBeat: %f\n", topLeft.x, w.x, currentBeat, snappedBeat);
 
         float snappedTime = calc_time(&timeEvents, snappedBeat);
 
@@ -1843,7 +1838,7 @@ struct Canvas2D {
         currentBeatEv = beatEvents.get_first();
 
         if (currentBeatEv && currentBeatEv->type != EV_FOCUS)
-          currentBeatEv = next_focus(currentBeatEv);
+          currentBeatEv = next_type(currentBeatEv, EV_FOCUS);
 
         // Draw foci and related harmonics, snap to focus
         while (currentBeatEv) {
@@ -1896,7 +1891,7 @@ struct Canvas2D {
             // TODO: handle non-constant draw_events
           }
           prevEv = currentBeatEv;
-          currentBeatEv = next_focus(currentBeatEv);
+          currentBeatEv = next_type(currentBeatEv, EV_FOCUS);
         }
 
         // draw_events(events.root, renderer, topLeft, bottomRight {snappedBeat, w.y});
@@ -1975,6 +1970,24 @@ struct Canvas2D {
               beatEvents.inorder();
             }
 
+            if (containsKey(keys, 's')) {
+              if (std::abs(split_start + 1) < 1e-6)
+                split_start = currentBeat;
+              else {
+                // Insert divisions between split_start and currentBeat
+                //Event* current = beatEvents.get_first();
+                //if (current->type != EV_BEAT)
+                //  current = next_type(current, EV_BEAT);
+                //while (current != nullptr && ) {
+                //  if (current->beat != split_start)
+                //    current = next_type(current, EV_BEAT);
+                //}
+                //Event* toInsert = new Event(std::atof(split_char), split_char, EV_BEAT);
+                //beatEvents.insert(toInsert);
+                //split_start = -1.0f;
+              }
+            }
+
             if (containsKey(keys, 'd') || containsKey(keys, 'f') || \
                   containsKey(keys, 'l')) {
                 // Delete the note because it will be replaced
@@ -1987,7 +2000,7 @@ struct Canvas2D {
                 Event* current = beatEvents.get_first();
                 Event* previous = nullptr;
                 if (current->type != EV_FOCUS)
-                  current = next_focus(current);
+                  current = next_type(current, EV_FOCUS);
                 bool deleted = false;
                 while (current) {
                   // We can do this because a focus' string_expr is always
@@ -2004,7 +2017,7 @@ struct Canvas2D {
                     previous = current;
                   else
                     deleted = false;
-                  current = next_focus(current);
+                  current = next_type(current, EV_FOCUS);
                 }
 
                 if (containsKey(keys, 'l')) {
@@ -2070,7 +2083,7 @@ struct Canvas2D {
             Event* currentFocus = beatEvents.root;
             while (currentFocus && currentFocus->left)
                 currentFocus = currentFocus->left;
-            currentFocus = next_focus(currentFocus);
+            currentFocus = next_type(currentFocus, EV_FOCUS);
             Event* prev = nullptr;
             Event* prevPrev = nullptr;
             while (currentFocus) {
@@ -2082,7 +2095,7 @@ struct Canvas2D {
                         focus_after = false;
                     if (fociLength <= 1 || (prevPrev && prevPrev->isConstant() && prevPrev->function.value() == 0.0f))
                         focus_before = false;
-                } else if (!next_focus(currentFocus) && !insertEv) {
+                } else if (!next_type(currentFocus, EV_FOCUS) && !insertEv) {
                     insert = fociLength + 1;
                 }
                 if (!insertEv) {
@@ -2090,7 +2103,7 @@ struct Canvas2D {
                     prev = currentFocus;
                 }
                 fociLength++;
-                currentFocus = next_focus(currentFocus);
+                currentFocus = next_type(currentFocus, EV_FOCUS);
             }
             printf("fociLength: %d insert: %d\n", fociLength, insert);
             // printf("insert: %d\n", insert);
@@ -2115,9 +2128,9 @@ struct Canvas2D {
             bool no_foci_or_after_foci_or_closest_ends_before_next = fociLength == 0 || insert == fociLength || (insertEv && closestOff->beat < insertEv->beat);
 
             bool closest_starts_at_prev = insert > 0 && prev && std::abs(closest->beat - prev->beat) < 1e-6;
-            bool closest_ends_at_next_focus_change = insert > 0 && insert <= fociLength - 1 && std::abs(closestOff->beat - insertEv->beat) < 1e-6;
+            bool closest_ends_at_next_type_change = insert > 0 && insert <= fociLength - 1 && std::abs(closestOff->beat - insertEv->beat) < 1e-6;
 
-            printf("npcsap: %d, cebnfc: %d, csatpfc: %d, ceanfc: %d, fb: %d, fa: %d\n", no_prev_or_closest_starts_after_prev, no_foci_or_after_foci_or_closest_ends_before_next, closest_starts_at_prev, closest_ends_at_next_focus_change, focus_before, focus_after);
+            printf("npcsap: %d, cebnfc: %d, csatpfc: %d, ceanfc: %d, fb: %d, fa: %d\n", no_prev_or_closest_starts_after_prev, no_foci_or_after_foci_or_closest_ends_before_next, closest_starts_at_prev, closest_ends_at_next_type_change, focus_before, focus_after);
 
             if (no_prev_or_closest_starts_after_prev) {
                 printf("A");
@@ -2153,11 +2166,11 @@ struct Canvas2D {
                 if (insert > 0 && prev) {
                     end->update_function(previousOctave);
                 }
-            } else if (closest_ends_at_next_focus_change) {
+            } else if (closest_ends_at_next_type_change) {
                 printf("D");
             } else if (!focus_after) {
                 // Still must check if the one after the next happens before the end of the note
-                if (next_focus(insertEv) && next_focus(insertEv)->beat < closestOff->beat) {
+                if (next_type(insertEv, EV_FOCUS) && next_type(insertEv, EV_FOCUS)->beat < closestOff->beat) {
                     removeNext = true;
                 } else {
                     insertEv->beat = closestOff->beat;
@@ -2334,21 +2347,49 @@ bool load_song(const std::string& path,
         throw std::runtime_error("Invalid file format");
     }
 
-    // Read beat events
+    canvas->timeEvents.remove_all();
+    canvas->beatEvents.remove_all();
 
-    printf("ready to read beatEvents");
-    std::fflush(stdout);
+    printf("empty timeEvents:");
+    canvas->timeEvents.inorder();
 
     uint32_t eventCount;
-    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
-    printf("beatEvents size: %d\n", eventCount);
-    std::fflush(stdout);
-
     float v;
     char expr[40];
     int t, l;
     uint32_t id;
     uint32_t next_id = 0;
+    // Read time events
+
+    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+
+    for (int i = 0; i < eventCount; i++) {
+      f.read(reinterpret_cast<char*>(&v), sizeof(float));
+      f.read(reinterpret_cast<char*>(&l), sizeof(int));
+      f.read(expr, l);
+      expr[l] = '\0';
+      f.read(reinterpret_cast<char*>(&t), sizeof(t));
+      Event* toInsert;
+      if (l != 0)
+        toInsert = canvas->createEvExpr(v, expr, t);
+      else
+        toInsert = canvas->createEv(v, t);
+      canvas->timeEvents.insert(toInsert);
+    }
+
+    canvas->timeEvents.reparent_tree();
+    printf("read timeEvents:");
+    canvas->timeEvents.inorder();
+
+    // Read beat events
+
+    printf("ready to read beatEvents");
+    std::fflush(stdout);
+
+    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
+    printf("beatEvents size: %d\n", eventCount);
+    std::fflush(stdout);
+
     for (int i = 0; i < eventCount; i++) {
       printf("event %d\n", i);
       std::fflush(stdout);
@@ -2378,26 +2419,6 @@ bool load_song(const std::string& path,
 
     printf("read beatEvent\n");
     std::fflush(stdout);
-
-    // Read time events
-
-    f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
-
-    for (int i = 0; i < eventCount; i++) {
-      f.read(reinterpret_cast<char*>(&v), sizeof(float));
-      f.read(reinterpret_cast<char*>(&l), sizeof(int));
-      f.read(expr, l);
-      expr[l] = '\0';
-      f.read(reinterpret_cast<char*>(&t), sizeof(t));
-      Event* toInsert;
-      if (l != 0)
-        toInsert = canvas->createEvExpr(v, expr, t);
-      else
-        toInsert = canvas->createEv(v, t);
-      canvas->timeEvents.insert(toInsert);
-    }
-
-    canvas->timeEvents.reparent_tree();
 
     // --- Tree root ---
     root = readTreeNode(f);
