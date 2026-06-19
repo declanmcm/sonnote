@@ -1,27 +1,37 @@
 #include <cstdint>
 #include <cmath>
 
+struct Operand;
+
 struct ArithNode {
   char type;
   char operation;
-  ArithNode* left;
-  ArithNode* right;
+  Operand* operands;
   int val;
-  uint8_t pronumPowers[4];
+  ArithNode* pronumPowers[4];
 
   ArithNode(char t) : type(t) {
-    left = nullptr;
-    right = nullptr;
+    operands = nullptr;
     operation = '~';
     val = 0;
-    pronumPowers[0] = 0;
-    pronumPowers[1] = 0;
-    pronumPowers[2] = 0;
-    pronumPowers[3] = 0;
+    pronumPowers[0] = nullptr;
+    pronumPowers[1] = nullptr;
+    pronumPowers[2] = nullptr;
+    pronumPowers[3] = nullptr;
   }
 };
 
-int getNum(char* str) {
+struct Operand {
+  char operation;
+  ArithNode* node;
+  Operand* next;
+
+  Operand(ArithNode* n, char op) : node(n), operation(op) {
+    next = nullptr;
+  }
+};
+
+int getNum(char*& str) {
   int val = 0;
   while (*str >= 48 && *str <= 57) {
     val = val * 10;
@@ -48,59 +58,79 @@ ArithNode* parseN(char*& str) {
       index = 3;
     str++;
     printf("index: %d\n", index);
-    if (*str == '^')
-      toReturn->pronumPowers[index] = getNum(str);
-    else
-      toReturn->pronumPowers[index] = 1;
+    if (*str == '^') {
+      str++;
+      if (*str == '(') {
+        str++;
+        toReturn->pronumPowers[index] = parseE(str);
+        str++;
+        printf("next Char: %c\n", *str);
+      }
+    } else {
+      char *one = (char*)malloc(1);
+      one[0] = '1';
+      toReturn->pronumPowers[index] = parseE(one);
+      free(one - 1);
+    }
   }
-  printf("pronumPowers: %d, %d, %d, %d\n", toReturn->pronumPowers[0], toReturn->pronumPowers[1], toReturn->pronumPowers[2], toReturn->pronumPowers[3]);
+  //printf("pronumPowers: %d, %d, %d, %d\n", toReturn->pronumPowers[0], toReturn->pronumPowers[1], toReturn->pronumPowers[2], toReturn->pronumPowers[3]);
   return toReturn;
 }
 
 ArithNode* parseF(char*& str) {
+  printf("parsing F\n");
   ArithNode* toReturn = new ArithNode('F');
   if (*str == '-') {
     str++;
-    toReturn->operation = '-';
-    toReturn->left = parseF(str);
+    toReturn->operands = new Operand(parseF(str), '-');
   } else if (*str == '(') {
     str++;
-    toReturn->left = parseE(str);
+    toReturn->operands = new Operand(parseE(str), '~');
     str++;
   } else {
     printf("parsing N\n");
-    toReturn->left = parseN(str);
+    toReturn->operands = new Operand(parseN(str), '~');
   }
   return toReturn;
 }
 
 ArithNode* parseT(char*& str) {
+  printf("parsing T\n");
   ArithNode* toReturn = new ArithNode('T');
-  toReturn->left = parseF(str);
-  if (*str == '*') {
-    str++;
-    printf("hey *\n");
-    toReturn->operation = '*';
-    toReturn->right = parseF(str);
-  } else if (*str == '/') {
-    str++;
-    toReturn->operation = '/';
-    toReturn->right = parseF(str);
+  toReturn->operands = new Operand(parseF(str), '~');
+  Operand* current = toReturn->operands;
+  while (*str == '*' || *str == '/') {
+    if (*str == '*') {
+      str++;
+      printf("hey *\n");
+      current->next = new Operand(parseF(str), '*');
+      current = current->next;
+    } else if (*str == '/') {
+      str++;
+      current->next = new Operand(parseF(str), '/');
+      current = current->next;
+    }
   }
   return toReturn;
 }
 
 ArithNode* parseE(char*& str) {
+  printf("parsing E\n");
   ArithNode* toReturn = new ArithNode('E');
-  toReturn->left = parseT(str);
-  if (*str == '+') {
-    str++;
-    toReturn->operation = '+';
-    toReturn->right = parseT(str);
-  } else if (*str == '-') {
-    str++;
-    toReturn->operation = '-';
-    toReturn->right = parseT(str);
+  toReturn->operands = new Operand(parseT(str), '~');
+  Operand* current = toReturn->operands;
+  printf("next char: %c\n", *str);
+  while (*str == '+' || *str == '-') {
+    if (*str == '+') {
+      printf("found plus\n");
+      str++;
+      current->next = new Operand(parseT(str), '+');
+      current = current->next;
+    } else if (*str == '-') {
+      str++;
+      current->next = new Operand(parseT(str), '-');
+      current = current->next;
+    }
   }
   return toReturn;
 }
@@ -120,39 +150,53 @@ struct ArithTree {
     if (node->type == 'E') {
       printf("E");
       std::fflush(stdout);
-      if (node->operation == '~') {
-        return evaluate(node->left, a, b, c, d);
-      } else if (node->operation == '+') {
-        return evaluate(node->left, a, b, c, d) + evaluate(node->right, a, b, c, d);
-      } else if (node->operation == '-') {
-        return evaluate(node->left, a, b, c, d) - evaluate(node->right, a, b, c, d);
+      Operand* current = node->operands;
+      float result = evaluate(current->node, a, b, c, d);
+      current = current->next;
+      while (current) {
+        if (current->operation == '+')
+          result += evaluate(current->node, a, b, c, d);
+        else if (current->operation == '-')
+          result -= evaluate(current->node, a, b, c, d);
+        current = current->next;
       }
+      return result;
     } else if (node->type == 'T') {
       printf("T");
       std::fflush(stdout);
-      if (node->operation == '~') {
-        return evaluate(node->left, a, b, c, d);
-      } else if (node->operation == '*') {
-        float value = evaluate(node->left, a, b, c, d) * evaluate(node->right, a, b, c, d);
-        printf("value at T: %f\n", value);
-        return value;
-      } else if (node->operation == '/') {
-        return evaluate(node->left, a, b, c, d) / evaluate(node->right, a, b, c, d);
+      Operand* current = node->operands;
+      float result = evaluate(current->node, a, b, c, d);
+      current = current->next;
+      while (current) {
+        printf("got next\n");
+        if (current->operation == '*')
+          result = result * evaluate(current->node, a, b, c, d);
+        else if (current->operation == '/')
+          result = result / evaluate(current->node, a, b, c, d);
+        current = current->next;
       }
+      return result;
     } else if (node->type == 'F') {
       printf("F");
       std::fflush(stdout);
       if (node->operation == '~') {
-        return evaluate(node->left, a, b, c, d);
+        return evaluate(node->operands->node, a, b, c, d);
       } else if (node->operation == '-') {
-        return -1 * evaluate(node->left, a, b, c, d);
+        return -1 * evaluate(node->operands->node, a, b, c, d);
       }
     } else if (node->type == 'N') {
       printf("N");
       std::fflush(stdout);
-      float value = std::pow(a, node->pronumPowers[0]) * \
-        std::pow(b, node->pronumPowers[1])  * std::pow(c, node->pronumPowers[2]) \
-        * std::pow(d, node->pronumPowers[3]);
+      float pows[4];
+      for (int i = 0; i < 4; i++) {
+        if (node->pronumPowers[i])
+          pows[i] = evaluate(node->pronumPowers[i], a, b, c, d);
+        else
+          pows[i] = 0;
+      }
+      float value = std::pow(a, pows[0]) * \
+        std::pow(b, pows[1])  * std::pow(c, pows[2]) \
+        * std::pow(d, pows[3]);
       if (node->val != 0)
         value = value * node->val;
       printf("value at N: %f\n", value);
