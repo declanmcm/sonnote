@@ -16,6 +16,7 @@
 #include <sndfile.h>
 #include <fftw3.h>
 //#include "exprtk.hpp"
+#include "parser.hpp"
 #include "audio_engine.hpp"
 
 #if defined(__APPLE__)
@@ -41,8 +42,8 @@ struct Note {
     int profile;
 };
 
-exprtk::symbol_table<double> table;
-exprtk::parser<double> parser;
+//exprtk::symbol_table<double> table;
+//exprtk::parser<double> parser;
 double b;
 double t;
 
@@ -123,19 +124,13 @@ void do_order(Event* current, Event*& previous) {
 
 Event* next(Event* ev) {
   Event* current = NULL;
-  printf("N");
   if (ev->right != NULL) {
     current = ev->right;
-    printf("1\n");
-    while (current && current->left) {
-      printf("cID: %d\n", current->id);
+    while (current && current->left)
       current = current->left;
-    }
   } else if (ev->parent && ev->parent->left == ev) {
-    printf("2\n");
     current = ev->parent;
   } else if (ev->parent && ev->parent->right == ev) {
-    printf("3\n");
     current = ev->parent;
     while (current->parent && current->parent->right == current) {
       current = current->parent;
@@ -165,13 +160,13 @@ Event* next_type(Event* ev, int type) {
   return ev;
 }
 
-float integrate(const exprtk::expression<double>& function, float t1, float t2) {
+float integrate(ArithTree function, float t1, float t2) {
     // TODO: Implement step integration here
     return 0.0f;
 }
 
 
-float integrate_until(const exprtk::expression<double>& function, float t1, float y) {
+float integrate_until(ArithTree function, float t1, float y) {
     // TODO: Integrate until equal to y and then return t2
     return 0.0f;
 }
@@ -187,14 +182,14 @@ float calc_time(EventTree* times, float noteBeat) {
         float currentTempoEvBeats = beats;
         if (next_type(currentTempoEv, EV_TEMPO)) {
             if (currentTempoEv->isConstant()) {
-                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.value();
+                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.evaluate(b, t, 0, 0);
             } else {
                 beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
             }
         }
         if (!next_type(currentTempoEv, EV_TEMPO) || beats > noteBeat) {
             if (currentTempoEv->isConstant()) {
-                return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.value() / 60.0);
+                return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.evaluate(b, t, 0, 0) / 60.0);
             } else {
                 return integrate_until(currentTempoEv->function, currentTempoEv->time, noteBeat - currentTempoEvBeats);
             }
@@ -215,14 +210,14 @@ void calc_times(EventTree* times, EventTree* beats) {
     while (currentTempoEv) {
         float currentTempoEvBeats = beatAccum;
         if (currentTempoEv->isConstant()) {
-            beatAccum += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.value();
+            beatAccum += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.evaluate(b, t, 0, 0);
         } else {
             beatAccum += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
         }
         while (currentBeatEv) {
             if (beatAccum > currentBeatEv->beat) {
                 if (currentTempoEv->isConstant()) {
-                    currentBeatEv->time = (currentBeatEv->beat - currentTempoEvBeats) / currentTempoEv->function.value();
+                    currentBeatEv->time = (currentBeatEv->beat - currentTempoEvBeats) / currentTempoEv->function.evaluate(b, t, 0, 0);
                 } else {
                     currentBeatEv->time = integrate_until(currentTempoEv->function, currentTempoEv->time, currentBeatEv->beat - currentTempoEvBeats);
                 }
@@ -1299,7 +1294,7 @@ struct Canvas2D {
           printf("HOW?!?\n");
           std::fflush(stdout);
         }
-        printf("val: %f\n", toInsert->function.value());
+        printf("val: %f\n", toInsert->function.evaluate(b, t, 0, 0));
         timeEvents.insert(toInsert);
     }
 
@@ -1382,10 +1377,9 @@ struct Canvas2D {
     float drawFundamental(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float start, float end, std::vector<Event*> currentEvs) {
       bool allConstant = true;
       float root = 0.0f;
-      printf("hiGG's BOSON\n");
       std::fflush(stdout);
       for  (int i = 0; i < (int)currentEvs.size(); i++) {
-        printf("value[%d]: %f\n", i, currentEvs[i]->function.value());
+        printf("value[%d]: %f\n", i, currentEvs[i]->function.evaluate(b, t, 0, 0));
         std::fflush(stdout);
         if (!(currentEvs[i]->isConstant())) {
           allConstant = false;
@@ -1396,7 +1390,7 @@ struct Canvas2D {
       if (allConstant) {
         std::vector<float> octaves;
         for (int i = 0; i < (int)currentEvs.size(); i++) {
-          octaves.push_back(currentEvs[i]->function.value());
+          octaves.push_back(currentEvs[i]->function.evaluate(b, t, 0, 0));
         }
         root = calculateRoot(octaves); 
 
@@ -1474,17 +1468,17 @@ struct Canvas2D {
                 // This is the last tempo event, will return
                 if (node->beat > v) {
                     if (last && last->isConstant())
-                        current += (last->function.value() / 60.0) * (v - last->beat);
-                    else 
+                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (v - last->beat);
+                    else
                         current += integrate(last->function, last->beat, v);
                 } else {
                     if (last && last->isConstant())
-                        current += (last->function.value() / 60.0) * (node->beat - last->beat);
-                    else 
-                        current += integrate(last->function, last->beat, node->beat);
+                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (node->beat - last->beat);
+                    else
+                      current += integrate(last->function, last->beat, node->beat);
 
                     if (node->isConstant())
-                        current += (node->function.value() / 60.0) * (v - node->beat);
+                        current += (node->function.evaluate(b, t, 0, 0) / 60.0) * (v - node->beat);
                     else
                         current += integrate(node->function, node->beat, v);
                 }
@@ -1495,14 +1489,14 @@ struct Canvas2D {
                     // Current time is less than current node's time
                     // Find value up to v and return
                     if (last && last->isConstant())
-                        current += (last->function.value() / 60.0) * (v - last->beat);
+                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (v - last->beat);
                     else
                         current += integrate(last->function, last->beat, v);
                     return current;
                 } else {
                     // Keep going, current node's time is less than current time
                     if (last && last->isConstant())
-                        current += (last->function.value() / 60.0) * (node->beat - last->beat);
+                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (node->beat - last->beat);
                     else
                         current += integrate(last->function, last->beat, v);
                 }
@@ -1767,8 +1761,8 @@ struct Canvas2D {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         Vec2 w = screenToWorld(topLeft, hover);
-        printf("timeEvents:");
-        timeEvents.inorder();
+        //printf("timeEvents:");
+        //timeEvents.inorder();
         float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
 
@@ -1780,6 +1774,9 @@ struct Canvas2D {
 
         Event* currentBeatEv = beatEvents.get_first();
 
+        if (currentBeatEv && currentBeatEv->type != EV_NOTE_START)
+          currentBeatEv = next_type(currentBeatEv, EV_NOTE_START);
+
         Vec2 unsnappedHoverW = screenToWorld(topLeft, hover);
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
@@ -1788,11 +1785,11 @@ struct Canvas2D {
         std::vector<Event*> noteStarts;
         Event* prevEv;
         while (currentBeatEv) {
-            printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
+            //printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
             if (currentBeatEv->type == EV_NOTE_START || currentBeatEv->type == EV_NOTE_END) {
-                printf("id: %d", currentBeatEv->id);
+                //printf("id: %d", currentBeatEv->id);
             }
-            printf("\n");
+            //printf("\n");
             if (currentBeatEv->type == EV_NOTE_START) {
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
                   float root = drawFundamental(renderer, topLeft, bottomRight, prevEv->time, currentBeatEv->time, noteStarts);
@@ -1819,20 +1816,30 @@ struct Canvas2D {
                         break;
                     }
                 }
-                printf("noteEv: %d, ", noteEv != nullptr);
+                //printf("noteEv: %d, ", noteEv != nullptr);
                 if (noteEv)
-                printf("isConstant: %d\n", noteEv->isConstant());
+                //printf("isConstant: %d\n", noteEv->isConstant());
                 if (noteEv && noteEv->isConstant()) {
-                    printf("yes display\n");
-                    // printf("value: %f, times: %f, %f!\n", noteEv->function.value(), noteEv->time, currentBeatEv->time);
-                    Vec2 a = worldToScreen(topLeft, { noteEv->time, noteEv->function.value() });
-                    Vec2 b = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.value() });
+                    //printf("yes display\n");
+                    // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
+                    Vec2 ap = worldToScreen(topLeft, { noteEv->time, noteEv->function.evaluate(b, t, 0, 0) });
+                    //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
+                    Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
-                    addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y - 1, b.x - a.x, 2, 0.47, 0.47, 1.0);
+                    addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
                 }
             }
             prevEv = currentBeatEv;
             currentBeatEv = next(currentBeatEv);
+        }
+
+        currentBeatEv = beatEvents.get_first();
+        if (currentBeatEv && currentBeatEv->type != EV_FOCUS)
+          currentBeatEv = next_type(currentBeatEv, EV_FOCUS);
+
+        while (currentBeatEv) {
+          //printf("FOCUS EVENT: %f, %f, %s, %f\n", currentBeatEv->beat, currentBeatEv->time, currentBeatEv->string_expr.c_str(), currentBeatEv->function.evaluate(b, t, 0, 0));
+          currentBeatEv = next_type(currentBeatEv, EV_FOCUS);
         }
 
         currentBeatEv = beatEvents.get_first();
@@ -1843,15 +1850,14 @@ struct Canvas2D {
         // Draw foci and related harmonics, snap to focus
         while (currentBeatEv) {
           // for each focus event
-          if (prevEv && prevEv->isConstant() && std::abs(prevEv->function.value()) > 1e-6) {
+          if (prevEv && prevEv->isConstant() && std::abs(prevEv->function.evaluate(b, t, 0, 0)) > 1e-6) {
             // foci at 0 represent a break -> no drawing or snapping
 
-
             // Draw focus line from previous to current focus draw_events
-            Vec2 a = worldToScreen(topLeft, { prevEv->time, prevEv->function.value() });
-            Vec2 b = worldToScreen(topLeft, { currentBeatEv->time, prevEv->function.value() });
-            printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
-            addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y - 1, b.x - a.x, 2, 1.0, 0.63, 0.353);
+            Vec2 ap = worldToScreen(topLeft, { prevEv->time, prevEv->function.evaluate(b, t, 0, 0) });
+            Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, prevEv->function.evaluate(b, t, 0, 0) });
+            printf("a: {%f, %f}, b: {%f, %f}\n", ap.x, ap.y, bp.x, bp.y);
+            addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 1.0, 0.63, 0.353);
 
             if (snap_harmonics && snap_foci) {
               // Draw harmonics of focus and snap if hovered within
@@ -1859,7 +1865,7 @@ struct Canvas2D {
               Vec2 bottom = screenToWorld(topLeft, bottomRight);
               Vec2 top = screenToWorld(topLeft, topLeft);
 
-              float current = prevEv->function.value();
+              float current = prevEv->function.evaluate(b, t, 0, 0);
               while (current > bottom.y)
                 current = current - 1;
 
@@ -1871,10 +1877,10 @@ struct Canvas2D {
                   float currentAdded = current + std::log2(perfectIntervals[i]);
                   if (currentAdded > top.y || currentAdded < bottom.y)
                     continue;
-                  if (std::abs(currentAdded - prevEv->function.value()) > 1e-6) {
-                    Vec2 a = worldToScreen(topLeft, { prevEv->time, currentAdded});
-                    Vec2 b = worldToScreen(topLeft, { currentBeatEv->time, currentAdded});
-                    addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y, b.x - a.x, 1, 0.7, 0.7, 0.7);
+                  if (std::abs(currentAdded - prevEv->function.evaluate(b, t, 0, 0)) > 1e-6) {
+                    Vec2 ap = worldToScreen(topLeft, { prevEv->time, currentAdded});
+                    Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, currentAdded});
+                    addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, 0.7, 0.7, 0.7);
                   }
                   if (hoveredWithin && \
                       std::abs(unsnappedHoverW.y - currentAdded) < std::abs(unsnappedHoverW.y - closest)) {
@@ -1950,12 +1956,12 @@ struct Canvas2D {
             b = currentBeat;
             Event* closest;
             for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
-                if (std::abs(currentEvsAtCursor[i]->function.value() - hoverW.y) < dist) {
-                    dist = std::abs(currentEvsAtCursor[i]->function.value() - hoverW.y);
+                if (std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y) < dist) {
+                    dist = std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y);
                     closest = currentEvsAtCursor[i];
                 }
             }
-            exprtk::expression<double>* closestFunction = &(closest->function);
+            ArithTree closestFunction = closest->function;
             char closestString[20];
             strcpy(closestString, closest->string_expr.c_str());
             printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
@@ -2006,7 +2012,7 @@ struct Canvas2D {
                   // We can do this because a focus' string_expr is always
                   // copied from the note that was right clicked on
                   if (current->string_expr == closest->string_expr) {
-                    if (previous && previous->function.value() != 0.0f) {
+                    if (previous && previous->function.evaluate(b, t, 0, 0) != 0.0f) {
                       current->update_function("0");
                     } else {
                       beatEvents.remove(current->beat, current->id);
@@ -2025,14 +2031,14 @@ struct Canvas2D {
                   if (std::abs(hoverW.x - closest->time) < std::abs(hoverW.x - noteEnd->time)) {
                     anchorW.x = noteEnd->time;
                     b = noteEnd->beat;
-                    anchorW.y = closestFunction->value();
+                    anchorW.y = closestFunction.evaluate(b, t, 0, 0);
                     strcpy(anchorExpr, closestString);
                     anchorBeat = noteEnd->beat;
                     anchorBeatExact= noteEnd->beat;
                   } else {
                     anchorW.x = closest->time;
                     b = closest->beat;
-                    anchorW.y = closestFunction->value();
+                    anchorW.y = closestFunction.evaluate(b, t, 0, 0);
                     strcpy(anchorExpr, closestString);
                     anchorBeat = closest->beat;
                     anchorBeatExact= closest->beat;
@@ -2062,8 +2068,8 @@ struct Canvas2D {
             b = currentBeat;
             Event* closest;
             for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
-                if (std::abs(currentEvsAtCursor[i]->function.value() - hoverW.y) < dist) {
-                    dist = std::abs(currentEvsAtCursor[i]->function.value() - hoverW.y);
+                if (std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y) < dist) {
+                    dist = std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y);
                     closest = currentEvsAtCursor[i];
                 }
             }
@@ -2075,15 +2081,14 @@ struct Canvas2D {
             printf("closestOff->beat: %f\n", closestOff->beat);
 
             int insert = 0;
-            int fociLength = 0;
+            int fociLength = 0; // This is i
             bool focus_after = true;
             bool focus_before = true;
             std::vector<Event> newFoci;
             Event* insertEv = nullptr;
-            Event* currentFocus = beatEvents.root;
-            while (currentFocus && currentFocus->left)
-                currentFocus = currentFocus->left;
-            currentFocus = next_type(currentFocus, EV_FOCUS);
+            Event* currentFocus = beatEvents.get_first();
+            if (currentFocus && currentFocus->type != EV_FOCUS)
+              currentFocus = next_type(currentFocus, EV_FOCUS);
             Event* prev = nullptr;
             Event* prevPrev = nullptr;
             while (currentFocus) {
@@ -2091,9 +2096,9 @@ struct Canvas2D {
                     // This index is the next focus change after the click point
                     insert = fociLength;
                     insertEv = currentFocus;
-                    if (currentFocus->isConstant() && currentFocus->function.value() == 0.0f)
+                    if (currentFocus->isConstant() && currentFocus->function.evaluate(b, t, 0, 0) == 0.0f)
                         focus_after = false;
-                    if (fociLength <= 1 || (prevPrev && prevPrev->isConstant() && prevPrev->function.value() == 0.0f))
+                    if (fociLength <= 1 || (prevPrev && prevPrev->isConstant() && prevPrev->function.evaluate(b, t, 0, 0) == 0.0f))
                         focus_before = false;
                 } else if (!next_type(currentFocus, EV_FOCUS) && !insertEv) {
                     insert = fociLength + 1;
@@ -2118,11 +2123,11 @@ struct Canvas2D {
             Event* end = new Event(0.0f, "0", EV_FOCUS);
 
             if (prevPrev && prevPrev->isConstant())
-                printf("prevPrev: %f, %f\n", prevPrev->beat, prevPrev->function.value());
+                printf("prevPrev: %f, %f\n", prevPrev->beat, prevPrev->function.evaluate(b, t, 0, 0));
             if (prev && prev->isConstant())
-                printf("prev: %f, %f\n", prev->beat, prev->function.value());
+                printf("prev: %f, %f\n", prev->beat, prev->function.evaluate(b, t, 0, 0));
             if (insertEv && insertEv->isConstant())
-                printf("current: %f, %f\n", insertEv->beat, insertEv->function.value());
+                printf("current: %f, %f\n", insertEv->beat, insertEv->function.evaluate(b, t, 0, 0));
 
             bool no_prev_or_closest_starts_after_prev = !prev || closest->beat > prev->beat;
             bool no_foci_or_after_foci_or_closest_ends_before_next = fociLength == 0 || insert == fociLength || (insertEv && closestOff->beat < insertEv->beat);
@@ -2192,7 +2197,7 @@ struct Canvas2D {
                 }
             }
 
-            bool focus_exists = insert > 0 && (!prev || (start->beat == prev->beat && start->function == prev->function)) && end->beat == currentFocus->beat && end->function == currentFocus->function;
+            bool focus_exists = insert > 0 && (!prev || (start->beat == prev->beat && start->string_expr == prev->string_expr)) && end->beat == currentFocus->beat && end->string_expr == currentFocus->string_expr;
             // printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave));
             if (!focus_exists) {
                 if (removePrevious)
@@ -2201,6 +2206,7 @@ struct Canvas2D {
                     beatEvents.remove(insertEv->beat, 0);
 
                 if (no_prev_or_closest_starts_after_prev && no_foci_or_after_foci_or_closest_ends_before_next) {
+                    printf("foci start: %s, end: %s\n", start->string_expr.c_str(), end->string_expr.c_str());
                     beatEvents.insert(start);
                     start->time = calc_time(&timeEvents, start->beat);
                     beatEvents.insert(end);
@@ -2321,7 +2327,7 @@ struct Canvas2D {
                     beatEvents.insert(e2);
                     e1->time = calc_time(&timeEvents, e1->beat);
                     e2->time = calc_time(&timeEvents, e2->beat);
-                    printf("e1->function: %f\n", e1->function.value());
+                    printf("e1->function: %f\n", e1->function.evaluate(b, t, 0, 0));
                     printf("e1 time: %f, e2 time: %f\n", e1->time, e2->time);
                     beatEvents.inorder();
                     beatEvents.ordered = false;
@@ -2350,9 +2356,6 @@ bool load_song(const std::string& path,
     canvas->timeEvents.remove_all();
     canvas->beatEvents.remove_all();
 
-    printf("empty timeEvents:");
-    canvas->timeEvents.inorder();
-
     uint32_t eventCount;
     float v;
     char expr[40];
@@ -2378,6 +2381,7 @@ bool load_song(const std::string& path,
     }
 
     canvas->timeEvents.reparent_tree();
+    canvas->timeEvents.setFinalEv();
     printf("read timeEvents:");
     canvas->timeEvents.inorder();
 
@@ -2474,9 +2478,9 @@ int main(int, char**)
 
     VulkanRenderer renderer = VulkanRenderer(window);
 
-    table.add_variable("b", b);
-    table.add_variable("t", t);
-    table.add_constants();
+    //table.add_variable("b", b);
+    //table.add_variable("t", t);
+    //table.add_constants();
 
     // Audio
     AudioEngine engine;

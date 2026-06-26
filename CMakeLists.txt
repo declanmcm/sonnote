@@ -63,6 +63,7 @@ add_executable(app
   src/audio_engine.cpp
   src/vulkan_renderer.cpp
   src/text_renderer.cpp
+  src/parser.cpp
 )
 
 target_include_directories(app PRIVATE
@@ -72,7 +73,7 @@ target_include_directories(app PRIVATE
 #  extern/msdfgen/ext
 #  extern/msdfgen
 #  extern/imgui
-  extern/miniaudio
+#  extern/miniaudio
   ${SDL2_INCLUDE_DIRS}
   ${FREETYPE_INCLUDE_DIRS}
 )

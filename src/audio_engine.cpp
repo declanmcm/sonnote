@@ -429,7 +429,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                     if (voiceIndex == MAX_VOICES)
                         voiceIndex = 0; // steal voice 0
 
-                    voiceFreqs[voiceIndex]  = &(currentEv->function);
+                    voiceFreqs[voiceIndex]  = &currentEv->function;
                     voicePhases[voiceIndex] = 0.0f;
                     voiceIDs[voiceIndex] = currentEv->id;
                     for (int i = 0; i < 3; i++) {
@@ -508,8 +508,8 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             }
 
             // Phase & sample
-            const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->value() - 4.0f);
-            printf("voice %d freq: %f\n", v, freq); 
+            const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->evaluate(b, t, 0, 0) - 4.0f);
+            printf("voice %d freq: %f\n", v, freq);
             float phase = voicePhases[v];
 
             phase += freq / sr;
@@ -662,13 +662,13 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
                 // NOTE ON: find free voice
                 size_t v = MAX_VOICES;
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
-                    if (state[k][0] == 0 && state[k][1] == 0 && state[k][2] == 0) { 
-                        v = k; break; 
+                    if (state[k][0] == 0 && state[k][1] == 0 && state[k][2] == 0) {
+                      v = k; break;
                     }
                 }
                 if (v == MAX_VOICES) v = 0; // steal voice 0
 
-                freq[v]  = currentEv->function.value();
+                freq[v]  = currentEv->function.evaluate(b, t, 0, 0);
                 phase[v] = 0.0f;
                 for (int i = 0; i < 3; i++) {
                     env[v][i] = 0.0f;
@@ -679,7 +679,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
                 // NOTE OFF: release matching voice
                 for (size_t k = 0; k < MAX_VOICES; ++k) {
                     if ((state[k][0] != 0 || state[k][1] != 0 || state[k][2] != 0) &&
-                        fabsf(freq[k] - currentEv->function.value()) < 1e-4f)
+                        fabsf(freq[k] - currentEv->function.evaluate(b, t, 0, 0)) < 1e-4f)
                     {
                         state[k][0] = 3;
                         state[k][1] = 3;
@@ -690,7 +690,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
             }
 
             // advance to next event
-            currentEv = next_note(currentEv); 
+            currentEv = next_note(currentEv);
         }
 
         // --- Polyphonic synthesis ---

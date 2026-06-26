@@ -47,7 +47,7 @@ struct SeqEvent {
 };
 
 //extern exprtk::symbol_table<double> table;
-extern exprtk::parser<double> parser;
+//extern exprtk::parser<double> parser;
 extern double b;
 extern double t;
 
@@ -62,7 +62,8 @@ struct Event {
     float beat;
     float time;
     std::string string_expr;
-    exprtk::expression<double> function;
+    ArithTree function;
+    //exprtk::expression<double> functionOld;
     int height;
     Event* left;
     Event* right;
@@ -78,7 +79,7 @@ struct Event {
     int type;
     uint32_t id;
 
-    Event(float b, int t) : beat(b), type(t) {
+    Event(float b, int t) : beat(b), type(t), function() {
         left = NULL;
         right = NULL;
         parent = NULL;
@@ -88,11 +89,14 @@ struct Event {
         profile = 0;
     }
 
-    Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t) {
-        function.register_symbol_table(table);
-        if (!parser.compile(expr_string, function)) {
-            throw std::runtime_error("Expression parse error: " + parser.error());
-        }
+    Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t), function(const_cast<char*>(expr_string.c_str())) {
+        //functionOld.register_symbol_table(table);
+        //if (!parser.compile(expr_string, functionOld)) {
+        //    throw std::runtime_error("Expression parse error: " + parser.error());
+        //}
+        //printf("functionOld value: %f\n", functionOld.value());
+        //function = ArithTree(const_cast<char*>(expr_string.c_str()));
+        printf("function value: %f\n", function.evaluate(0 ,0 ,0 ,0));
         string_expr = expr_string;
         left = NULL;
         right = NULL;
@@ -104,10 +108,11 @@ struct Event {
     }
 
     void update_function(const std::string& expr_string) {
-        function.register_symbol_table(table);
-        if (!parser.compile(expr_string, function)) {
-            throw std::runtime_error("Expression parse error: " + parser.error());
-        }
+        //functionOld.register_symbol_table(table);
+        //if (!parser.compile(expr_string, functionOld)) {
+        //    throw std::runtime_error("Expression parse error: " + parser.error());
+        //}
+        function = ArithTree(const_cast<char*>(expr_string.c_str()));
         string_expr = expr_string;
     }
 
@@ -126,8 +131,8 @@ struct Event {
 void do_order(Event* current, Event*& previous);
 Event* next_type(Event* ev, int type);
 Event* next_note(Event* ev);
-float integrate(const exprtk::expression<double>& function, float t1, float t2);
-float integrate_until(const exprtk::expression<double>& function, float t1, float y);
+float integrate(ArithTree* function, float t1, float t2);
+float integrate_until(ArithTree* function, float t1, float y);
 
 class EventTree {
 public:
@@ -146,8 +151,11 @@ public:
     }
 
     void remove_all() {
-      while (root)
-        remove(root, root->beat, root->id);
+      if (root) {
+        root = remove(root, root->beat, root->id);
+        remove_all();
+      } else
+        return;
     }
 
     void inorder() const {
@@ -172,6 +180,13 @@ public:
         reparent(root);
         root->parent = nullptr;
       }
+    }
+
+    void setFinalEv() {
+      Event* current = get_first();
+      while (current && current->right)
+        current = current->right;
+      current->finalEv = true;
     }
 
     Event* get_first() {
@@ -558,7 +573,7 @@ private:
     // Polyphonic voice state
     // ============================
     static constexpr size_t MAX_VOICES = 64;
-    std::array<exprtk::expression<double>*, MAX_VOICES> voiceFreqs{};
+    std::array<ArithTree*, MAX_VOICES> voiceFreqs{};
     std::array<float, MAX_VOICES> voicePhases{};
     std::array<uint32_t, MAX_VOICES> voiceIDs{};
     // std::array<float, MAX_VOICES> voiceEnvs{};
