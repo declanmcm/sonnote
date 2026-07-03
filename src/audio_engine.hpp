@@ -69,7 +69,8 @@ struct Event {
     Event* right;
     Event* next_ev;
     Event* parent;
-    Event* beatParent;
+    float beatL;
+    float beatR;
     uint8_t beatDivs;
     float origin;
     bool selected;

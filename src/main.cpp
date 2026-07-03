@@ -64,6 +64,42 @@ int gcd(int a, int b) {
     return b == 0 ? std::abs(a) : gcd(b, a % b);
 }
 
+
+
+bool isPrime(int n) {
+  if (n != 2 && n % 2 == 0) {
+    return false;
+  } else if (n != 3 && n % 3 == 0) {
+    return false;
+  } else {
+    int i = n / 2;
+    while (i > 1) {
+      if (n % i == 0)
+        return false;
+      i--;
+    }
+  }
+  return true;
+}
+
+std::vector<int> getPrimeFactors(int n) {
+  int current = n;
+  int i = 2;
+  std::vector<int> res;
+  while (current != 1) {
+    if (isPrime(i)) {
+      int count = 0;
+      while (current % i == 0) {
+        current = current / i;
+        count++;
+      }
+      res.push_back(count);
+    }
+    i++;
+  }
+  return res;
+}
+
 // Convert float to simplified fraction
 void floatToFraction(float value, int& num, int& den, int maxDen = 10000) {
     // Handle sign
@@ -144,6 +180,27 @@ Event* next(Event* ev) {
   return current;
 }
 
+Event* prev(Event* ev) {
+  Event* current = NULL;
+  if (ev->left != NULL) {
+    current = ev->left;
+    while (current && current->right)
+      current = current->right;
+  } else if (ev->parent && ev->parent->right == ev) {
+    current = ev->parent;
+  } else if (ev->parent && ev->parent->left == ev) {
+    current = ev->parent;
+    while (current->parent && current->parent->left == current) {
+      current = current->parent;
+    }
+    if (!current->parent)
+      current = nullptr;
+    else
+      current = current->parent;
+  }
+  return current;
+}
+
 Event* next_note(Event* ev) {
   if (ev)
     ev = next(ev);
@@ -171,6 +228,33 @@ float integrate_until(ArithTree function, float t1, float y) {
     return 0.0f;
 }
 
+float calc_beat(EventTree* times, float noteTime) {
+  printf("\nCALC BEAT\n");
+  printf("noteTime: %f\n", noteTime);
+  Event* currentTempoEv = times->get_first();
+  if (currentTempoEv->type != EV_TEMPO)
+    currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
+  float beats = 0.0f;
+  while (currentTempoEv) {
+    float currentTempoEvBeats = beats;
+    if (next_type(currentTempoEv, EV_TEMPO) && next_type(currentTempoEv, EV_TEMPO)->time < noteTime) {
+        if (currentTempoEv->isConstant()) {
+          beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
+        } else {
+          beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
+        }
+    } else {
+      if (currentTempoEv->isConstant()) {
+        float thing = beats + (noteTime - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
+        printf("result: %f\n", thing);
+        return thing;
+      } else {
+        return beats + integrate(currentTempoEv->function, currentTempoEv->time, noteTime);
+      }
+    }
+  }
+  return beats;
+}
 
 float calc_time(EventTree* times, float noteBeat) {
     Event* currentTempoEv = times->get_first();
@@ -179,19 +263,19 @@ float calc_time(EventTree* times, float noteBeat) {
     float beats = 0.0f;
     while (currentTempoEv) {
         printf("tempoEv: %p\n", currentTempoEv);
-        float currentTempoEvBeats = beats;
+        float currentTempoEvBeats = beats; // We can do this because there will always be a first tempoEv at zero
         if (next_type(currentTempoEv, EV_TEMPO)) {
             if (currentTempoEv->isConstant()) {
-                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.evaluate(b, t, 0, 0);
+                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
             } else {
                 beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
             }
         }
         if (!next_type(currentTempoEv, EV_TEMPO) || beats > noteBeat) {
             if (currentTempoEv->isConstant()) {
-                return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.evaluate(b, t, 0, 0) / 60.0);
+                return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.evaluate(b, t, 0, 0) / 60.0) + currentTempoEv->time;
             } else {
-                return integrate_until(currentTempoEv->function, currentTempoEv->time, noteBeat - currentTempoEvBeats);
+                return integrate_until(currentTempoEv->function, currentTempoEv->time, noteBeat - currentTempoEvBeats) + currentTempoEv->time;
             }
         }
         currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
@@ -237,7 +321,7 @@ struct FocusChange {
 
 struct MidiEvent {
     double tick;
-    std::vector<uint8_t> data; 
+    std::vector<uint8_t> data;
 };
 
 struct TreeNode {
@@ -1348,16 +1432,16 @@ struct Canvas2D {
     }
 
     float calculateRoot(std::vector<float> octaves) {
-        // Algorithm: take frequencies a, b, c etc. divide a by b, find simplest fraction with 
-        // Integers, divide a by the numerator (or b by the denominator), then repeat the process 
+        // Algorithm: take frequencies a, b, c etc. divide a by b, find simplest fraction with
+        // Integers, divide a by the numerator (or b by the denominator), then repeat the process
         // with that new number n, c, etc. until you only have one number.
         float root = octave_to_freq(octaves[0]);
         for (int i = 1; i < (int)octaves.size(); i++) {
-          float div = root / octave_to_freq(octaves[i]); 
+          float div = root / octave_to_freq(octaves[i]);
           int num, den;
           floatToFraction(div, num, den);
           root = root / num;
-        } 
+        }
         return root;
     }
 
@@ -1534,116 +1618,75 @@ struct Canvas2D {
         return closest;
     }
 
-    void drawRhythmLine(Vec2 s0, VulkanRenderer& renderer, std::vector<int>& divisions, Vec2 topLeft, Vec2 bottomRight) {
-        addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 10, 1, 20, 0.47, 0.47, 0.63);
-        if ((int)divisions.size() > 1) {
-            switch (divisions.back()) {
-                case 8:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 16, 6, 32, 0.47, 0.47, 0.63);
-                case 4:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 13, 6, 1, 0.47, 0.47, 0.63);
-                case 2:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 10, 6, 1, 0.47, 0.47, 0.63);
-                    break;
-                case 3:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 11, 6, 2, 0.47, 0.47, 0.63);
-                    break;
-                case 5:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    break;
-                case 7:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 12, 3, 2, 0.47, 0.47, 0.63);
-                    break;
-                case 6:
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
-                    addCanvasRect(renderer, topLeft, bottomRight, s0.x - 3, s0.y - 8, 6, 4, 0.47, 0.47, 0.63);
-                    break;
+    void drawRhythmLine(float beat, Vec2 s0, Vec2 range, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+        addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 15, 1, 30, 0.47, 0.47, 0.63);
+        float dec = beat - std::floor(beat);
+        int num, den;
+        printf("decimal: %f\n", dec);
+        floatToFraction(dec, num, den);
+        printf("denominator: %d\n", den);
+        std::vector<int> primeFactors = getPrimeFactors(den);
+        int skipCount = 0;
+        int offset = 15;
+        printf("s0.x: %f, beat: %f\n", s0.x, beat);
+        for (int i = 0; i < primeFactors.size(); i++) {
+          if (primeFactors[i] == 0) {
+            skipCount++;
+          } else {
+            printf("i: %d\n", i);
+            // Draw the skip marker then the tails
+            if (skipCount > 0) {
+              printf("skip: %d\n", skipCount);
+              addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y + offset, 3, 1, 0.47, 0.47, 0.63);
+              if (skipCount > 1) {
+                std::string st = std::to_string(skipCount);
+                char const *s = st.c_str();
+                printf("YYYYYYYwrite text!\n");
+                renderer.addText(s, s0.x + 3, s0.y + offset, 10.0f, glm::vec4(0.47, 0.47, 0.63, 1.0f));
+              }
+              offset -= 5;
+              skipCount = 0;
             }
+            int offsetX = 3;
+            addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y + offset, 3, 1, 0.47, 0.47, 0.63);
+            for (int j = 0; j < primeFactors[i]; j++) {
+              addCanvasRect(renderer, topLeft, bottomRight, s0.x + offsetX, s0.y + offset, 1, 4, 0.47, 0.47, 0.63);
+              if (j != primeFactors[i] - 1)
+                addCanvasRect(renderer, topLeft, bottomRight, s0.x + offsetX, s0.y + offset, 2, 1, 0.47, 0.47, 0.63);
+              offsetX += 2;
+            }
+            offset -= 5;
+          }
         }
     }
 
-    // divisions holds the list of recursive split sizes
-    void drawRhythmLines(TreeNode* current, const std::vector<Note>& sortedStart, const std::vector<Note>& sortedEnd, \
-        float start, float end, std::vector<int> divisions, std::vector<float>& currently_held, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
-        // printf("start\n");
-        float beat_size = std::abs(end - start) / divisions.back();
-        int latest_starti = 0;
-        int latest_endi = 0;
-        // printf("start: %f, end: %f, beat_size %f, divisions: %d\n", start, end, beat_size, divisions.back());
-        // Currently dealing with the last-appended number to divisions - the current number to split into
-        for (int i = 0; i < divisions.back() + 1; i++) {
-            float current_beat = start + i * beat_size;
-            int starti = latest_starti;
-            int endi = latest_endi;
-            // Only draw a line if there is a note playing, keep track of playing notes to perform averages
-            // Only draw lines in the middles if these are subdivisions
-            if ((int)sortedStart.size() > 0 && ((int)divisions.size() == 1 || (i != 0 && i != divisions.back()))) {
-                // printf("endi: %d, sEndsize:%d, sEndBeat_OFF: %f\n", endi, (int)sortedEnd.size(), sortedEnd[endi].beat_off);
-                if (starti >= (int)sortedStart.size()) {
-                    printf("ISSUE: starti: %d, latest_starti: %d\n", starti, latest_starti);
-                }
-                // Setup start and end indexes to line up with the next note event we'll encounter (purely an optimisation)
-                while (starti < (int)sortedStart.size() && sortedStart[starti].beat_on < current_beat)
-                    starti++;
-                while (endi < (int)sortedEnd.size() && sortedEnd[endi].beat_off < current_beat)
-                    endi++;
-                // If this is true, a note is starting or ending on current_beat, we must keep track of this for the average
-                if ((starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) || (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6)) {
-                    while (starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) {
-                        currently_held.push_back(sortedStart[starti].octave);
-                        Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedStart[starti].octave });
-                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
-                        latest_starti = starti;
-                        starti++;
-                    }
-                    while (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6) {
-                        std::vector<float> newList;
-                        for (int j = 0; j < (int)currently_held.size(); j++) {
-                            // printf("diff: %f\n", std::abs(currently_held[j] - sortedEnd[endi].octave));
-                            if (std::abs(currently_held[j] - sortedEnd[endi].octave) > 0.0001) {
-                                // printf("j: %d\n", j);
-                                newList.push_back(currently_held[j]);
-                            }
-                        }
-                        // printf("removing: %f\n", sortedEnd[endi].octave);
-                        currently_held = newList;
-                        // std::remove(currently_held.begin(), currently_held.end(), sortedEnd[endi].octave);
-                        Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedEnd[endi].octave });
-                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
-                        latest_endi = endi;
-                        endi++;
-                    }
-                } else if ((int)currently_held.size() != 0) {
-                    // If there are notes held but no note events occur on current_beat, take an average and place the marker between them
-                    float avg = 0.0f;
-                    for (int i = 0; i < (int)currently_held.size(); i++) {
-                        avg += currently_held[i];
-                    }
-                    avg = avg / (int)currently_held.size();
-                    Vec2 s0 = worldToScreen(topLeft, { current_beat,  avg});
-                    drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
-
-                }
-                // printf("CH:%d\n", (int)currently_held.size());
-            }
-            // Check if we have to go deeper on this beat
-            for (int j = 0; j < (int)current->children.size(); j++) {
-                TreeNode* child = current->children[j].get();
-                // printf("val: %d, i: %d\n", child->value, i);
-                if (child->value == ((int)divisions.size() == 1 ? i + start : i)) {
-                    // printf("match\n");
-                    for (const auto& childChild : child->children) {
-                        // printf("gotta go inside\n");
-                        divisions.push_back(childChild.get()->value);
-                        drawRhythmLines(childChild.get(), sortedStart, sortedEnd, start + i * beat_size, start + (i + 1) * beat_size, divisions, currently_held, renderer, topLeft, bottomRight);
-                        divisions.pop_back();
-                    }
-                }
-            }
+    void draw_rhythm_line(Event* beatEv, std::vector<Event*> currentlyHeld, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+      Event* current = beatEv;
+      std::vector<float> simultaneous;
+      float val;
+      while (current->beat == beatEv->beat) {
+        if (current->function.root && (current->type == EV_NOTE_START || current->type == EV_NOTE_END))
+          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+        current = prev(current);
+      }
+      current = beatEv;
+      while (current->beat == beatEv->beat) {
+        if (current->function.root && (current->type == EV_NOTE_START || current->type == EV_NOTE_END))
+          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+        current = next(current);
+      }
+      if (simultaneous.empty()) {
+        // Take the average of all the currentlyHeld and place it there
+        Vec2 ap = worldToScreen(topLeft, { beatEv->time, 0.0f });
+        ap.y = (topLeft.y + bottomRight.y) / 2.0f;
+        drawRhythmLine(beatEv->beat, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
+      } else {
+        // Draw it on each of the simultaneous Notes
+        for (int i = 0; i < simultaneous.size(); i++) {
+          Vec2 ap = worldToScreen(topLeft, { beatEv->beat, simultaneous[i]});
+          drawRhythmLine(beatEv->beat, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
         }
-        // printf("end\n");
+      }
     }
 
     Vec2 prevHover = {0.0f, 0.0f};
@@ -1746,11 +1789,11 @@ struct Canvas2D {
         }
 
         // Vertical: beats at integer positions within [wA.x, wB.x]
-        int beatStart = std::max(std::floor(wA.x), (int)sorted.size() > 0 ? std::floor(sorted[0].beat_on) : -99999.0f);
-        int beatEnd   = std::min(std::ceil (wB.x), std::ceil(end));
-        std::vector<int> divisions;
-        divisions.push_back(std::abs(beatEnd - beatStart));
-        drawRhythmLines(splits.get(), sorted, sortedEnd, beatStart, beatEnd, divisions, currently_held, renderer, topLeft, bottomRight);
+        //int beatStart = std::max(std::floor(wA.x), (int)sorted.size() > 0 ? std::floor(sorted[0].beat_on) : -99999.0f);
+        //int beatEnd   = std::min(std::ceil (wB.x), std::ceil(end));
+        //std::vector<int> divisions;
+        //divisions.push_back(std::abs(beatEnd - beatStart));
+        //drawRhythmLines(splits.get(), sorted, sortedEnd, beatStart, beatEnd, divisions, currently_held, renderer, topLeft, bottomRight);
 
         // Horizontal: octaves at integer positions
         int octStart = (int)std::floor(wB.y);
@@ -1774,8 +1817,8 @@ struct Canvas2D {
 
         Event* currentBeatEv = beatEvents.get_first();
 
-        if (currentBeatEv && currentBeatEv->type != EV_NOTE_START)
-          currentBeatEv = next_type(currentBeatEv, EV_NOTE_START);
+        while (currentBeatEv && (currentBeatEv->type != EV_NOTE_START && currentBeatEv->type != EV_BEAT))
+          currentBeatEv = next(currentBeatEv);
 
         Vec2 unsnappedHoverW = screenToWorld(topLeft, hover);
         hoverW = unsnappedHoverW;
@@ -1783,14 +1826,16 @@ struct Canvas2D {
 
         currentEvsAtCursor.clear();
         std::vector<Event*> noteStarts;
-        Event* prevEv;
+        Event* prevEv = nullptr;
+        int beatRLi = 0;
         while (currentBeatEv) {
-            //printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
+            printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
             if (currentBeatEv->type == EV_NOTE_START || currentBeatEv->type == EV_NOTE_END) {
                 //printf("id: %d", currentBeatEv->id);
             }
             //printf("\n");
             if (currentBeatEv->type == EV_NOTE_START) {
+              printf("yo!\n");
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
                   float root = drawFundamental(renderer, topLeft, bottomRight, prevEv->time, currentBeatEv->time, noteStarts);
                   // Snap to harmonics
@@ -1818,16 +1863,39 @@ struct Canvas2D {
                 }
                 //printf("noteEv: %d, ", noteEv != nullptr);
                 if (noteEv)
-                //printf("isConstant: %d\n", noteEv->isConstant());
+                printf("isConstant: %d\n", noteEv->isConstant());
                 if (noteEv && noteEv->isConstant()) {
-                    //printf("yes display\n");
+                    printf("yes display\n");
                     // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
                     Vec2 ap = worldToScreen(topLeft, { noteEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
                     addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
+                    if (std::floor(noteEv->time) - noteEv->time < 1e-6) {
+                      // Draw rhythm line at note start
+                      addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
+                    }
+                    if (std::floor(currentBeatEv->time) - currentBeatEv->time < 1e-6) {
+                      // Draw rhythm line at note end
+                      addCanvasRect(renderer, topLeft, bottomRight, bp.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
+                    }
                 }
+            } else if (currentBeatEv->type == EV_BEAT) {
+              draw_rhythm_line(currentBeatEv, noteStarts, renderer, topLeft, bottomRight);
+            }
+            if (prevEv) {
+              // Catch up with regular beat lines
+              for (int i = std::floor(prevEv->beat); i < std::ceil(currentBeatEv->beat) + 1; i++) {
+                if (i <= beatRLi)
+                  continue;
+                // Draw line in the middle of the screen
+                Vec2 ap = worldToScreen(topLeft, {calc_time(&timeEvents, i), 0.0f});
+                addCanvasRect(renderer, topLeft, bottomRight, ap.x, std::floor((topLeft.y + bottomRight.y) / 2) - 15, 1, 30, 0.47, 0.47, 0.63);
+              }
+              beatRLi = std::ceil(currentBeatEv->beat);
+              //if (avoidFirst == 0)
+              //  avoidFirst = 1;
             }
             prevEv = currentBeatEv;
             currentBeatEv = next(currentBeatEv);
@@ -1978,19 +2046,28 @@ struct Canvas2D {
 
             if (containsKey(keys, 's')) {
               if (std::abs(split_start + 1) < 1e-6)
-                split_start = currentBeat;
+                split_start = snappedBeat;
               else {
-                // Insert divisions between split_start and currentBeat
-                //Event* current = beatEvents.get_first();
-                //if (current->type != EV_BEAT)
-                //  current = next_type(current, EV_BEAT);
-                //while (current != nullptr && ) {
-                //  if (current->beat != split_start)
-                //    current = next_type(current, EV_BEAT);
-                //}
-                //Event* toInsert = new Event(std::atof(split_char), split_char, EV_BEAT);
-                //beatEvents.insert(toInsert);
-                //split_start = -1.0f;
+                // Insert divisions between split_start and snappedBeat
+                float inc = (snappedBeat - split_start) / std::atof(split);
+                float i = split_start + inc;
+                while (i < snappedBeat) {
+                  printf("insertBEAT_EV: %f\n", i);
+                  Event* toInsert = new Event(i, EV_BEAT);
+                  if (std::floor(snappedBeat) - snappedBeat < 1e-6 && std::floor(split_start) - split_start < 1e-6 && std::abs(snappedBeat - split_start) - 1.0f < 1e-6) {
+                    toInsert->beatDivs = 0;
+                    toInsert->beatL = 0;
+                    toInsert->beatR = 0;
+                  } else {
+                    toInsert->beatDivs = std::atoi(split);
+                    toInsert->beatL = split_start;
+                    toInsert->beatR = snappedBeat;
+                  }
+                  toInsert->time = calc_time(&timeEvents, toInsert->beat);
+                  beatEvents.insert(toInsert);
+                  i += inc;
+                }
+                split_start = -1.0f;
               }
             }
 

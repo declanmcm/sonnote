@@ -790,3 +790,87 @@ struct Canvas2D {
         ImGui::End();
     }
 };
+
+
+
+    // divisions holds the list of recursive split sizes
+    void drawRhythmLines(TreeNode* current, const std::vector<Note>& sortedStart, const std::vector<Note>& sortedEnd, \
+        float start, float end, std::vector<int> divisions, std::vector<float>& currently_held, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+        // printf("start\n");
+        float beat_size = std::abs(end - start) / divisions.back();
+        int latest_starti = 0;
+        int latest_endi = 0;
+        // printf("start: %f, end: %f, beat_size %f, divisions: %d\n", start, end, beat_size, divisions.back());
+        // Currently dealing with the last-appended number to divisions - the current number to split into
+        for (int i = 0; i < divisions.back() + 1; i++) {
+            float current_beat = start + i * beat_size;
+            int starti = latest_starti;
+            int endi = latest_endi;
+            // Only draw a line if there is a note playing, keep track of playing notes to perform averages
+            // Only draw lines in the middles if these are subdivisions
+            if ((int)sortedStart.size() > 0 && ((int)divisions.size() == 1 || (i != 0 && i != divisions.back()))) {
+                // printf("endi: %d, sEndsize:%d, sEndBeat_OFF: %f\n", endi, (int)sortedEnd.size(), sortedEnd[endi].beat_off);
+                if (starti >= (int)sortedStart.size()) {
+                    printf("ISSUE: starti: %d, latest_starti: %d\n", starti, latest_starti);
+                }
+                // Setup start and end indexes to line up with the next note event we'll encounter (purely an optimisation)
+                while (starti < (int)sortedStart.size() && sortedStart[starti].beat_on < current_beat)
+                    starti++;
+                while (endi < (int)sortedEnd.size() && sortedEnd[endi].beat_off < current_beat)
+                    endi++;
+                // If this is true, a note is starting or ending on current_beat, we must keep track of this for the average
+                if ((starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) || (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6)) {
+                    while (starti < (int)sortedStart.size() && std::abs(sortedStart[starti].beat_on - current_beat) < 1e-6) {
+                        currently_held.push_back(sortedStart[starti].octave);
+                        Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedStart[starti].octave });
+                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
+                        latest_starti = starti;
+                        starti++;
+                    }
+                    while (endi < (int)sortedEnd.size() && std::abs(sortedEnd[endi].beat_off - current_beat) < 1e-6) {
+                        std::vector<float> newList;
+                        for (int j = 0; j < (int)currently_held.size(); j++) {
+                            // printf("diff: %f\n", std::abs(currently_held[j] - sortedEnd[endi].octave));
+                            if (std::abs(currently_held[j] - sortedEnd[endi].octave) > 0.0001) {
+                                // printf("j: %d\n", j);
+                                newList.push_back(currently_held[j]);
+                            }
+                        }
+                        // printf("removing: %f\n", sortedEnd[endi].octave);
+                        currently_held = newList;
+                        // std::remove(currently_held.begin(), currently_held.end(), sortedEnd[endi].octave);
+                        Vec2 s0 = worldToScreen(topLeft, { current_beat, sortedEnd[endi].octave });
+                        drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
+                        latest_endi = endi;
+                        endi++;
+                    }
+                } else if ((int)currently_held.size() != 0) {
+                    // If there are notes held but no note events occur on current_beat, take an average and place the marker between them
+                    float avg = 0.0f;
+                    for (int i = 0; i < (int)currently_held.size(); i++) {
+                        avg += currently_held[i];
+                    }
+                    avg = avg / (int)currently_held.size();
+                    Vec2 s0 = worldToScreen(topLeft, { current_beat,  avg});
+                    drawRhythmLine(s0, renderer, divisions, topLeft, bottomRight);
+
+                }
+                // printf("CH:%d\n", (int)currently_held.size());
+            }
+            // Check if we have to go deeper on this beat
+            for (int j = 0; j < (int)current->children.size(); j++) {
+                TreeNode* child = current->children[j].get();
+                // printf("val: %d, i: %d\n", child->value, i);
+                if (child->value == ((int)divisions.size() == 1 ? i + start : i)) {
+                    // printf("match\n");
+                    for (const auto& childChild : child->children) {
+                        // printf("gotta go inside\n");
+                        divisions.push_back(childChild.get()->value);
+                        drawRhythmLines(childChild.get(), sortedStart, sortedEnd, start + i * beat_size, start + (i + 1) * beat_size, divisions, currently_held, renderer, topLeft, bottomRight);
+                        divisions.pop_back();
+                    }
+                }
+            }
+        }
+        // printf("end\n");
+    }

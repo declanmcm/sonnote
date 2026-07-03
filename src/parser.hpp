@@ -55,13 +55,14 @@ struct ArithTree {
   }
 
   float evaluate(float a, float b, float c, float d) {
-    return evaluate(root, a, b, c, d);
+    if (root)
+      return evaluate(root, a, b, c, d);
+    else
+      return 0;
   }
 
   float evaluate(ArithNode* node, float a, float b, float c, float d) {
     if (node->type == 'E') {
-      //printf("E");
-      std::fflush(stdout);
       Operand* current = node->operands;
       float result = evaluate(current->node, a, b, c, d);
       current = current->next;
@@ -74,7 +75,7 @@ struct ArithTree {
       }
       return result;
     } else if (node->type == 'T') {
-      //printf("T");
+      printf("T");
       std::fflush(stdout);
       Operand* current = node->operands;
       float result = evaluate(current->node, a, b, c, d);
@@ -89,7 +90,7 @@ struct ArithTree {
       }
       return result;
     } else if (node->type == 'F') {
-      //printf("F");
+      printf("F");
       std::fflush(stdout);
       if (node->operation == '~') {
         return evaluate(node->operands->node, a, b, c, d);
@@ -97,7 +98,7 @@ struct ArithTree {
         return -1 * evaluate(node->operands->node, a, b, c, d);
       }
     } else if (node->type == 'N') {
-      //printf("N");
+      printf("N");
       std::fflush(stdout);
       float pows[4];
       for (int i = 0; i < 4; i++) {
@@ -111,7 +112,7 @@ struct ArithTree {
         * std::pow(d, pows[3]);
       if (!node->noVal)
         value = value * node->val;
-      //printf("value at N: %f\n", value);
+      printf("value at N: %f\n", value);
       return value;
     }
     return 0;
