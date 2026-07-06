@@ -289,6 +289,8 @@ void VulkanRenderer::uploadSpectrogramR8(const uint8_t* data, int w, int h)
 }
 
 
+
+
 void VulkanRenderer::addText(const char* text, float x, float y, float scale, const glm::vec4& colour) {
     texts.emplace_back(text, x, y, scale, colour);
 }

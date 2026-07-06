@@ -1618,6 +1618,63 @@ struct Canvas2D {
         return closest;
     }
 
+    void drawNumber(int n, Vec2 p, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+      int current = n % 10;
+      // Draw current;
+      switch (current) {
+        case 0:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y - 1, 1, 3, 0.0, 0.0, 0.0);
+          break;
+        case 1:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 1, 5, 0.47, 0.47, 0.63);
+          break;
+        case 2:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y - 1, 2, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y + 1, 2, 1, 0.0, 0.0, 0.0);
+          break;
+        case 3:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y + 1, 2, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 1, 2, 1, 0.0, 0.0, 0.0);
+          break;
+        case 4:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y, 3, 3, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y + 1, 1, 2, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 2, p.y - 2, 1, 2, 0.47, 0.47, 0.63);
+          break;
+        case 5:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y + 1, 2, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 1, 2, 1, 0.0, 0.0, 0.0);
+          break;
+        case 6:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y + 1, 2, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y - 1, 1, 1, 0.0, 0.0, 0.0);
+          break;
+        case 7:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y + 2, 3, 1, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 2, p.y - 2, 1, 5, 0.47, 0.47, 0.63);
+          break;
+        case 8:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y + 1, 1, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y - 1, 1, 1, 0.0 ,0.0 ,0.0);
+          break;
+        case 9:
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 2, 3, 5, 0.47, 0.47, 0.63);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x + 1, p.y + 1, 1, 1, 0.0, 0.0, 0.0);
+          addCanvasRect(renderer, topLeft, bottomRight, p.x, p.y - 1, 2, 1, 0.0, 0.0, 0.0);
+          break;
+        default:
+          break;
+      }
+      if (n != current)
+        drawNumber((n - current) / 10, { p.x - 4, p.y }, renderer, topLeft, bottomRight);
+    }
+
     void drawRhythmLine(float beat, Vec2 s0, Vec2 range, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 15, 1, 30, 0.47, 0.47, 0.63);
         float dec = beat - std::floor(beat);
@@ -1642,9 +1699,10 @@ struct Canvas2D {
                 std::string st = std::to_string(skipCount);
                 char const *s = st.c_str();
                 printf("YYYYYYYwrite text!\n");
-                renderer.addText(s, s0.x + 3, s0.y + offset, 10.0f, glm::vec4(0.47, 0.47, 0.63, 1.0f));
+                drawNumber(skipCount, { s0.x + 4, s0.y + offset}, renderer, topLeft, bottomRight);
+                //renderer.addText(s, s0.x + 3, s0.y + offset, 10.0f, glm::vec4(0.47, 0.47, 0.63, 1.0f));
               }
-              offset -= 5;
+              offset -= 6;
               skipCount = 0;
             }
             int offsetX = 3;
