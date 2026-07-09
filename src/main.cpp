@@ -9,6 +9,7 @@
 #include <sstream>
 #include <fstream>
 #include <cmath>
+#include <numeric>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -215,6 +216,18 @@ Event* next_type(Event* ev, int type) {
   while (ev && ev->type != type)
     ev = next(ev);
   return ev;
+}
+
+Event* findBeatEv(Event* root, float v) {
+  Event* current = root;
+  if (current->type != EV_BEAT)
+    current = next_type(current, EV_BEAT);
+  while (current) {
+    if (std::abs(current->beat - v) < 1e-6)
+      return current;
+    current = next_type(current, EV_BEAT);
+  }
+  return nullptr;
 }
 
 float integrate(ArithTree function, float t1, float t2) {
@@ -1532,15 +1545,20 @@ struct Canvas2D {
     float snap_beat(const Event* node, float v, float closest) {
         if (!node) return 999999999.0f;
         float current = snap_beat(node->left, v, closest);
+        printf("Ev: %f\n", node->beat);
         if (node->type == EV_BEAT) {
+          printf("currentBeatEv: %f\n", node->beat);
             if (std::abs(node->beat - v) > std::abs(current - v)) {
                 return current;
             } else {
                 current = node->beat;
             }
         }
-        current = snap_beat(node->right, v, current);
-        return current;
+        float rightVal = snap_beat(node->right, v, current);
+        if (std::abs(rightVal - v) > std::abs(current - v))
+          return current;
+        else
+          return rightVal;
     }
 
     float accum_beats(Event* node, float acc, float v, Event* last) {
@@ -1675,19 +1693,14 @@ struct Canvas2D {
         drawNumber((n - current) / 10, { p.x - 4, p.y }, renderer, topLeft, bottomRight);
     }
 
-    void drawRhythmLine(float beat, Vec2 s0, Vec2 range, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+    void drawRhythmLine(Event* ev, Vec2 s0, Vec2 range, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y - 15, 1, 30, 0.47, 0.47, 0.63);
-        float dec = beat - std::floor(beat);
-        int num, den;
-        printf("decimal: %f\n", dec);
-        floatToFraction(dec, num, den);
-        printf("denominator: %d\n", den);
-        std::vector<int> primeFactors = getPrimeFactors(den);
+        float beat = ev->beat;
         int skipCount = 0;
         int offset = 15;
         printf("s0.x: %f, beat: %f\n", s0.x, beat);
-        for (int i = 0; i < primeFactors.size(); i++) {
-          if (primeFactors[i] == 0) {
+        for (int i = 0; i < ev->primeFactors.size(); i++) {
+          if (ev->primeFactors[i] == 0) {
             skipCount++;
           } else {
             printf("i: %d\n", i);
@@ -1707,9 +1720,9 @@ struct Canvas2D {
             }
             int offsetX = 3;
             addCanvasRect(renderer, topLeft, bottomRight, s0.x, s0.y + offset, 3, 1, 0.47, 0.47, 0.63);
-            for (int j = 0; j < primeFactors[i]; j++) {
+            for (int j = 0; j < ev->primeFactors[i]; j++) {
               addCanvasRect(renderer, topLeft, bottomRight, s0.x + offsetX, s0.y + offset, 1, 4, 0.47, 0.47, 0.63);
-              if (j != primeFactors[i] - 1)
+              if (j != ev->primeFactors[i] - 1)
                 addCanvasRect(renderer, topLeft, bottomRight, s0.x + offsetX, s0.y + offset, 2, 1, 0.47, 0.47, 0.63);
               offsetX += 2;
             }
@@ -1722,27 +1735,42 @@ struct Canvas2D {
       Event* current = beatEv;
       std::vector<float> simultaneous;
       float val;
-      while (current->beat == beatEv->beat) {
-        if (current->function.root && (current->type == EV_NOTE_START || current->type == EV_NOTE_END))
-          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+      while (current && std::abs(current->beat - beatEv->beat) < 1e-6) {
+        if (current->type == EV_NOTE_START || current->type == EV_NOTE_END) {
+          if (current->function.root)
+            simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          else {
+            Event* evi = prev(current);
+            while (evi->id != current->id)
+              evi = prev(evi);
+            simultaneous.push_back(evi->function.evaluate(b, t, 0, 0));
+          }
+        }
         current = prev(current);
       }
       current = beatEv;
-      while (current->beat == beatEv->beat) {
-        if (current->function.root && (current->type == EV_NOTE_START || current->type == EV_NOTE_END))
-          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+      while (current && std::abs(current->beat - beatEv->beat) < 1e-6) {
+        if (current->type == EV_NOTE_START || current->type == EV_NOTE_END) {
+          if (current->function.root)
+            simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          else {
+            Event* evi = prev(current);
+            while (evi->id != current->id)
+              evi = prev(evi);
+            simultaneous.push_back(evi->function.evaluate(b, t, 0, 0));
+          }
+        }
         current = next(current);
       }
       if (simultaneous.empty()) {
-        // Take the average of all the currentlyHeld and place it there
         Vec2 ap = worldToScreen(topLeft, { beatEv->time, 0.0f });
         ap.y = (topLeft.y + bottomRight.y) / 2.0f;
-        drawRhythmLine(beatEv->beat, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
+        drawRhythmLine(beatEv, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
       } else {
         // Draw it on each of the simultaneous Notes
         for (int i = 0; i < simultaneous.size(); i++) {
-          Vec2 ap = worldToScreen(topLeft, { beatEv->beat, simultaneous[i]});
-          drawRhythmLine(beatEv->beat, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
+          Vec2 ap = worldToScreen(topLeft, { beatEv->time, simultaneous[i]});
+          drawRhythmLine(beatEv, ap, {beatEv->beatL, beatEv->beatR}, renderer, topLeft, bottomRight);
         }
       }
     }
@@ -1867,6 +1895,8 @@ struct Canvas2D {
         float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
 
+        printf("snappedBeat: %f\n", snappedBeat);
+
         if (std::abs(currentBeat - std::round(currentBeat)) < std::abs(currentBeat - snappedBeat))
             snappedBeat =  std::round(currentBeat);
         printf("topLeft.x: %f, w.x: %f, currentBeat: %f, snappedBeat: %f\n", topLeft.x, w.x, currentBeat, snappedBeat);
@@ -1930,11 +1960,11 @@ struct Canvas2D {
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
                     addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
-                    if (std::floor(noteEv->time) - noteEv->time < 1e-6) {
+                    if (std::abs(std::floor(noteEv->beat) - noteEv->beat) < 1e-6) {
                       // Draw rhythm line at note start
                       addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
                     }
-                    if (std::floor(currentBeatEv->time) - currentBeatEv->time < 1e-6) {
+                    if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
                       // Draw rhythm line at note end
                       addCanvasRect(renderer, topLeft, bottomRight, bp.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
                     }
@@ -2106,24 +2136,70 @@ struct Canvas2D {
               if (std::abs(split_start + 1) < 1e-6)
                 split_start = snappedBeat;
               else {
+                printf("START");
                 // Insert divisions between split_start and snappedBeat
-                float inc = (snappedBeat - split_start) / std::atof(split);
-                float i = split_start + inc;
-                while (i < snappedBeat) {
-                  printf("insertBEAT_EV: %f\n", i);
-                  Event* toInsert = new Event(i, EV_BEAT);
-                  if (std::floor(snappedBeat) - snappedBeat < 1e-6 && std::floor(split_start) - split_start < 1e-6 && std::abs(snappedBeat - split_start) - 1.0f < 1e-6) {
-                    toInsert->beatDivs = 0;
-                    toInsert->beatL = 0;
-                    toInsert->beatR = 0;
-                  } else {
-                    toInsert->beatDivs = std::atoi(split);
-                    toInsert->beatL = split_start;
-                    toInsert->beatR = snappedBeat;
+                if (std::abs(snappedBeat - split_start) > 1e-6) {
+                  float start = split_start;
+                  float end = snappedBeat;
+                  if (snappedBeat < split_start) {
+                    start = snappedBeat;
+                    end = split_start;
                   }
-                  toInsert->time = calc_time(&timeEvents, toInsert->beat);
-                  beatEvents.insert(toInsert);
-                  i += inc;
+                  float inc = (end - start) / std::atof(split);
+                  float i = start + inc;
+                  int num = 1;
+                  int den = std::atoi(split);
+                  Event* ev1 = findBeatEv(beatEvents.root, start);
+                  Event* ev2 = findBeatEv(beatEvents.root, end);
+                  int offset = std::floor(end) - std::floor(start);
+                  int startNum, startDen, endNum, endDen;
+                  startNum = endNum = 0;
+                  startDen = endDen = 1;
+                  if (ev1) {
+                    startNum = ev1->num;
+                    startDen = ev1->den;
+                  }
+                  if (ev2) {
+                    endNum = ev2->num;
+                    endDen = ev2->den;
+                  }
+                  printf("dens: %d, %d, lcm: %d\n", startDen, endDen, std::lcm(startDen, endDen));
+                  endNum += endDen * offset;
+                  int diffDen = std::lcm(startDen, endDen);
+                  int diffNum = (diffDen / endDen) * endNum - (diffDen / startDen) * startNum;
+                  while (i < end) {
+                    printf("insertBEAT_EV: %f, end: %f\n", i, end);
+                    Event* toInsert = new Event(i, EV_BEAT);
+                    if (std::abs(std::floor(end) - end) < 1e-6 && std::abs(std::floor(start) - start) < 1e-6 && std::abs(snappedBeat - split_start) - 1.0f < 1e-6) {
+                      toInsert->beatL = 0;
+                      toInsert->beatR = 0;
+                    } else {
+                      toInsert->beatL = start;
+                      toInsert->beatR = end;
+                    }
+                    int unsimpNum = diffNum * num;
+                    int unsimpDen = diffDen * den;
+                    // Add to startNum, startDen;
+                    int lcm = std::lcm(startDen, unsimpDen);
+                    unsimpNum = (lcm / unsimpDen) * unsimpNum + (lcm / startDen) * startNum;
+                    unsimpDen = lcm;
+                    while (unsimpNum - unsimpDen > 0)
+                      unsimpNum -= unsimpDen;
+                    printf("unsimpNum: %d, unsimpDen: %d, GCD: %d\n", unsimpNum, unsimpDen, std::gcd(unsimpNum, unsimpDen));
+                    int gcd = std::gcd(unsimpNum, unsimpDen);
+                    if (gcd == 0) {
+                      toInsert->num = unsimpNum;
+                      toInsert->den = unsimpDen;
+                    } else {
+                      toInsert->num = unsimpNum / std::gcd(unsimpNum, unsimpDen);
+                      toInsert->den = unsimpDen / std::gcd(unsimpNum, unsimpDen);
+                    }
+                    toInsert->primeFactors = getPrimeFactors(toInsert->den);
+                    toInsert->time = calc_time(&timeEvents, toInsert->beat);
+                    beatEvents.insert(toInsert);
+                    i += inc;
+                    num++;
+                  }
                 }
                 split_start = -1.0f;
               }

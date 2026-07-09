@@ -71,7 +71,9 @@ struct Event {
     Event* parent;
     float beatL;
     float beatR;
-    uint8_t beatDivs;
+    int num;
+    int den;
+    std::vector<int> primeFactors;
     float origin;
     bool selected;
     bool finalEv;
