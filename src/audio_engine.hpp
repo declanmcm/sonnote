@@ -576,7 +576,7 @@ private:
     // Polyphonic voice state
     // ============================
     static constexpr size_t MAX_VOICES = 64;
-    std::array<ArithTree*, MAX_VOICES> voiceFreqs{};
+    std::array<float, MAX_VOICES> voiceFreqs{};
     std::array<float, MAX_VOICES> voicePhases{};
     std::array<uint32_t, MAX_VOICES> voiceIDs{};
     // std::array<float, MAX_VOICES> voiceEnvs{};
