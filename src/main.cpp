@@ -1182,6 +1182,7 @@ bool save_song(const std::string& path,
     while (current) {
       v = current->beat;
       sprintf(expr, "%s", current->string_expr.c_str());
+      //sprintf(expr, "3.0\0");
       l = strlen(expr);
       printf("expr: %s, len: %d\n", expr, l);
       t = current->type;
@@ -1973,6 +1974,7 @@ struct Canvas2D {
                 }
                 lastNoteEvTime = currentBeatEv->time;
                 noteStarts.push_back(currentBeatEv);
+                printf("freq: %f\n", currentBeatEv->function.evaluate(b, t, 0, 0));
                 if (currentBeatEv->beat < currentBeat)
                     currentEvsAtCursor.push_back(currentBeatEv);
             } else if (currentBeatEv->type == EV_NOTE_END) {

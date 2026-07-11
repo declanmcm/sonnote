@@ -134,6 +134,7 @@ struct Event {
 void do_order(Event* current, Event*& previous);
 Event* next_type(Event* ev, int type);
 Event* next_note(Event* ev);
+Event* next(Event* ev);
 float integrate(ArithTree* function, float t1, float t2);
 float integrate_until(ArithTree* function, float t1, float y);
 

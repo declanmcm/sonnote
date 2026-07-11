@@ -388,7 +388,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
-    for (uint32_t i = 0; i < frames; ++i)
+    for (uint32_t in = 0; in < frames; ++in)
     {
         float s = 0.0f;
 
@@ -560,9 +560,9 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
         //fprintf(out, "%f\n", s);
 
-        outL[i] = s;
+        outL[in] = s;
         // printf("s: %f\n", s);
-        outR[i] = s;
+        outR[in] = s;
         // toPrint[printIndex] = s;
         // printIndex++;
         // if (printIndex == 100) printIndex = 0;
@@ -633,7 +633,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
     float divisorSmooth = 1.0f;
 
     // Event sequencing (beat-based)
-    size_t evIndex = 0;  
+    size_t evIndex = 0;
     double secondsPerBeat  = 60.0 / tempoBPM;
     double samplesPerBeat  = secondsPerBeat * sampleRate;
 
@@ -661,134 +661,217 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
     Event* currentEv = events.root;
     while (currentEv->left)
       currentEv = currentEv->left;
+    while (currentEv && currentEv->type != EV_NOTE_START)
+      currentEv = next(currentEv);
+    if (currentEv) {
+      printf("FIRSTEV: %f\n", currentEv->beat);
+    } else {
+      printf("no event\n");
+    }
 
-    for (uint64_t i = 0; i < totalFrames; ++i)
+    printf("totalFrames: %d\n", totalFrames);
+
+    for (uint64_t in = 0; in < totalFrames; ++in)
     {
-        float mix = 0.0f;
+        float s = 0.0f;
 
-        // --- Sequencer / Event triggering ---
-        double beat = double(sc) / samplesPerBeat;
-        b = beat;
-        while (currentEv && currentEv->beat <= beat) {
-            //const SeqEvent& ev; // TODO Remove
+        // --- Sequencer: map sampleCounter → beat and fire events when crossing beat positions ---
+        currentBeat = double(sc) / samplesPerBeat;
+        b = currentBeat;
 
+        // Trigger all events whose beat <= current beat (looping)
+        if (!freeze) {
 
-            if (currentEv->type == EV_NOTE_START) {
-                // NOTE ON: find free voice
-                size_t v = MAX_VOICES;
-                for (size_t k = 0; k < MAX_VOICES; ++k) {
-                    if (state[k][0] == 0 && state[k][1] == 0 && state[k][2] == 0) {
-                      v = k; break;
-                    }
-                }
-                if (v == MAX_VOICES) v = 0; // steal voice 0
+            // double lastBeat = currentBeat;
+            // currentBeat = beat;  // update for envelope or external code, if needed
 
-                freq[v]  = currentEv->function.evaluate(b, t, 0, 0);
-                phase[v] = 0.0f;
-                for (int i = 0; i < 3; i++) {
-                    env[v][i] = 0.0f;
-                    state[v][i] = 1;
-                }
-                voicePs[v] = currentEv->profile;
-            } else {
-                // NOTE OFF: release matching voice
-                for (size_t k = 0; k < MAX_VOICES; ++k) {
-                    if ((state[k][0] != 0 || state[k][1] != 0 || state[k][2] != 0) &&
-                        fabsf(freq[k] - currentEv->function.evaluate(b, t, 0, 0)) < 1e-4f)
-                    {
-                        state[k][0] = 3;
-                        state[k][1] = 3;
-                        state[k][2] = 3;
-                        break;
-                    }
-                }
+            //size_t count = activeEvents.size();
+
+            // If beat jumped backwards (tempo change) or we reset
+            // we restart scanning from index 0
+            if (currentBeat < lastBeat) {
+                nextEventIndex = 0;
             }
 
-            // advance to next event
-            currentEv = next_note(currentEv);
-        }
+            if (countdown < 51) countdown--;
 
-        // --- Polyphonic synthesis ---
-        int activeVoices = 0;
+            // Consume events while currentBeat passes their beat positions
+            while (currentEv &&
+                currentEv->beat <= currentBeat)
+            {
+                countdown--;
 
-        // float atkStep = (adsr.attack  > 0) ? (1.0f / (adsr.attack  * sr)) : 1.0f;
-        // float relStep = (adsr.release > 0) ? (1.0f / (adsr.release * sr)) : 1.0f;
-        // float decStep = (adsr.decay   > 0) ? (1.0f / (adsr.decay   * sr)) : 1.0f;
+                // Only trigger if we *passed* this beat within this audio block
+                if (currentEv->type == EV_NOTE_START) {
+                    printf("note on: %d at %d\n", currentEv->id, in);
 
-        for (size_t v = 0; v < MAX_VOICES; ++v)
-        {
-            if (state[v][0] == 0 && state[v][1] == 0 && state[v][2] == 0)
-                continue;
-
-            activeVoices++;
-            for (int i = 0; i < 3; i++) {
-                // Envelope update
-                if (state[v][i] == 1) {
-                    float atkStep = (profiles[voicePs[v]].settings[i].attack > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].attack  * sr)) : 1.0f;
-                    env[v][i] += atkStep;
-                    if (env[v][i] >= 1.0f) {
-                        env[v][i] = 1.0f;
-                        state[v][i] = 2; // decay/sustain
+                    // NOTE ON
+                    size_t voiceIndex = MAX_VOICES;
+                    for (size_t v = 0; v < MAX_VOICES; ++v) {
+                        if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
+                            voiceIndex = v;
+                            break;
+                        }
                     }
-                } 
-                else if (state[v][i] == 2) {
-                    float decStep = (profiles[voicePs[v]].settings[i].decay   > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].decay  * sr)) : 1.0f;
-                    if (env[v][i] > profiles[voicePs[v]].settings[i].sustain) {
-                        env[v][i] -= decStep;
-                        if (env[v][i] <= profiles[voicePs[v]].settings[i].sustain)
-                            env[v][i] = profiles[voicePs[v]].settings[i].sustain;
+                    if (voiceIndex == MAX_VOICES)
+                        voiceIndex = 0; // steal voice 0
+
+                    //voiceFreqs[voiceIndex]  = &currentEv->function;
+                    voiceFreqs[voiceIndex] = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, currentEv->function.evaluate(b, t, 0, 0) - 4.0f);
+                    voicePhases[voiceIndex] = 0.0f;
+                    voiceIDs[voiceIndex] = currentEv->id;
+                    for (int i = 0; i < 3; i++) {
+                        voiceEnvs[voiceIndex][i]   = 0.0f;
+                        voiceStates[voiceIndex][i] = 1;
                     }
-                } else if (state[v][i] == 3) {
-                    float relStep = (profiles[voicePs[v]].settings[i].release > 1e-6) ? (1.0f / (float)(profiles[voicePs[v]].settings[i].release * sr)) : 1.0f;
-                    env[v][i] -= relStep;
-                    if (env[v][i] <= 0.0f) {
-                        env[v][i] = 0;
-                        state[v][i] = 0;
+                    voiceProfiles[voiceIndex] = currentEv->profile;
+                }
+                else {
+                    // NOTE OFF
+                    printf("note off: %d\n", currentEv->id);
+                    for (size_t v = 0; v < MAX_VOICES; ++v) {
+                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
+                              voiceStates[v][2] != 0) &&
+                            currentEv->id == voiceIDs[v])
+                        {
+                          //printf("heylo\n");
+                            voiceStates[v][0] = 3;
+                            voiceStates[v][1] = 3;
+                            voiceStates[v][2] = 3;
+                            break;
+                        }
                     }
                 }
-            }
 
-
-            // Phase + waveform
-            phase[v] += freq[v] / sr;
-            if (phase[v] >= 1.0f) phase[v] -= 1.0f;
-            
-            for (int i = 0; i < 3; i++) {
-                float voiceSample =
-                    generateSample(profiles[voicePs[v]].settings[i].waveType, phase[v]) * env[v][i] * profiles[voicePs[v]].settings[i].gain;
-                if (voiceSample< 1e-6) {
-                    totalZero++;
+                currentEv = next_note(currentEv);
+                if (currentEv) {
+                  printf("nextEv beat: %f\n", currentEv->beat);
                 } else {
-                    totalNonZero++;
+                  printf("no more notes\n");
                 }
-                mix += voiceSample;
+
+                // Loop the sequence
+                // if (nextEventIndex >= count) {
+                //     nextEventIndex = 0;
+
+                //     // If we wrapped but the next event is in the future,
+                //     // we should stop scanning here.
+                //     if (activeEvents[0].beat > currentBeat)
+                //         break;
+                // }
             }
         }
 
-        // --- voice count smoothing ---
-        if (activeVoices > 0) {
-            if (fabs(divisorSmooth - (float)activeVoices) > 1e-6f) {
-                divisorSmooth += ((float)activeVoices - divisorSmooth) / 100.0f;
-            } else {
-                divisorSmooth = (float)activeVoices;
+        // --- Per-voice synthesis (similar to old data_callback) ---
+        int activeCount = 0;
+        for (size_t v = 0; v < MAX_VOICES; ++v) {
+            // printf("voiceStates: %d, %d, %d\n", voiceStates[v][0], voiceStates[v][1], voiceStates[2]);
+            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) continue; // inactive
+
+            activeCount++;
+
+            for (int e = 0; e < 3; e++) {
+                // Envelope update OSC i
+                if (voiceStates[v][e] == 1) {
+                    // Attack
+                    float atkStep = (profiles[voiceProfiles[v]].settings[e].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].attack  * sr)) : 1.0f;
+                    voiceEnvs[v][e] += atkStep;
+                    if (voiceEnvs[v][e] >= 1.0f) {
+                        voiceEnvs[v][e] = 1.0f;
+                        voiceStates[v][e] = 2; // sustain/decay
+                    }
+                } else if (voiceStates[v][e] == 2) {
+                    // Decay toward sustain
+                    float decStep = (profiles[voiceProfiles[v]].settings[e].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].decay  * sr)) : 1.0f;
+                    if (voiceEnvs[v][e] > profiles[voiceProfiles[v]].settings[e].sustain) {
+                        voiceEnvs[v][e] -= decStep;
+                        if (voiceEnvs[v][e] <= profiles[voiceProfiles[v]].settings[e].sustain) {
+                            voiceEnvs[v][e] = profiles[voiceProfiles[v]].settings[e].sustain;
+                        }
+                    }
+                } else if (voiceStates[v][e] == 3) {
+                    // Release
+                    float relStep = (profiles[voiceProfiles[v]].settings[e].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].release * sr)) : 1.0f;
+                    voiceEnvs[v][e] -= relStep;
+                    if (voiceEnvs[v][e] <= 0.0f) {
+                        voiceEnvs[v][e] = 0.0f;
+                        voiceStates[v][e] = 0; // off
+                    }
+                }
             }
-            // mix /= divisorSmooth;
+
+            // Phase & sample
+            //const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->evaluate(b, t, 0, 0) - 4.0f);
+            const float freq = voiceFreqs[v];
+            //printf("voice %d freq: %f\n", v, freq);
+            float phase = voicePhases[v];
+
+            phase += freq / sr;
+            if (phase >= 1.0f) phase -= 1.0f;
+            voicePhases[v] = phase;
+
+            for (int i = 0; i < 3; i++) {
+              //printf("gain: %f\n", profiles[voiceProfiles[v]].settings[i].gain);
+                float voiceSample = generateSample(profiles[voiceProfiles[v]].settings[i].waveType, phase) * voiceEnvs[v][i] * profiles[voiceProfiles[v]].settings[i].gain;
+
+                s += voiceSample;
+                // printf("s: %f gain: %f\n", s, profiles[voiceProfiles[v]].settings[i].gain);
+                // fflush(stdout);
+            }
+        }
+
+        // Smooth divisor (like old "divisor" logic)
+        if (activeCount > 0) {
+            if (std::abs(divisorSmooth - (float)activeCount) > 1e-6f) {
+                divisorSmooth += ((float)activeCount - divisorSmooth) / 100.0f;
+            } else {
+                divisorSmooth = (float)activeCount;
+            }
+
+            s /= divisorSmooth;
         } else {
             divisorSmooth = 1.0f;
         }
 
-        // global gain
-        // mix *= gain;
+        // Apply global gain
+        // s *= gain;
 
-        // clamp
-        if (mix > 1.0f) mix = 1.0f;
-        if (mix < -1.0f) mix = -1.0f;
+        // Clamp
+        if (s > 1.0f) {
+          //printf("YO");
+          s = 1.0f;
+        }
+        if (s < -1.0f) {
+          //printf("YO");
+          s = -1.0f;
+        }
 
-        buffer[i * 2 + 0] = mix;
-        buffer[i * 2 + 1] = mix;
-
+        buffer[in * 2] = s;
+        buffer[in * 2 + 1] = s;
         sc++;
+        //if (s > 1e-6)
+        //  printf("s: %f\n", s);
+        // toPrint[printIndex] = s;
+        // printIndex++;
+        // if (printIndex == 100) printIndex = 0;
+
+        // if (countdown == 0) {
+        //     printf("hey");
+        //     // Print to file
+        //     FILE* out = fopen("out.csv", "w+");
+        //     char str[16];
+        //     for (int i = 0; i < 99; i++) {
+        //         printIndex++;
+        //         if (printIndex == 100) printIndex = 0;
+        //         sprintf(str, "%f,", toPrint[printIndex]);
+        //         fputs(str, out);
+        //     }
+        //     sprintf(str, "%f", toPrint[++printIndex]);
+        //     fputs(str, out);
+        //     fclose(out);
+        // }
     }
+    printf("currentBeat: %f\n", b);
 
     printf("totalZero: %d\n", totalZero);
     printf("totatNonZero: %d\n", totalNonZero);
