@@ -75,13 +75,13 @@ struct ArithTree {
       }
       return result;
     } else if (node->type == 'T') {
-      printf("T");
-      std::fflush(stdout);
+      //printf("T");
+      //std::fflush(stdout);
       Operand* current = node->operands;
       float result = evaluate(current->node, a, b, c, d);
       current = current->next;
       while (current) {
-        printf("got next\n");
+        //printf("got next\n");
         if (current->operation == '*')
           result = result * evaluate(current->node, a, b, c, d);
         else if (current->operation == '/')
@@ -90,16 +90,16 @@ struct ArithTree {
       }
       return result;
     } else if (node->type == 'F') {
-      printf("F");
-      std::fflush(stdout);
+      //printf("F");
+      //std::fflush(stdout);
       if (node->operation == '~') {
         return evaluate(node->operands->node, a, b, c, d);
       } else if (node->operation == '-') {
         return -1 * evaluate(node->operands->node, a, b, c, d);
       }
     } else if (node->type == 'N') {
-      printf("N");
-      std::fflush(stdout);
+      //printf("N");
+      //std::fflush(stdout);
       float pows[4];
       for (int i = 0; i < 4; i++) {
         if (node->pronumPowers[i])
@@ -112,7 +112,7 @@ struct ArithTree {
         * std::pow(d, pows[3]);
       if (!node->noVal)
         value = value * node->val;
-      printf("value at N: %f\n", value);
+      //printf("value at N: %f\n", value);
       return value;
     }
     return 0;

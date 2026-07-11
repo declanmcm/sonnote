@@ -148,6 +148,38 @@ void floatToFraction(float value, int& num, int& den, int maxDen = 10000) {
    den /= g;
 }
 
+void readJump(char* jump, int& num, int& den, float& val) {
+  int i = 0;
+  int n = 0;
+  while (jump[i] != '/' && jump[i] != '.') {
+    n *= 10;
+    n += jump[i] - 48;
+    i++;
+  }
+  if (jump[i] == '.') {
+    i++;
+    float dec = 0.0f;
+    int place = -1;
+    while (jump[i] != '\0') {
+      dec += std::pow(10, place) * (jump[i] - 48);
+      i ++;
+      place--;
+    }
+    val = n + dec;
+    return;
+  } else {
+    num = n;
+    n = 0;
+    i++;
+    while (jump[i] != '\0') {
+      n *= 10;
+      n += jump[i] - 48;
+      i++;
+    }
+    den = n;
+  }
+}
+
 void do_order(Event* current, Event*& previous) {
     if (!current) return;
     do_order(current->left, previous);
@@ -215,6 +247,14 @@ Event* next_type(Event* ev, int type) {
     ev = next(ev);
   while (ev && ev->type != type)
     ev = next(ev);
+  return ev;
+}
+
+Event* prev_type(Event* ev, int type) {
+  if (ev)
+    ev = prev(ev);
+  while (ev && ev->type != type)
+    ev = prev(ev);
   return ev;
 }
 
@@ -1916,6 +1956,7 @@ struct Canvas2D {
         std::vector<Event*> noteStarts;
         Event* prevEv = nullptr;
         int beatRLi = 0;
+        float lastNoteEvTime = 0.0f;
         while (currentBeatEv) {
             printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
             if (currentBeatEv->type == EV_NOTE_START || currentBeatEv->type == EV_NOTE_END) {
@@ -1925,18 +1966,19 @@ struct Canvas2D {
             if (currentBeatEv->type == EV_NOTE_START) {
               printf("yo!\n");
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
-                  float root = drawFundamental(renderer, topLeft, bottomRight, prevEv->time, currentBeatEv->time, noteStarts);
+                  float root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   // Snap to harmonics
-                  if (unsnappedHoverW.x > prevEv->time && unsnappedHoverW.x < currentBeatEv->time)
+                  if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time)
                     hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
                 }
+                lastNoteEvTime = currentBeatEv->time;
                 noteStarts.push_back(currentBeatEv);
                 if (currentBeatEv->beat < currentBeat)
                     currentEvsAtCursor.push_back(currentBeatEv);
             } else if (currentBeatEv->type == EV_NOTE_END) {
                 if (snap_harmonics && !snap_foci && (int)noteStarts.size() > 1 && prevEv) {
-                  float root = drawFundamental(renderer, topLeft, bottomRight, prevEv->time, currentBeatEv->time, noteStarts);
-                  if (unsnappedHoverW.x > prevEv->time && unsnappedHoverW.x < currentBeatEv->time)
+                  float root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time)
                     hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
                 }
                 Event* noteEv = nullptr;
@@ -1949,6 +1991,7 @@ struct Canvas2D {
                         break;
                     }
                 }
+                lastNoteEvTime = currentBeatEv->time;
                 //printf("noteEv: %d, ", noteEv != nullptr);
                 if (noteEv)
                 printf("isConstant: %d\n", noteEv->isConstant());
@@ -2130,6 +2173,22 @@ struct Canvas2D {
 
             if (containsKey(keys, 'q')) {
               beatEvents.inorder();
+            }
+
+            if (containsKey(keys, 'j')) {
+              // jump the frequency by the amount contained in jump (char* passed to draw())
+              float val = 0.0f;
+              int num, den;
+              num = den = 0;
+              readJump(jump, num, den, val);
+              printf("num: %d, den: %d\n", num, den);
+              char toUpdate[20];
+              if (val < 1e-6) {
+                sprintf(toUpdate, "%f", closest->function.evaluate(b, t, 0, 0) * (float)num / (float)den);
+              } else {
+                sprintf(toUpdate, "%f", closest->function.evaluate(b, t, 0, 0) * val);
+              }
+              closest->update_function(toUpdate);
             }
 
             if (containsKey(keys, 's')) {
