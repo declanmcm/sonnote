@@ -2122,7 +2122,7 @@ struct Canvas2D {
 
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
         if (hovered) {
-            if (containsKey(keys, 'p')) 
+            if (containsKey(keys, 'p'))
                 playhead_time = hoverW.x;
             else if (containsKey(keys, 'h'))
                 snap_foci = !snap_foci;
@@ -3190,7 +3190,8 @@ int main(int, char**)
                 //gBeatOctCanvas.beatEvents.create_order();
 
                 engine.setEvents(&(gBeatOctCanvas.beatEvents));
-                engine.resetSampleCounter();
+                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time));
+                printf("playhead_beat: %f\n", calc_beat(&gBeatOctCanvas.timeEvents, playhead_time));
                 engine.setPlayState(true);
             } else {
                 engine.setPlayState(false);

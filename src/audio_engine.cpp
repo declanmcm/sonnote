@@ -179,7 +179,6 @@ void AudioEngine::setPlayState(bool on) {
     m.type = MessageType::SetPlayState;
     m.bValue = on;
     messageQueue.push(m);
-    currentBeat = 0.0f;
 }
 
 void AudioEngine::setWaveform(WaveformType w) {
@@ -215,7 +214,7 @@ void AudioEngine::toggleFreeze() {
     freeze = !freeze;
 }
 
-void AudioEngine::setEvents(EventTree* newEvents) { 
+void AudioEngine::setEvents(EventTree* newEvents) {
     b = 0.0f;
     Message m;
     m.type = MessageType::ReplaceEvents;
@@ -223,7 +222,12 @@ void AudioEngine::setEvents(EventTree* newEvents) {
     messageQueue.push(m);
 }
 
-void AudioEngine::resetSampleCounter() {
+void AudioEngine::resetSampleCounter(float playhead_beat) {
+    const double secondsPerBeat = 60.0 / tempoBPM;
+    const double samplesPerBeat = secondsPerBeat * sampleRate;
+    if (playhead_beat < 0) playhead_beat *= -1;
+    sampleCounter = std::floor(playhead_beat * samplesPerBeat);
+    printf("sc: %d\n", sampleCounter);
     Message m;
     m.type = MessageType::ResetSampleCounter;
     messageQueue.push(m);
@@ -265,7 +269,6 @@ void AudioEngine::applyMessages() {
             break;
 
         case MessageType::ResetSampleCounter:
-            sampleCounter = 0;
             currentBeat = 0.0;
             nextEventIndex = 0;
             // Clear voices
@@ -388,6 +391,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
+    printf("%d\n", sampleCounter);
     for (uint32_t in = 0; in < frames; ++in)
     {
         float s = 0.0f;

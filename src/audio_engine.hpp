@@ -537,7 +537,7 @@ public:
     void setEvents(EventTree* newEvents);
 
     // Reset playback position
-    void resetSampleCounter();
+    void resetSampleCounter(float playhead_beat);
 
     // Export WAV file using libsndfile
     bool exportWav(const char* path, float playhead_time, float durationSeconds);
