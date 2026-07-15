@@ -742,6 +742,7 @@ float perfectIntervals[] = {
 };
 
 float playhead_time = 0.0f;
+float loop_end = -1.0f;
 bool play_triggered_from_space = false;
 
 static char jump[64] = "";
@@ -1930,6 +1931,10 @@ struct Canvas2D {
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
+        // Draw loop end line
+        s0 = worldToScreen(topLeft, { loop_end, wA.y });
+        addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
+
         Vec2 w = screenToWorld(topLeft, hover);
         //printf("timeEvents:");
         //timeEvents.inorder();
@@ -2124,11 +2129,18 @@ struct Canvas2D {
         if (hovered) {
             if (containsKey(keys, 'p'))
                 playhead_time = hoverW.x;
-            else if (containsKey(keys, 'h'))
+            if (containsKey(keys, 'u')) {
+              // Set loop limit
+              if (std::abs(loop_end - hoverW.x) < 1e-6)
+                loop_end = -1.0f;
+              else
+                loop_end = hoverW.x;
+            }
+            if (containsKey(keys, 'h'))
                 snap_foci = !snap_foci;
-            else if (containsKey(keys, ' '))
+            if (containsKey(keys, ' '))
                 play_triggered_from_space = true;
-            else if (containsKey(keys, 'v')) {
+            if (containsKey(keys, 'v')) {
                 // Paste notes
                 float firstSelectedTime = 0.0f;
                 for (int i = 0; i < (int)notes.size(); i++) {
@@ -2142,7 +2154,7 @@ struct Canvas2D {
                         notes.push_back(to_push);
                     }
                 }
-            } else if (containsKey(keys, 'r')) {
+            } if (containsKey(keys, 'r')) {
                 // Remove selected notes
                 std::vector<Note> newNotes;
                 for (int i = 0; i < (int)notes.size(); i++) {
@@ -3190,7 +3202,7 @@ int main(int, char**)
                 //gBeatOctCanvas.beatEvents.create_order();
 
                 engine.setEvents(&(gBeatOctCanvas.beatEvents));
-                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time));
+                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time), calc_beat(&gBeatOctCanvas.timeEvents, loop_end));
                 printf("playhead_beat: %f\n", calc_beat(&gBeatOctCanvas.timeEvents, playhead_time));
                 engine.setPlayState(true);
             } else {

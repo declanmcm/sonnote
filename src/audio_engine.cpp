@@ -222,11 +222,18 @@ void AudioEngine::setEvents(EventTree* newEvents) {
     messageQueue.push(m);
 }
 
-void AudioEngine::resetSampleCounter(float playhead_beat) {
+void AudioEngine::resetSampleCounter(float playhead_beat, float loop_end) {
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
-    if (playhead_beat < 0) playhead_beat *= -1;
     sampleCounter = std::floor(playhead_beat * samplesPerBeat);
+    if (sampleCounter == -1)
+      sampleCounter = 0;
+    printf("sampleCounter: %d\n", sampleCounter);
+    loopStartSamples = sampleCounter;
+    if (loop_end < 0)
+      loopEndSamples = 0;
+    else
+      loopEndSamples = std::floor(loop_end * samplesPerBeat);
     printf("sc: %d\n", sampleCounter);
     Message m;
     m.type = MessageType::ResetSampleCounter;
@@ -424,7 +431,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
                 // Only trigger if we *passed* this beat within this audio block
                 if (currentEv->type == EV_NOTE_START) {
-                    //printf("note on: %d\n", currentEv->id);
+                    printf("note on: %d\n", currentEv->id);
 
                     // NOTE ON
                     size_t voiceIndex = MAX_VOICES;
@@ -449,7 +456,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 }
                 else {
                     // NOTE OFF
-                    //printf("note off: %d\n", currentEv->id);
+                    printf("note off: %d\n", currentEv->id);
                     for (size_t v = 0; v < MAX_VOICES; ++v) {
                         if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
                               voiceStates[v][2] != 0) &&
@@ -589,6 +596,23 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
         if (!freeze)
             sampleCounter++;
+        if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
+          sampleCounter = loopStartSamples;
+          for (size_t v = 0; v < MAX_VOICES; ++v) {
+            if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
+                voiceStates[v][2] != 0))
+            {
+              //printf("heylo\n");
+              voiceStates[v][0] = 3;
+              voiceStates[v][1] = 3;
+              voiceStates[v][2] = 3;
+              break;
+            }
+          }
+          currentEv = activeEvents.root;
+          while (currentEv && currentEv->left)
+            currentEv = currentEv->left;
+        }
     }
 }
 
@@ -601,7 +625,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 // Purely offline rendering.
 //
 
-bool AudioEngine::exportWav(const char* path, float playhead_time, float durationSeconds)
+bool AudioEngine::exportWav(const char* path, float playhead_beat, float durationSeconds)
 {
     // ========== SETUP LIBSNDFILE ==========
     SF_INFO info{};
@@ -658,7 +682,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_time, float duratio
     }
 
     // ========== PER-SAMPLE OFFLINE RENDER LOOP ==========
-    uint64_t sc = playhead_time * samplesPerBeat; // offline sample counter
+    uint64_t sc = playhead_beat * samplesPerBeat; // offline sample counter
     int totalZero = 0;
     int totalNonZero = 0;
 

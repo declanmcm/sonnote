@@ -537,7 +537,7 @@ public:
     void setEvents(EventTree* newEvents);
 
     // Reset playback position
-    void resetSampleCounter(float playhead_beat);
+    void resetSampleCounter(float playhead_beat, float loop_end);
 
     // Export WAV file using libsndfile
     bool exportWav(const char* path, float playhead_time, float durationSeconds);
@@ -565,6 +565,8 @@ private:
     double currentBeat = 0.0;    // increments based on BPM
     double lastBeat = -0.001;
     uint64_t sampleCounter = 0;  // absolute sample index
+    uint64_t loopEndSamples = 0;
+    uint64_t loopStartSamples = 0;
     size_t nextEventIndex = 0;
 
     // Sequencer event storage (double-buffer)
