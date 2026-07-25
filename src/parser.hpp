@@ -37,7 +37,7 @@ struct Operand {
   }
 };
 
-float getNum(char*&);
+float getNum(char*&, bool& noVal);
 ArithNode* parseE(char*&);
 ArithNode* parseT(char*&);
 ArithNode* parseN(char*&);

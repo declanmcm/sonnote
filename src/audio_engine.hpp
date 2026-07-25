@@ -71,10 +71,10 @@ struct Event {
     Event* parent;
     float beatL;
     float beatR;
-    int num;
-    int den;
-    std::vector<int> primeFactors;
-    float origin;
+    uint32_t num;
+    uint32_t den;
+    std::vector<uint32_t> primeFactors;
+    Event* origin;
     bool selected;
     bool finalEv;
     int velocity;
@@ -87,8 +87,10 @@ struct Event {
         right = NULL;
         parent = NULL;
         next_ev = NULL;
+        origin = NULL;
         height = 0;
         id = 0;
+        den = 0;
         profile = 0;
     }
 
@@ -105,8 +107,10 @@ struct Event {
         right = NULL;
         parent = NULL;
         next_ev = NULL;
+        origin = NULL;
         height = 0;
         id = 0;
+        den = 0;
         profile = 0;
     }
 

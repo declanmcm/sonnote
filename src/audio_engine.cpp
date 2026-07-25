@@ -551,7 +551,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 divisorSmooth = (float)activeCount;
             }
 
-            s /= divisorSmooth;
+            //s /= divisorSmooth;
         } else {
             divisorSmooth = 1.0f;
         }
@@ -602,11 +602,9 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
                 voiceStates[v][2] != 0))
             {
-              //printf("heylo\n");
               voiceStates[v][0] = 3;
               voiceStates[v][1] = 3;
               voiceStates[v][2] = 3;
-              break;
             }
           }
           currentEv = activeEvents.root;
