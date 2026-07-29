@@ -1164,8 +1164,7 @@ bool save_song(const std::string& path,
 
     while (current) {
       v = current->beat;
-      //sprintf(expr, "%s", current->string_expr.c_str());
-      sprintf(expr, "261.63");
+      sprintf(expr, "%s", current->string_expr.c_str());
       l = strlen(expr);
       t = current->type;
       f.write(reinterpret_cast<const char*>(&v), sizeof(float));
@@ -1873,6 +1872,10 @@ struct Canvas2D {
         Vec2 bottomRight = { nw.x2, nw.y1 };
 
         printf("raw hover: %f, %f\n", hover.x, hover.y);
+
+        printf("pixels per beat: %f\n", sx);
+        Vec2 sxWorld = screenToWorld(topLeft, {sx, 0});
+        printf("beats at %f: %f\n", sx, calc_beat(&timeEvents, sxWorld.x));
 
         bool hovered = hover.x > 1e-06 && hover.y > 1e-06;
 
@@ -2699,6 +2702,7 @@ bool load_song(const std::string& path,
       f.read(reinterpret_cast<char*>(&l), sizeof(int));
       f.read(expr, l);
       expr[l] = '\0';
+      printf("timeEvent: %f, %s\n", v, expr);
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
       Event* toInsert;
       if (l != 0)
