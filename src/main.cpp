@@ -1535,21 +1535,26 @@ struct Canvas2D {
           allConstant = false;
         }
       }
-      
+
       int height = 0;
       if (allConstant) {
         std::vector<float> octaves;
         for (int i = 0; i < (int)currentEvs.size(); i++) {
           octaves.push_back(currentEvs[i]->function.evaluate(b, t, 0, 0));
         }
-        root = calculateRoot(octaves); 
+        root = calculateRoot(octaves);
 
         float currentFreq = root;
         while (true) {
           Vec2 a = worldToScreen(topLeft, { start, freq_to_octave(currentFreq) });
           Vec2 b = worldToScreen(topLeft, { end, freq_to_octave(currentFreq) });
-          if (a.y - height < 2)
-            break;
+          if (a.y - height < 2) {
+            if (height == 0) {
+              currentFreq = currentFreq + root;
+              continue;
+            } else
+              break;
+          }
           height = a.y;
           if (a.y > topLeft.y)
             break;
