@@ -47,6 +47,13 @@ struct Note {
 //exprtk::parser<double> parser;
 double b;
 double t;
+float inputFreq = 0.0f;
+
+const int audioBufferSize = 4096;
+float audioIn[audioBufferSize];
+int audioi = 0;
+int frames = 0;
+bool newAudioIn = false;
 
 float c4 = 220.0f * std::pow(2.0f, 3.0/12.0);
 
@@ -514,6 +521,7 @@ struct STFTMag {
     int numBins = 0;           // fftSize/2+1
     int numFrames = 0;
     std::vector<float> mag;    // flattened: mag[frame*numBins + bin]
+    float highBin;
 };
 
 inline std::vector<float> makeHann(int n)
@@ -530,17 +538,18 @@ inline STFTMag computeSTFT_FFTW(
     int fftSize = 2048,
     int hopSize = 512
 ) {
+  printf("samples.size(): %d, fftSize: %d\n", (int)samples.size(), fftSize);
     if ((int)samples.size() < fftSize) throw std::runtime_error("audio too short for fftSize");
 
     STFTMag out;
     out.sampleRate = sampleRate;
     out.fftSize = fftSize;
     out.hopSize = hopSize;
-    out.numBins = fftSize / 2 + 1;
+    out.numBins = fftSize;// / 2 + 1;
     out.numFrames = ((int)samples.size() - fftSize) / hopSize + 1;
     out.mag.assign((size_t)out.numFrames * (size_t)out.numBins, 0.0f);
 
-    auto window = makeHann(fftSize);
+    auto windowFFT = makeHann(fftSize);
 
     std::vector<float> in((size_t)fftSize);
     std::vector<fftwf_complex> spec((size_t)out.numBins);
@@ -549,11 +558,19 @@ inline STFTMag computeSTFT_FFTW(
         fftSize, in.data(), spec.data(), FFTW_MEASURE
     );
 
+    //printf("numbins: %d, numFrames: %d\n", out.numBins, out.numFrames);
+    float maxBin = 0.0f;
+    float maxVal = -9999999.0f;
+    bool search = true;
+    float lastPeak = 0.0f;
+    bool up = false;
     for (int frame = 0; frame < out.numFrames; ++frame) {
         int offset = frame * hopSize;
 
-        for (int i = 0; i < fftSize; ++i)
-            in[(size_t)i] = samples[(size_t)offset + (size_t)i] * window[(size_t)i];
+        for (int i = 0; i < fftSize; ++i) {
+          in[(size_t)i] = samples[(size_t)offset + (size_t)i] * windowFFT[(size_t)i];
+          //printf("%f\n", in[(size_t)i]);
+        }
 
         fftwf_execute(plan);
 
@@ -562,8 +579,33 @@ inline STFTMag computeSTFT_FFTW(
             float re = spec[(size_t)b][0];
             float im = spec[(size_t)b][1];
             dst[(size_t)b] = sqrtf(re * re + im * im);
+            //printf("frame, bin: %d, %d, dst: %f ", frame, b, dst[(size_t)b]);
+            if (search && dst[(size_t)b] > maxVal) {
+              //printf("newTopBin: %f\n", ((float)sampleRate * (float)b) / (float)audioBufferSize);
+              printf("newTopBin: %d\n", b);
+              maxBin = (float)b;
+              maxVal = dst[(size_t)b];
+              up = true;
+            } else {
+              if (up) {
+                maxBin += -1 * (dst[(int)maxBin - 1] / dst[(int)maxBin]) / 2 + (dst[(int)maxBin + 1] / dst[(int)maxBin]) / 2;
+                printf("newPeak: %f\n", maxBin);
+                /*
+                if (std::abs(lastPeak) >= 1e-6) {
+                  if (std::abs((maxBin / 2) - lastPeak) < 2) {
+                    maxBin = lastPeak;
+                    search = false;
+                  }
+                }
+                if (maxBin > (fftSize * 50) / (float)sampleRate)
+                  lastPeak = maxBin;*/
+                up = false;
+              }
+            }
         }
+        //out.highBins[frame] = maxBin;
     }
+    out.highBin = maxBin;
 
     fftwf_destroy_plan(plan);
     return out;
@@ -1951,6 +1993,10 @@ struct Canvas2D {
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
+        s0 = worldToScreen(topLeft, {0, freq_to_octave(inputFreq)});
+        printf("freq: %f, currentOc: %f\n", inputFreq, freq_to_octave(inputFreq));
+        addCanvasRect(renderer, topLeft, bottomRight, topLeft.x, s0.y, bottomRight.x - topLeft.x, 1, gridCol[0], gridCol[1], gridCol[2]);
+
         // Draw loop end line
         s0 = worldToScreen(topLeft, { loop_end, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
@@ -2002,7 +2048,6 @@ struct Canvas2D {
                 }
                 lastNoteEvTime = currentBeatEv->time;
                 noteStarts.push_back(currentBeatEv);
-                printf("freq: %f\n", currentBeatEv->function.evaluate(b, t, 0, 0));
                 if (currentBeatEv->beat < currentBeat)
                     currentEvsAtCursor.push_back(currentBeatEv);
             } else if (currentBeatEv->type == EV_NOTE_END) {
@@ -2027,7 +2072,7 @@ struct Canvas2D {
                 if (noteEv)
                 printf("isConstant: %d\n", noteEv->isConstant());
                 if (noteEv && noteEv->isConstant()) {
-                    printf("yes display\n");
+                    printf("noteOc: %f\n", noteEv->function.evaluate(b, t ,0 ,0));
                     // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
                     Vec2 ap = worldToScreen(topLeft, { noteEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
@@ -2961,7 +3006,27 @@ int main(int, char**)
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
     Profile profileSettings;
+    float currentInFreq = 0.0f;
+    STFTMag res;
     while (running) {
+        if (newAudioIn) {
+          std::vector<float> v(audioIn, audioIn + audioBufferSize);
+          res = computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
+
+          //printf("frames: %d\n", frames);
+          //printf("bin: %d\n", res.highBins[0]);
+          //for (int i = 20; i >= 0; i--) {
+          //  printf("%d\n", res.highBins[frames - i]);
+          //}
+
+          printf("resolution: %f, current Freq: %f\n", engine.sampleRate / audioBufferSize, (engine.sampleRate * res.highBin) / audioBufferSize);
+
+          inputFreq = (engine.sampleRate * res.highBin) / audioBufferSize;
+
+          rerender = true;
+
+          newAudioIn = false;
+        }
         SDL_Event e;
         keys.clear();
         if (ctrl) {

@@ -51,6 +51,12 @@ struct SeqEvent {
 extern double b;
 extern double t;
 
+extern const int audioBufferSize;
+extern float audioIn[4096];
+extern int audioi;
+extern int frames;
+extern bool newAudioIn;
+
 #define EV_TEMPO 2
 #define EV_NOTE_START 1
 #define EV_NOTE_END 0
@@ -535,6 +541,7 @@ public:
     Profile getProfile(int n);
 
     Profile profiles[10];
+    float sampleRate = 48000.0f;
 
     // Replace the entire event list
     // (Audio thread uses double-buffer swap)
@@ -552,11 +559,6 @@ private:
     // =================================
     JackState* jack = nullptr;
     float updateADSR(float dt);
-
-    // =================================
-    // Internal RT-safe data
-    // =================================
-    float sampleRate = 48000.0f;
 
     // Current DSP parameters (updated via messages)
     float gain = 0.5f;

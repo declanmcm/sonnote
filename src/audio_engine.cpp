@@ -14,6 +14,7 @@ struct AudioEngine::JackState {
         jack_client_t* client = nullptr;
         jack_port_t* outL = nullptr;
         jack_port_t* outR = nullptr;
+        jack_port_t* in = nullptr;
         AudioEngine* engine = nullptr;
     };
 FILE* out = nullptr;
@@ -46,12 +47,19 @@ int jackProcess(jack_nframes_t nframes, void* arg)
 
     float* outL = (float*)jack_port_get_buffer(js->outL, nframes);
     float* outR = (float*)jack_port_get_buffer(js->outR, nframes);
+    float* in = (float*)jack_port_get_buffer(js->in, nframes);
+    memcpy(audioIn + audioi, in, sizeof(float) * (audioi + nframes <= audioBufferSize ? nframes : audioBufferSize - audioi));
+    if (audioi + nframes >= audioBufferSize) {
+      newAudioIn = true;
+      audioi = 0;
+    } else
+      audioi += nframes;
+    frames = nframes;
 
     engine->processAudio(outL, outR, nframes);
 
     return 0;
 }
-
 
 // ======================================================
 // ======================= START =========================
@@ -94,6 +102,11 @@ bool AudioEngine::start() {
         jack->client, "out_R",
         JACK_DEFAULT_AUDIO_TYPE,
         JackPortIsOutput, 0);
+
+    jack->in = jack_port_register(
+        jack->client, "in_L",
+        JACK_DEFAULT_AUDIO_TYPE,
+        JackPortIsInput, 0);
 
     if (!jack->outL || !jack->outR) {
         std::cerr << "Failed to register JACK ports\n";
@@ -551,7 +564,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                 divisorSmooth = (float)activeCount;
             }
 
-            //s /= divisorSmooth;
+            s /= divisorSmooth;
         } else {
             divisorSmooth = 1.0f;
         }
@@ -598,6 +611,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             sampleCounter++;
         if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
           sampleCounter = loopStartSamples;
+//          printf("remove all voices\n");
           for (size_t v = 0; v < MAX_VOICES; ++v) {
             if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
                 voiceStates[v][2] != 0))
