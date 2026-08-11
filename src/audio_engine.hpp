@@ -98,6 +98,7 @@ struct Event {
         id = 0;
         den = 0;
         profile = 0;
+        selected = false;
     }
 
     Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t), function(const_cast<char*>(expr_string.c_str())) {
@@ -118,6 +119,7 @@ struct Event {
         id = 0;
         den = 0;
         profile = 0;
+        selected = false;
     }
 
     void update_function(const std::string& expr_string) {

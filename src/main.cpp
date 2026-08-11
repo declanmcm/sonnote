@@ -538,7 +538,7 @@ inline STFTMag computeSTFT_FFTW(
     int fftSize = 2048,
     int hopSize = 512
 ) {
-  printf("samples.size(): %d, fftSize: %d\n", (int)samples.size(), fftSize);
+  //printf("samples.size(): %d, fftSize: %d\n", (int)samples.size(), fftSize);
     if ((int)samples.size() < fftSize) throw std::runtime_error("audio too short for fftSize");
 
     STFTMag out;
@@ -582,14 +582,14 @@ inline STFTMag computeSTFT_FFTW(
             //printf("frame, bin: %d, %d, dst: %f ", frame, b, dst[(size_t)b]);
             if (search && dst[(size_t)b] > maxVal) {
               //printf("newTopBin: %f\n", ((float)sampleRate * (float)b) / (float)audioBufferSize);
-              printf("newTopBin: %d\n", b);
+              //printf("newTopBin: %d\n", b);
               maxBin = (float)b;
               maxVal = dst[(size_t)b];
               up = true;
             } else {
               if (up) {
                 maxBin += -1 * (dst[(int)maxBin - 1] / dst[(int)maxBin]) / 2 + (dst[(int)maxBin + 1] / dst[(int)maxBin]) / 2;
-                printf("newPeak: %f\n", maxBin);
+                //printf("newPeak: %f\n", maxBin);
                 /*
                 if (std::abs(lastPeak) >= 1e-6) {
                   if (std::abs((maxBin / 2) - lastPeak) < 2) {
@@ -1186,8 +1186,7 @@ bool save_song(const std::string& path,
 
     char expr[40];
     float v;
-    int t;
-    int l;
+    int t, l, p;
     uint32_t id, den;
     uint32_t eventCount = 0;
 
@@ -1237,6 +1236,7 @@ bool save_song(const std::string& path,
       l = strlen(expr);
       printf("expr: %s, len: %d\n", expr, l);
       t = current->type;
+      p = current->profile;
       id = current->id;
       den = current->den;
       f.write(reinterpret_cast<const char*>(&v), sizeof(float));
@@ -1245,6 +1245,7 @@ bool save_song(const std::string& path,
       f.write(reinterpret_cast<const char*>(&t), sizeof(int));
       f.write(reinterpret_cast<const char*>(&id), sizeof(uint32_t));
       f.write(reinterpret_cast<const char*>(&den), sizeof(uint32_t));
+      f.write(reinterpret_cast<const char*>(&p), sizeof(int));
       current = next(current);
     }
 
@@ -2212,17 +2213,47 @@ struct Canvas2D {
                 play_triggered_from_space = true;
             if (containsKey(keys, 'v')) {
                 // Paste notes
+                Event* current = beatEvents.get_first();
+                std::vector<Event*> noteStarts;
                 float firstSelectedTime = 0.0f;
-                for (int i = 0; i < (int)notes.size(); i++) {
-                    if (notes[i].selected) {
-                        if (firstSelectedTime < 1e-6)
-                            firstSelectedTime = notes[i].beat_on;
-                        Note to_push = notes[i];
-                        to_push.beat_on = hoverW.x + notes[i].beat_on - firstSelectedTime;
-                        to_push.beat_off = hoverW.x + notes[i].beat_off - firstSelectedTime;
-                        to_push.selected = false;
-                        notes.push_back(to_push);
+                while (current) {
+                  if (current->selected) {
+                    if (current->type == EV_NOTE_START) {
+                      printf("new note: %f, %s\n", current->beat, current->string_expr.c_str());
+                      if (firstSelectedTime < 1e-6)
+                        firstSelectedTime = current->beat;
+                      noteStarts.push_back(current);
+                    } else if (current->type == EV_NOTE_END) {
+                      for (int i = 0; i < noteStarts.size(); i++) {
+                        if (noteStarts[i]->id == current->id) {
+                          // Process note
+                          printf("adding new notes\n");
+                          char expr[20];
+                          strcpy(expr, noteStarts[i]->string_expr.c_str());
+                          Event* e1 = new Event(hoverW.x + noteStarts[i]->beat - firstSelectedTime, expr, EV_NOTE_START);
+                          Event* e2 = new Event(hoverW.x + current->beat - firstSelectedTime, EV_NOTE_END);
+                          if ((int)spareIDs.size() > 0) {
+                            e1->id = spareIDs[(int)spareIDs.size() - 1];
+                            spareIDs.pop_back();
+                            e2->id = e1->id;
+                          } else {
+                            e1->id = nextID;
+                            e2->id = nextID++;
+                          }
+                          beatEvents.insert(e1);
+                          beatEvents.insert(e2);
+                          e1->time = calc_time(&timeEvents, e1->beat);
+                          e2->time = calc_time(&timeEvents, e2->beat);
+                          e1->origin = originEv;
+                          beatEvents.inorder();
+                          beatEvents.ordered = false;
+                          noteStarts.erase(find(noteStarts.begin(), noteStarts.end(), noteStarts[i]));
+                          break;
+                        }
+                      }
                     }
+                  }
+                  current = next_note(current);
                 }
             } if (containsKey(keys, 'r')) {
                 // Remove selected notes
@@ -2258,6 +2289,7 @@ struct Canvas2D {
         }
 
         if (hovered && (int)keys.size() != 0 && (int)currentEvsAtCursor.size() > 0) {
+            // We can safely assume closest exists since there are more than zero currentEvs
             ArithTree closestFunction = closest->function;
             char closestString[20];
             strcpy(closestString, closest->string_expr.c_str());
@@ -2271,6 +2303,10 @@ struct Canvas2D {
 
             if (containsKey(keys, 'q')) {
               beatEvents.inorder();
+            }
+
+            if (containsKey(keys, 'a')) {
+              closest->selected = !closest->selected;
             }
 
             if (containsKey(keys, 'j')) {
@@ -2740,7 +2776,7 @@ bool load_song(const std::string& path,
     uint32_t eventCount;
     float v;
     char expr[40];
-    int t, l;
+    int t, l, p;
     uint32_t id, den;
     uint32_t next_id = 0;
     // Read time events
@@ -2786,6 +2822,7 @@ bool load_song(const std::string& path,
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
       f.read(reinterpret_cast<char*>(&id), sizeof(uint32_t));
       f.read(reinterpret_cast<char*>(&den), sizeof(uint32_t));
+      f.read(reinterpret_cast<char*>(&p), sizeof(int));
       printf("read: %f, %s, %d, %d, %d\n", v, expr, l, t, id);
       Event* toInsert;
       if (l != 0)
@@ -2801,6 +2838,7 @@ bool load_song(const std::string& path,
       if (toInsert->den != 0)
         toInsert->primeFactors = getPrimeFactors(den);
       toInsert->time = calc_time(&canvas->timeEvents, v);
+      toInsert->profile = p;
       std::fflush(stdout);
       canvas->beatEvents.insert(toInsert);
     }
@@ -3007,6 +3045,8 @@ int main(int, char**)
     std::vector<char> keys;
     Profile profileSettings;
     float currentInFreq = 0.0f;
+    float inputFreqSum = 0.0f;
+    int inputFreqi = 0;
     STFTMag res;
     while (running) {
         if (newAudioIn) {
@@ -3019,11 +3059,20 @@ int main(int, char**)
           //  printf("%d\n", res.highBins[frames - i]);
           //}
 
-          printf("resolution: %f, current Freq: %f\n", engine.sampleRate / audioBufferSize, (engine.sampleRate * res.highBin) / audioBufferSize);
+          //printf("resolution: %f, current Freq: %f\n", engine.sampleRate / audioBufferSize, (engine.sampleRate * res.highBin) / audioBufferSize);
 
-          inputFreq = (engine.sampleRate * res.highBin) / audioBufferSize;
-
-          rerender = true;
+          float resFreq = (engine.sampleRate * res.highBin) / audioBufferSize;
+          if (!isnan(resFreq)) {
+            inputFreqSum += resFreq;
+            inputFreqi++;
+            if (inputFreqi == 3) {
+              inputFreq = inputFreqSum / 3;
+              //printf("inputFreq: %f\n", inputFreq);
+              rerender = true;
+              inputFreqi = 0;
+              inputFreqSum = 0;
+            }
+          }
 
           newAudioIn = false;
         }
