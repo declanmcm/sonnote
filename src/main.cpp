@@ -1464,6 +1464,12 @@ struct Canvas2D {
     Vec2 unsnappedHoverW{0,0};
     float anchorBeatExact = 0.0f;
 
+    Vec2 select1{0,0};
+    Vec2 select2{0,0};
+    Event* select1closest;
+    Event* select2closest;
+    bool selectFirst = true;
+
     TreeNode* getSplits() {
         return splits.get();
     }
@@ -2196,6 +2202,11 @@ struct Canvas2D {
             }
         }
 
+        if (!selectFirst) {
+          // Draw measurement
+          //renderer.addText(/**/, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
         if (hovered) {
             if (containsKey(keys, 'p'))
@@ -2217,39 +2228,38 @@ struct Canvas2D {
                 std::vector<Event*> noteStarts;
                 float firstSelectedTime = 0.0f;
                 while (current) {
-                  if (current->selected) {
-                    if (current->type == EV_NOTE_START) {
-                      printf("new note: %f, %s\n", current->beat, current->string_expr.c_str());
+                  if (current->type == EV_NOTE_START) {
+                    if (current->selected) {
+                        printf("new note: %f, %s\n", current->beat, current->string_expr.c_str());
                       if (firstSelectedTime < 1e-6)
                         firstSelectedTime = current->beat;
                       noteStarts.push_back(current);
-                    } else if (current->type == EV_NOTE_END) {
-                      for (int i = 0; i < noteStarts.size(); i++) {
-                        if (noteStarts[i]->id == current->id) {
-                          // Process note
-                          printf("adding new notes\n");
-                          char expr[20];
-                          strcpy(expr, noteStarts[i]->string_expr.c_str());
-                          Event* e1 = new Event(hoverW.x + noteStarts[i]->beat - firstSelectedTime, expr, EV_NOTE_START);
-                          Event* e2 = new Event(hoverW.x + current->beat - firstSelectedTime, EV_NOTE_END);
-                          if ((int)spareIDs.size() > 0) {
-                            e1->id = spareIDs[(int)spareIDs.size() - 1];
-                            spareIDs.pop_back();
-                            e2->id = e1->id;
-                          } else {
-                            e1->id = nextID;
-                            e2->id = nextID++;
-                          }
-                          beatEvents.insert(e1);
-                          beatEvents.insert(e2);
-                          e1->time = calc_time(&timeEvents, e1->beat);
-                          e2->time = calc_time(&timeEvents, e2->beat);
-                          e1->origin = originEv;
-                          beatEvents.inorder();
-                          beatEvents.ordered = false;
-                          noteStarts.erase(find(noteStarts.begin(), noteStarts.end(), noteStarts[i]));
-                          break;
+                    }
+                  } else if (current->type == EV_NOTE_END) {
+                    for (int i = 0; i < noteStarts.size(); i++) {
+                      if (noteStarts[i]->id == current->id) {
+                        // Process note
+                        char expr[20];
+                        strcpy(expr, noteStarts[i]->string_expr.c_str());
+                        Event* e1 = new Event(calc_beat(&timeEvents, hoverW.x) + noteStarts[i]->beat - firstSelectedTime, expr, EV_NOTE_START);
+                        Event* e2 = new Event(calc_beat(&timeEvents, hoverW.x) + current->beat - firstSelectedTime, EV_NOTE_END);
+                        if ((int)spareIDs.size() > 0) {
+                          e1->id = spareIDs[(int)spareIDs.size() - 1];
+                          spareIDs.pop_back();
+                          e2->id = e1->id;
+                        } else {
+                          e1->id = nextID;
+                          e2->id = nextID++;
                         }
+                        beatEvents.insert(e1);
+                        beatEvents.insert(e2);
+                        e1->time = calc_time(&timeEvents, e1->beat);
+                        e2->time = calc_time(&timeEvents, e2->beat);
+                        e1->origin = originEv;
+                        beatEvents.inorder();
+                        beatEvents.ordered = false;
+                        noteStarts.erase(find(noteStarts.begin(), noteStarts.end(), noteStarts[i]));
+                        break;
                       }
                     }
                   }
@@ -2275,6 +2285,17 @@ struct Canvas2D {
                     closest = currentEvsAtCursor[i];
                 }
             }
+        }
+
+        if (containsKey(keys, 'e')) {
+          if (selectFirst) {
+            select1 = hoverW;
+            select1closest = closest;
+          } else {
+            select2 = hoverW;
+            select2closest = closest;
+          }
+          selectFirst = !selectFirst;
         }
 
         // Draw origin line
