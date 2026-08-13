@@ -8,6 +8,7 @@
 #include <array>
 //#include "exprtk.hpp"
 #include "parser.hpp"
+#include "utils.hpp"
 
 // =============================================
 // ========== PUBLIC AUDIO ENGINE API ==========
@@ -70,6 +71,7 @@ struct Event {
     std::string string_expr;
     ArithTree function;
     //exprtk::expression<double> functionOld;
+    Ratio ratio;
     int height;
     Event* left;
     Event* right;

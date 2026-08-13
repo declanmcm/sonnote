@@ -19,6 +19,9 @@
 //#include "exprtk.hpp"
 #include "parser.hpp"
 #include "audio_engine.hpp"
+#include "utils.hpp"
+
+Vec2 nigger;
 
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -27,21 +30,6 @@
   #include <GL/gl.h>
   #include <GL/glu.h>
 #endif
-
-struct Vec2 {
-    float x;
-    float y;
-};
-
-struct Note {
-    float beat_on;   // inclusive
-    float beat_off;  // exclusive
-    int velocity;
-    float octave;    // fixed at first click
-    float origin;
-    bool selected;
-    int profile;
-};
 
 //exprtk::symbol_table<double> table;
 //exprtk::parser<double> parser;
@@ -297,8 +285,6 @@ float integrate_until(ArithTree function, float t1, float y) {
 }
 
 float calc_beat(EventTree* times, float noteTime) {
-  printf("\nCALC BEAT\n");
-  printf("noteTime: %f\n", noteTime);
   Event* currentTempoEv = times->get_first();
   if (currentTempoEv->type != EV_TEMPO)
     currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
@@ -314,7 +300,6 @@ float calc_beat(EventTree* times, float noteTime) {
     } else {
       if (currentTempoEv->isConstant()) {
         float thing = beats + (noteTime - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
-        printf("result: %f\n", thing);
         return thing;
       } else {
         return beats + integrate(currentTempoEv->function, currentTempoEv->time, noteTime);
@@ -330,7 +315,6 @@ float calc_time(EventTree* times, float noteBeat) {
         currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
     float beats = 0.0f;
     while (currentTempoEv) {
-        printf("tempoEv: %p\n", currentTempoEv);
         float currentTempoEvBeats = beats; // We can do this because there will always be a first tempoEv at zero
         if (next_type(currentTempoEv, EV_TEMPO)) {
             if (currentTempoEv->isConstant()) {
@@ -381,11 +365,6 @@ void calc_times(EventTree* times, EventTree* beats) {
 
     }
 }
-
-struct FocusChange {
-    float time;
-    float octave;
-};
 
 struct MidiEvent {
     double tick;
@@ -831,314 +810,6 @@ static void writeVarLen(Stream& f, uint32_t value) {
         f.put(buf[i]);
 }
 
-// Multichannel (MPE)
-bool save_midi_file_mpe(const std::string& path,
-                        const std::vector<Note>& notes,
-                        float bpm)
-{
-    if (notes.empty()) return false;
-
-    const int ticksPerQuarter = 480;
-    const double secPerBeat = 60.0 / bpm;
-    const double ticksPerSec = ticksPerQuarter / secPerBeat;
-    const int firstChannel = 1;   // skip ch 0 (Bitwig expects 1–15)
-    const int lastChannel  = 15;
-
-    // Sort by start time
-    std::vector<Note> sorted = notes;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const Note& a, const Note& b){ return a.beat_on < b.beat_on; });
-
-    // Event structure
-    struct Ev { double tick; std::vector<uint8_t> data; };
-    std::vector<Ev> events;
-
-    // Track active notes by channel
-    std::map<int, double> channelBusyUntil;
-    for (int ch = firstChannel; ch <= lastChannel; ++ch)
-        channelBusyUntil[ch] = 0.0;
-
-    for (auto& n : sorted) {
-        double startTick = n.beat_on * ticksPerQuarter;
-        double endTick   = n.beat_off * ticksPerQuarter;
-
-        // find a free channel
-        int chosen = firstChannel;
-        for (int ch = firstChannel; ch <= lastChannel; ++ch) {
-            if (channelBusyUntil[ch] <= startTick) { chosen = ch; break; }
-        }
-        channelBusyUntil[chosen] = endTick;
-
-        // convert octave → MIDI + pitch bend
-        double freq = octave_to_freq(n.octave);
-        double midiNoteFloat = 69 + 12.0 * std::log2(freq / 440.0);
-        int baseNote = std::clamp((int)std::round(midiNoteFloat), 0, 127);
-        double semitoneDiff = midiNoteFloat - baseNote;
-        int bendValue = std::clamp((int)std::round(8192 + semitoneDiff * (8192 / 2.0)), 0, 16383);
-
-        // Pitch bend event
-        events.push_back({startTick, {uint8_t(0xE0 | chosen),
-                                      uint8_t(bendValue & 0x7F),
-                                      uint8_t((bendValue >> 7) & 0x7F)}});
-        // Note on
-        events.push_back({startTick, {uint8_t(0x90 | chosen),
-                                      uint8_t(baseNote), 100}});
-        // Note off
-        events.push_back({endTick,   {uint8_t(0x80 | chosen),
-                                      uint8_t(baseNote), 0}});
-    }
-
-    // Sort all events by time
-    std::sort(events.begin(), events.end(),
-              [](auto& a, auto& b){ return a.tick < b.tick; });
-
-    // ----- Write file -----
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    // f.write("MThd", 4);
-    f.put('M'); f.put('T'); f.put('h'); f.put('d');
-    writeBE32(f, 6);
-    writeBE16(f, 1);  // format 0
-    writeBE16(f, 1);  // 1 track
-    writeBE16(f, ticksPerQuarter);
-
-    std::ostringstream track;
-    double lastTick = 0.0;
-
-    // (Optional) MPE pitch bend range setup (±2 semitones)
-    writeVarLen(track, 0);
-    for (int ch = firstChannel; ch <= lastChannel; ++ch) {
-        track.put(0xB0 | ch); track.put(0x65); track.put(0x00);
-        track.put(0xB0 | ch); track.put(0x64); track.put(0x00);
-        track.put(0xB0 | ch); track.put(0x06); track.put(0x02);
-        track.put(0xB0 | ch); track.put(0x26); track.put(0x00);
-    }
-
-    for (int ch = firstChannel; ch <= lastChannel; ++ch) {
-        track.put(0xB0 | ch); track.put(0x65); track.put(0x00);
-        track.put(0xB0 | ch); track.put(0x64); track.put(0x00);
-        track.put(0xB0 | ch); track.put(0x06); track.put(0x02);
-        track.put(0xB0 | ch); track.put(0x26); track.put(0x00);
-    }
-
-    // Write all events
-    for (auto& e : events) {
-        uint32_t delta = (uint32_t)std::max(0.0, e.tick - lastTick);
-        writeVarLen(track, delta);
-        for (uint8_t b : e.data) track.put(b);
-        lastTick = e.tick;
-    }
-
-    // End of track
-    writeVarLen(track, 0);
-    track.put(0xFF); track.put(0x2F); track.put(0x00);
-
-    std::string data = track.str();
-    // f.write("MTrk", 4);
-    f.put('M'); f.put('T'); f.put('r'); f.put('k');
-    writeBE32(f, data.size());
-    f.write(data.data(), data.size());
-    f.close();
-
-    return true;
-}
-
-// Export notes to a simple Format 0 MIDI with pitch bend for fractional octaves
-bool save_midi_file(const std::string& path,
-                    const std::vector<Note>& notes,
-                    float bpm)
-{
-    if (notes.empty()) return false;
-
-    const int ticksPerQuarter = 480;
-    const double secPerBeat = 60.0 / bpm;
-    const double ticksPerSec = ticksPerQuarter / secPerBeat;
-
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    // ===== Header =====
-    f.write("MThd", 4);
-    writeBE32(f, 6);
-    writeBE16(f, 0);  // format 0
-    writeBE16(f, 1);  // 1 track
-    writeBE16(f, ticksPerQuarter);
-
-    // ===== Track data =====
-    std::ostringstream track;
-    double lastTick = 0.0;
-
-    auto sorted = notes;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const Note& a, const Note& b){ return a.beat_on < b.beat_on; });
-
-    std::vector<MidiEvent> events;
-
-    for (auto& n : notes) {
-        double startTick = n.beat_on * ticksPerQuarter;
-        double endTick   = n.beat_off * ticksPerQuarter;
-
-        double freq = octave_to_freq(n.octave);
-        double midiNoteFloat = 69 + 12.0 * std::log2(freq / 440.0);
-        int baseNote = std::clamp((int)std::round(midiNoteFloat), 0, 127);
-
-        double semitoneDiff = midiNoteFloat - baseNote;
-        int bendValue = (int)std::round(8192 + semitoneDiff * (8192 / 2.0));
-        bendValue = std::clamp(bendValue, 0, 16383);
-
-        // Pitch bend event
-        events.push_back({ startTick, { (uint8_t)0xE0,
-                                    (uint8_t)(bendValue & 0x7F),
-                                    (uint8_t)((bendValue >> 7) & 0x7F) } });
-        // Note on
-        events.push_back({ startTick, { 0x90, (uint8_t)baseNote, 100 } });
-        // Note off
-        events.push_back({ endTick,   { 0x80, (uint8_t)baseNote, 0 } });
-    }
-
-    // Sort all events by tick
-    std::sort(events.begin(), events.end(),
-            [](auto& a, auto& b){ return a.tick < b.tick; });
-
-    // Now write all events with correct delta times
-    for (auto& e : events) {
-        uint32_t delta = (uint32_t)std::max(0.0, e.tick - lastTick);
-        writeVarLen(track, delta);
-        for (uint8_t b : e.data) track.put(b);
-        lastTick = e.tick;
-    }
-
-    // End of track
-    writeVarLen(track, 0);
-    track.put(0xFF); track.put(0x2F); track.put(0x00);
-
-    std::string data = track.str();
-    f.write("MTrk", 4);
-    writeBE32(f, data.size());
-    f.write(data.data(), data.size());
-    f.close();
-    return true;
-}
-
-bool save_midi_file_mpe_format1(const std::string& path,
-                                const std::vector<Note>& notes,
-                                float bpm)
-{
-    if (notes.empty()) return false;
-
-    const int ticksPerQuarter = 480;
-    const double secPerBeat = 60.0 / bpm;
-    const double ticksPerSec = ticksPerQuarter / secPerBeat;
-    const int firstChannel = 1;   // global ch 1
-    const int firstVoiceCh = 2;   // voice channels 2–16
-    const int lastVoiceCh  = 16;
-    const int numVoiceCh   = lastVoiceCh - firstVoiceCh + 1;
-    const int totalTracks  = 1 + numVoiceCh;  // tempo + voices
-
-    // Sort notes
-    std::vector<Note> sorted = notes;
-    std::sort(sorted.begin(), sorted.end(),
-              [](auto& a, auto& b){ return a.beat_on < b.beat_on; });
-
-    // Assign channels round-robin (simple)
-    std::vector<int> noteChannels(sorted.size());
-    for (size_t i = 0; i < sorted.size(); ++i)
-        noteChannels[i] = firstVoiceCh + (i % numVoiceCh);
-
-    // --- open file ---
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    // ===== HEADER =====
-    f.put('M'); f.put('T'); f.put('h'); f.put('d');
-    writeBE32(f, 6);
-    writeBE16(f, 1);                  // format 1
-    writeBE16(f, totalTracks);        // # tracks
-    writeBE16(f, ticksPerQuarter);
-
-    // ===== TRACK 0  (tempo/global) =====
-    {
-        std::ostringstream tr;
-        // tempo 120 BPM
-        writeVarLen(tr, 0);
-        tr.put(0xFF); tr.put(0x51); tr.put(0x03);
-        tr.put(0x07); tr.put(0xA1); tr.put(0x20);
-        // name
-        writeVarLen(tr, 0);
-        tr.put(0xFF); tr.put(0x03);
-        std::string name = "Sonnote MPE Export";
-        tr.put((uint8_t)name.size());
-        tr.write(name.data(), name.size());
-        // end
-        writeVarLen(tr, 0);
-        tr.put(0xFF); tr.put(0x2F); tr.put(0x00);
-
-        std::string data = tr.str();
-        f.put('M'); f.put('T'); f.put('r'); f.put('k');
-        writeBE32(f, data.size());
-        f.write(data.data(), data.size());
-    }
-
-    // ===== PER-CHANNEL TRACKS =====
-    for (int ch = firstVoiceCh; ch <= lastVoiceCh; ++ch) {
-        std::ostringstream tr;
-        double lastTick = 0.0;
-
-        // Set pitch-bend range ±2 semitones
-        writeVarLen(tr, 0);
-        tr.put(0xB0 | ch); tr.put(0x65); tr.put(0x00);
-        writeVarLen(tr, 0);
-        tr.put(0xB0 | ch); tr.put(0x64); tr.put(0x00);
-        writeVarLen(tr, 0);
-        tr.put(0xB0 | ch); tr.put(0x06); tr.put(0x02);
-        writeVarLen(tr, 0);
-        tr.put(0xB0 | ch); tr.put(0x26); tr.put(0x00);
-
-        // Notes for this channel
-        for (size_t i = 0; i < sorted.size(); ++i) {
-            if (noteChannels[i] != ch) continue;
-            auto& n = sorted[i];
-            double startTick = n.beat_on * ticksPerQuarter;
-            double endTick   = n.beat_off * ticksPerQuarter;
-            double freq = octave_to_freq(n.octave);
-            double midiNoteFloat = 69 + 12.0 * std::log2(freq / 440.0);
-            int baseNote = std::clamp((int)std::round(midiNoteFloat), 0, 127);
-            double semitoneDiff = midiNoteFloat - baseNote;
-            int bendValue = std::clamp(
-                (int)std::round(8192 + semitoneDiff * (8192 / 2.0)), 0, 16383);
-
-            // pitch bend
-            writeVarLen(tr, (uint32_t)std::max(0.0, startTick - lastTick));
-            tr.put(0xE0 | ch);
-            tr.put(bendValue & 0x7F);
-            tr.put((bendValue >> 7) & 0x7F);
-            lastTick = startTick;
-
-            // note on
-            writeVarLen(tr, 0);
-            tr.put(0x90 | ch); tr.put(baseNote); tr.put(100);
-
-            // note off
-            writeVarLen(tr, (uint32_t)(endTick - startTick));
-            tr.put(0x80 | ch); tr.put(baseNote); tr.put(0);
-            lastTick = endTick;
-        }
-
-        // end of track
-        writeVarLen(tr, 0);
-        tr.put(0xFF); tr.put(0x2F); tr.put(0x00);
-
-        std::string data = tr.str();
-        f.put('M'); f.put('T'); f.put('r'); f.put('k');
-        writeBE32(f, data.size());
-        f.write(data.data(), data.size());
-    }
-
-    f.close();
-    return true;
-}
-
 // --- Write TreeNode recursively ---
 void writeTreeNode(std::ofstream& f, const TreeNode& node)
 {
@@ -1275,43 +946,6 @@ bool save_song(const std::string& path,
     return true;
 }
 
-static std::vector<SeqEvent> build_events_from_notes(const std::vector<Note>& notes,
-                                                     float bpm, uint32_t sampleRate, float playhead_time)
-{
-    std::vector<Note> ns = notes;
-    std::sort(ns.begin(), ns.end(),
-              [](const Note& a, const Note& b){ return a.beat_on < b.beat_on; });
-
-    std::vector<SeqEvent> ev;
-    if (ns.empty()) return ev;
-
-    const double spb = (double)sampleRate * 60.0 / (double)bpm; // samples per beat
-
-    for (const auto& n : ns) {
-        // Map [beat_on, beat_off) → [sample_on, sample_off)
-        double bon = n.beat_on - playhead_time;
-        double boff = n.beat_off - playhead_time;
-        if (boff <= bon || boff < 0.0f) continue;
-        if (bon < 0) bon = 0.0f;
-        if (std::abs(bon - boff) < 1e-6) continue;
-
-        SeqEvent e1;
-        e1.type = 1;
-        e1.beat  = bon;
-        e1.value       = c4 * std::pow(2.0f, n.octave - 4.0f);
-        e1.profile = n.profile;
-        ev.push_back(e1);
-        SeqEvent e2;
-        e2.type = 0;
-        e2.beat = boff; // exclusive
-        e2.value = c4 * std::pow(2.0f, n.octave - 4.0f);
-        ev.push_back(e2);
-        std::fflush(stdout);
-    }
-    printf("length: %d\n", (int)ev.size());
-    return ev;
-}
-
 float parseDivisor(char* n) {
     float numerator = 0;
     float denominator = 0;
@@ -1421,6 +1055,7 @@ char buttonLabels[27][32] = {"Export WAV",
     };
 char texts[3][32] = {"file.wav", "              ", "              "};
 char originText[64];
+char measureText[64];
 
 struct Canvas2D {
     // World-space units
@@ -1437,9 +1072,7 @@ struct Canvas2D {
     float snap_y = 1.0/12.0;  // snap to semitones
 
     // Stored points in world units (beat, octave)
-    std::vector<Note> notes;
     std::unique_ptr<TreeNode> splits = std::make_unique<TreeNode>(-1);
-    std::vector<FocusChange> foci;
 
     EventTree timeEvents;
     EventTree beatEvents;
@@ -1546,11 +1179,39 @@ struct Canvas2D {
         return {wx, wy};
     }
 
-    float calculateRoot(std::vector<float> octaves) {
+    Ratio simplifyR(Ratio ratio) {
+      uint32_t gcd = gcd(ratio.num, ratio.den);
+      ratio.num = ratio.num / gcd;
+      ratio.den = ratio.den / gcd;
+      return ratio;
+    }
+
+    Ratio multiplyR(Ratio a, Ratio b) {
+      Ratio c;
+      c.num = a.num * b.num;
+      c.den = a.den * b.den;
+      return simplifyR(c);
+    }
+
+    Ratio divideR(Ratio a, Ratio b) {
+      Ratio c;
+      c.num = a.num * b.den;
+      c.den = a.den * b.num;
+      return simplifyR(c);
+    }
+
+    Ratio invertR(Ratio a) {
+      uint32_t num = a.num;
+      a.num = a.den;
+      a.den = num;
+      return a;
+    }
+
+    Ratio calculateRoot(std::vector<Ratio> octaves) {
         // Algorithm: take frequencies a, b, c etc. divide a by b, find simplest fraction with
         // Integers, divide a by the numerator (or b by the denominator), then repeat the process
         // with that new number n, c, etc. until you only have one number.
-        float root = octave_to_freq(octaves[0]);
+        Ratio root = octaves[0];
         for (int i = 1; i < (int)octaves.size(); i++) {
           float div = root / octave_to_freq(octaves[i]);
           int num, den;
@@ -1560,7 +1221,7 @@ struct Canvas2D {
         return root;
     }
 
-    float snapRootHarmonics(Vec2 unsnappedHoverW, float root) {
+    float snapRootHarmonics(Vec2 unsnappedHoverW, float root, Ratio &ratio) {
       float closest = 99999999.0;
       float current = root;
       while (true) {
@@ -1652,15 +1313,13 @@ struct Canvas2D {
     float snap_beat(const Event* node, float v, float closest) {
         if (!node) return 999999999.0f;
         float current = snap_beat(node->left, v, closest);
-        printf("Ev: %f\n", node->beat);
         if (node->type == EV_BEAT) {
-          printf("currentBeatEv: %f\n", node->beat);
             if (std::abs(node->beat - v) > std::abs(current - v)) {
                 return current;
             } else {
                 current = node->beat;
             }
-        }
+      }
         float rightVal = snap_beat(node->right, v, current);
         if (std::abs(rightVal - v) > std::abs(current - v))
           return current;
@@ -1925,11 +1584,9 @@ struct Canvas2D {
         Vec2 size     = { std::abs(nw.x2 - nw.x1), std::abs(nw.y2 - nw.y1) };
         Vec2 bottomRight = { nw.x2, nw.y1 };
 
-        printf("raw hover: %f, %f\n", hover.x, hover.y);
+        printf("\nraw hover: %f, %f\n", hover.x, hover.y);
 
-        printf("pixels per beat: %f\n", sx);
         Vec2 sxWorld = screenToWorld(topLeft, {sx, 0});
-        printf("beats at %f: %f\n", sx, calc_beat(&timeEvents, sxWorld.x));
 
         bool hovered = hover.x > 1e-06 && hover.y > 1e-06;
 
@@ -1970,21 +1627,6 @@ struct Canvas2D {
         const float selCol[3] = { 1.0, 1.0, 0.2588 };
         const float focusCol[3] = { 1.0, 0.63, 0.353 };
 
-        // Sort notes
-        std::vector<Note> sorted = notes;
-        std::vector<Note> sortedEnd = notes;
-        std::vector<float> currently_held;
-        float end = 0.0f;
-        std::sort(sorted.begin(), sorted.end(),
-                [](auto& a, auto& b){
-                    return a.beat_on < b.beat_on; });
-        std::sort(sortedEnd.begin(), sortedEnd.end(),
-                [](auto&a, auto& b){
-                    return a.beat_off < b.beat_off;});
-        if ((int)sortedEnd.size() > 0) {
-            end = sortedEnd[(int)sortedEnd.size() - 1].beat_off;
-        }
-
         // Vertical: beats at integer positions within [wA.x, wB.x]
         //int beatStart = std::max(std::floor(wA.x), (int)sorted.size() > 0 ? std::floor(sorted[0].beat_on) : -99999.0f);
         //int beatEnd   = std::min(std::ceil (wB.x), std::ceil(end));
@@ -2001,7 +1643,6 @@ struct Canvas2D {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         s0 = worldToScreen(topLeft, {0, freq_to_octave(inputFreq)});
-        printf("freq: %f, currentOc: %f\n", inputFreq, freq_to_octave(inputFreq));
         addCanvasRect(renderer, topLeft, bottomRight, topLeft.x, s0.y, bottomRight.x - topLeft.x, 1, gridCol[0], gridCol[1], gridCol[2]);
 
         // Draw loop end line
@@ -2030,7 +1671,7 @@ struct Canvas2D {
         Vec2 unsnappedHoverW = screenToWorld(topLeft, hover);
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
- 
+
         float currentFocus = -1.0f;
 
         currentEvsAtCursor.clear();
@@ -2039,18 +1680,16 @@ struct Canvas2D {
         int beatRLi = 0;
         float lastNoteEvTime = 0.0f;
         while (currentBeatEv) {
-            printf("currentBeatEv: %d, %f", currentBeatEv->type, currentBeatEv->beat);
             if (currentBeatEv->type == EV_NOTE_START || currentBeatEv->type == EV_NOTE_END) {
                 //printf("id: %d", currentBeatEv->id);
             }
             //printf("\n");
             if (currentBeatEv->type == EV_NOTE_START) {
-              printf("yo!\n");
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
                   float root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   // Snap to harmonics
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
-                    hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
+                    hoverW.y = snapRootHarmonics(unsnappedHoverW, root, snappedRatio);
                   }
                 }
                 lastNoteEvTime = currentBeatEv->time;
@@ -2077,9 +1716,7 @@ struct Canvas2D {
                 lastNoteEvTime = currentBeatEv->time;
                 //printf("noteEv: %d, ", noteEv != nullptr);
                 if (noteEv)
-                printf("isConstant: %d\n", noteEv->isConstant());
                 if (noteEv && noteEv->isConstant()) {
-                    printf("noteOc: %f\n", noteEv->function.evaluate(b, t ,0 ,0));
                     // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
                     Vec2 ap = worldToScreen(topLeft, { noteEv->time, noteEv->function.evaluate(b, t, 0, 0) });
                     //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
@@ -2202,9 +1839,20 @@ struct Canvas2D {
             }
         }
 
-        if (!selectFirst) {
+        if (selectFirst && select1closest && select2closest) {
           // Draw measurement
-          //renderer.addText(/**/, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+          printf("freqs: %f, %f\n", octave_to_freq(select2closest->function.evaluate(b, t, 0, 0)), octave_to_freq(select1closest->function.evaluate(b, t, 0, 0)));
+          int num, den;
+          float ratio = octave_to_freq(select2closest->function.evaluate(b, t, 0, 0)) / octave_to_freq(select1closest->function.evaluate(b, t, 0, 0));
+          floatToFraction(ratio, num, den);
+          printf("num, den: %d, %d\n", num, den);
+          while (num % 2 == 0 && num != 2)
+            num = num / 2;
+          while (den % 2 == 0 && den != 2)
+            den = den / 2;
+          sprintf(measureText, "%d/%d", num, den);
+          printf("%s\n", measureText);
+          renderer.addText(measureText, bottomRight.x - 150, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
@@ -2267,11 +1915,6 @@ struct Canvas2D {
                 }
             } if (containsKey(keys, 'r')) {
                 // Remove selected notes
-                std::vector<Note> newNotes;
-                for (int i = 0; i < (int)notes.size(); i++) {
-                    if (!notes[i].selected) newNotes.push_back(notes[i]);
-                }
-                notes = newNotes;
             }
         }
 
@@ -2732,14 +2375,6 @@ struct Canvas2D {
                     lengthOrigin = 0.0f;
                     if (snap_harmonics) {
                         // Check whether there's any focus at the anchor
-                        for (int i = 1; i < (int)foci.size(); i++) {
-                            // printf("foci[i - 1].time: %f, anchorW.x: %f, foci[i].time: %f\n", foci[i - 1].time, anchorW.x, foci[i].time);
-
-                            if (foci[i - 1].time <= anchorBeatExact && foci[i].time >= anchorBeatExact) {
-                                newOrigin = foci[i - 1].octave;
-                                break;
-                            }
-                        }
                     }
                     Event* e1;
                     Event* e2;
@@ -3420,7 +3055,6 @@ int main(int, char**)
         }
 
         if (buttons[8].hit) { // if export midi button is pressed
-            save_midi_file_mpe_format1("take1.mid", gBeatOctCanvas.notes, bpm);
             buttons[8].hit = false;
         }
 
