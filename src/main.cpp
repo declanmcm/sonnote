@@ -21,8 +21,6 @@
 #include "audio_engine.hpp"
 #include "utils.hpp"
 
-Vec2 nigger;
-
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
   #include <OpenGL/gl3.h>
@@ -36,6 +34,7 @@ Vec2 nigger;
 double b;
 double t;
 float inputFreq = 0.0f;
+float ref = 440.0f;
 
 const int audioBufferSize = 4096;
 float audioIn[audioBufferSize];
@@ -1025,7 +1024,7 @@ bool find_division(TreeNode* current, int split, float current_start, float curr
     }
 }
 
-char buttonLabels[27][32] = {"Export WAV", 
+char buttonLabels[28][32] = {"Export WAV", 
     "BPM:          ", 
     "Attack:          ", 
     "Decay:          ", 
@@ -1051,9 +1050,10 @@ char buttonLabels[27][32] = {"Export WAV",
     "Decay:          ", 
     "Sustain:          ", 
     "Release:          ",
-    "Gain:              "
+    "Gain:              ",
+    "Ref. Freq.:"
     };
-char texts[3][32] = {"file.wav", "              ", "              "};
+char texts[4][32] = {"file.wav", "              ", "              ", "             "};
 char originText[64];
 char measureText[64];
 
@@ -1179,44 +1179,15 @@ struct Canvas2D {
         return {wx, wy};
     }
 
-    Ratio simplifyR(Ratio ratio) {
-      uint32_t gcd = gcd(ratio.num, ratio.den);
-      ratio.num = ratio.num / gcd;
-      ratio.den = ratio.den / gcd;
-      return ratio;
-    }
-
-    Ratio multiplyR(Ratio a, Ratio b) {
-      Ratio c;
-      c.num = a.num * b.num;
-      c.den = a.den * b.den;
-      return simplifyR(c);
-    }
-
-    Ratio divideR(Ratio a, Ratio b) {
-      Ratio c;
-      c.num = a.num * b.den;
-      c.den = a.den * b.num;
-      return simplifyR(c);
-    }
-
-    Ratio invertR(Ratio a) {
-      uint32_t num = a.num;
-      a.num = a.den;
-      a.den = num;
-      return a;
-    }
-
     Ratio calculateRoot(std::vector<Ratio> octaves) {
         // Algorithm: take frequencies a, b, c etc. divide a by b, find simplest fraction with
         // Integers, divide a by the numerator (or b by the denominator), then repeat the process
         // with that new number n, c, etc. until you only have one number.
         Ratio root = octaves[0];
         for (int i = 1; i < (int)octaves.size(); i++) {
-          float div = root / octave_to_freq(octaves[i]);
-          int num, den;
-          floatToFraction(div, num, den);
-          root = root / num;
+          Ratio div = divideR(root, octaves[i]);
+          root.den *= div.num;
+          root = simplifyR(root);
         }
         return root;
     }
@@ -1234,13 +1205,10 @@ struct Canvas2D {
       return closest;
     }
 
-    float drawFundamental(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float start, float end, std::vector<Event*> currentEvs) {
+    Ratio drawFundamental(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float start, float end, std::vector<Event*> currentEvs) {
       bool allConstant = true;
-      float root = 0.0f;
-      std::fflush(stdout);
+      Ratio root{0,0};
       for  (int i = 0; i < (int)currentEvs.size(); i++) {
-        printf("value[%d]: %f\n", i, currentEvs[i]->function.evaluate(b, t, 0, 0));
-        std::fflush(stdout);
         if (!(currentEvs[i]->isConstant())) {
           allConstant = false;
         }
@@ -1248,19 +1216,19 @@ struct Canvas2D {
 
       int height = 0;
       if (allConstant) {
-        std::vector<float> octaves;
+        std::vector<Ratio> octaves;
         for (int i = 0; i < (int)currentEvs.size(); i++) {
-          octaves.push_back(currentEvs[i]->function.evaluate(b, t, 0, 0));
+          octaves.push_back(currentEvs[i]->ratio);
         }
         root = calculateRoot(octaves);
 
-        float currentFreq = root;
+        Ratio currentFreq = root;
         while (true) {
-          Vec2 a = worldToScreen(topLeft, { start, freq_to_octave(currentFreq) });
-          Vec2 b = worldToScreen(topLeft, { end, freq_to_octave(currentFreq) });
+          Vec2 a = worldToScreen(topLeft, { start, freq_to_octave(currentFreq.eval() * ref) });
+          Vec2 b = worldToScreen(topLeft, { end, freq_to_octave(currentFreq.eval() * ref) });
           if (a.y - height < 2) {
             if (height == 0) {
-              currentFreq = currentFreq + root;
+              currentFreq = addR(currentFreq, root);
               continue;
             } else
               break;
@@ -1270,7 +1238,7 @@ struct Canvas2D {
             break;
           else if (a.y > bottomRight.y)
             addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y - 1, b.x - a.x, 1, 1.0, 0.0, 1.0);
-          currentFreq = currentFreq + root;
+          currentFreq = addR(currentFreq, root);
         }
 
       }
@@ -1686,10 +1654,10 @@ struct Canvas2D {
             //printf("\n");
             if (currentBeatEv->type == EV_NOTE_START) {
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
-                  float root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   // Snap to harmonics
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
-                    hoverW.y = snapRootHarmonics(unsnappedHoverW, root, snappedRatio);
+                    //hoverW.y = snapRootHarmonics(unsnappedHoverW, root, snappedRatio);
                   }
                 }
                 lastNoteEvTime = currentBeatEv->time;
@@ -1698,9 +1666,9 @@ struct Canvas2D {
                     currentEvsAtCursor.push_back(currentBeatEv);
             } else if (currentBeatEv->type == EV_NOTE_END) {
                 if (snap_harmonics && !snap_foci && (int)noteStarts.size() > 1 && prevEv) {
-                  float root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
-                    hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
+                    //hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
                   }
                 }
                 Event* noteEv = nullptr;
@@ -2611,6 +2579,7 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[24], false, 0.7f); // Sustain 3 (value is sent as is)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[25], false, 0.0083333f); // Release 3 (value * 3 is sent)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[26], false, 0.0f); // Gain 3 (value is sent as is)
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[27], false, 0.0f, texts[3]); // Reference frequency
     engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
@@ -2630,6 +2599,7 @@ int main(int, char**)
     rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
+    rects.push_back({140.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 27.0f, F_TEXT_BOX_CW});
     // Export WAV, export MIDI, save project, load project buttons
     rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
     rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});

@@ -64,6 +64,7 @@ add_executable(app
   src/vulkan_renderer.cpp
   src/text_renderer.cpp
   src/parser.cpp
+  src/utils.cpp
 )
 
 target_include_directories(app PRIVATE
