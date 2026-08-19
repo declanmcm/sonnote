@@ -49,15 +49,17 @@ int jackProcess(jack_nframes_t nframes, void* arg)
 
     float* outL = (float*)jack_port_get_buffer(js->outL, nframes);
     float* outR = (float*)jack_port_get_buffer(js->outR, nframes);
-    float* in = (float*)jack_port_get_buffer(js->in, nframes);
-    memcpy(audioIn + audioi, in, sizeof(float) * (audioi + nframes <= audioBufferSize ? nframes : audioBufferSize - audioi));
-    if (audioi + nframes >= audioBufferSize) {
-      newAudioIn = true;
-      audioi = 0;
-    } else {
-      audioi += nframes;
-      if (audioi > audioBufferSize)
-        audioi = audioBufferSize;
+    if (engine->tunerEnabled) {
+      float* in = (float*)jack_port_get_buffer(js->in, nframes);
+      memcpy(audioIn + audioi, in, sizeof(float) * (audioi + nframes <= audioBufferSize ? nframes : audioBufferSize - audioi));
+      if (audioi + nframes >= audioBufferSize) {
+        newAudioIn = true;
+        audioi = 0;
+      } else {
+        audioi += nframes;
+        if (audioi > audioBufferSize)
+          audioi = audioBufferSize;
+      }
     }
 
     /*printf("i: %d\n", audioOuti);
@@ -189,7 +191,6 @@ void AudioEngine::stop() {
 }
 
 
-
 // ======================================================
 // ============= MESSAGE SENDING METHODS ================
 // ======================================================
@@ -279,6 +280,10 @@ void AudioEngine::resetSampleCounter(float playhead_beat, float loop_end) {
     messageQueue.push(m);
 }
 
+void AudioEngine::toggleTuner() {
+  tunerEnabled = !tunerEnabled;
+}
+
 
 
 // ======================================================
@@ -299,6 +304,7 @@ void AudioEngine::applyMessages() {
             break;
 
         case MessageType::SetFrequency:
+            ref = msg.fValue;
             break;
 
         case MessageType::SetWaveform:
@@ -466,6 +472,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
             while (currentEv &&
                 currentEv->beat <= currentBeat)
             {
+              printf("currentBeat: %f, currentEv: %f\n", currentBeat, currentEv->beat);
                 countdown--;
 
                 // Only trigger if we *passed* this beat within this audio block
@@ -483,8 +490,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                     if (voiceIndex == MAX_VOICES)
                         voiceIndex = 0; // steal voice 0
 
-                    //voiceFreqs[voiceIndex]  = &currentEv->function;
-                    voiceFreqs[voiceIndex] = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, currentEv->function.evaluate(b, t, 0, 0) - 4.0f);
+                    voiceFreqs[voiceIndex]  = ref * currentEv->ratio.eval();
                     voicePhases[voiceIndex] = 0.0f;
                     voiceIDs[voiceIndex] = currentEv->id;
                     for (int i = 0; i < 3; i++) {
@@ -781,8 +787,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_beat, float duratio
                     if (voiceIndex == MAX_VOICES)
                         voiceIndex = 0; // steal voice 0
 
-                    //voiceFreqs[voiceIndex]  = &currentEv->function;
-                    voiceFreqs[voiceIndex] = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, currentEv->function.evaluate(b, t, 0, 0) - 4.0f);
+                    voiceFreqs[voiceIndex] = ref * currentEv->ratio.eval();
                     voicePhases[voiceIndex] = 0.0f;
                     voiceIDs[voiceIndex] = currentEv->id;
                     for (int i = 0; i < 3; i++) {

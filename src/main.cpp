@@ -1,8 +1,5 @@
 #include <SDL.h>
-// #include "imgui.h"
 #include "vulkan_renderer.hpp"
-// #include "backends/imgui_impl_sdl2.h"
-// #include "backends/imgui_impl_opengl3.h"
 #include <cstdio>
 #include <vector>
 #include <algorithm>
@@ -16,7 +13,6 @@
 #include <iostream>
 #include <sndfile.h>
 #include <fftw3.h>
-//#include "exprtk.hpp"
 #include "parser.hpp"
 #include "audio_engine.hpp"
 #include "utils.hpp"
@@ -29,11 +25,9 @@
   #include <GL/glu.h>
 #endif
 
-
-//exprtk::symbol_table<double> table;
-//exprtk::parser<double> parser;
 double b;
 double t;
+bool empty = true;
 float inputFreq = 0.0f;
 float ref = 440.0f;
 
@@ -55,6 +49,14 @@ static inline float octave_to_freq(float octave) {
 
 static inline float freq_to_octave(float freq) {
   return std::log2(freq / c4) + 4.0f;
+}
+
+static inline float ratio_to_freq(Ratio ratio) {
+  return ratio.eval() * ref;
+}
+
+static inline float ratio_to_octave(Ratio ratio) {
+  return freq_to_octave(ratio_to_freq(ratio));
 }
 
 // Compute greatest common divisor
@@ -175,22 +177,11 @@ void readJump(char* jump, int& num, int& den, float& val) {
   }
 }
 
-void do_order(Event* current, Event*& previous) {
-    if (!current) return;
-    do_order(current->left, previous);
-    if (previous) {
-        previous->next_ev = current;
-        printf("LINK previous: %d, %f to next: %d, %f\n", previous->type, previous->beat, current->type, current->beat);
-    }
-    previous = current;
-    do_order(current->right, previous);
-}
-
-Event* findNote(Event* current, float value) {
-  if (value < 0.0f)
+Event* findNote(Event* current, Ratio value) {
+  if (value.den == 99999999 && value.num == 99999999)
     return nullptr;
   while (current) {
-    if (std::abs(current->function.evaluate(b, t, 0, 0) - value) < 1e-6)
+    if (subtractR(current->ratio, value).num == 0)
       return current;
     current = next_type(current, EV_NOTE_START);
   }
@@ -376,19 +367,6 @@ struct MidiEvent {
     std::vector<uint8_t> data;
 };
 
-struct TreeNode {
-    int value;
-    std::vector<std::unique_ptr<TreeNode>> children;
-
-    explicit TreeNode(int val) : value(val) {}
-
-    // Add a child and return a pointer to it
-    TreeNode* addChild(int val) {
-        children.push_back(std::make_unique<TreeNode>(val));
-        return children.back().get();
-    }
-};
-
 struct Rect {
     float x;
     float y;
@@ -436,27 +414,6 @@ constexpr int NUM_BINS = FFT_SIZE / 2 + 1;
 TextRenderer g_textRenderer;
 VulkanDeviceContext g_deviceContext; // You'd need to populate this
 VkRenderPass g_renderPass;           // Your main render pass
-
-// Recursive print function
-void printTree(const TreeNode* node, int depth = 0) {
-    if (!node) return;
-    printf("%d %d\n", depth, node->value);
-    // std::cout << std::string(depth * 2, ' ') << node->value << "\n";
-    for (const auto& child : node->children) {
-        printTree(child.get(), depth + 1);
-    }
-}
-
-TreeNode* findNode(TreeNode* node, int target) {
-    if (!node) return nullptr;
-
-    for (auto& child : node->children) {
-        if (child->value == target) {
-            return child.get();
-        }
-    }
-    return nullptr;
-}
 
 struct AudioData {
     int sampleRate = 0;
@@ -875,9 +832,30 @@ float perfectIntervals[] = {
     10.0 / 7.0
 };
 
+Ratio perfectIntervalRatios[] = {
+    {1, 1},
+    {3, 2},
+    {4, 3},
+    {5, 4},
+    {6, 5},
+    {7, 6},
+    {8, 7},
+    {9, 8},
+    {16, 15},
+    {7, 5},
+    {8, 5},
+    {5, 3},
+    {12, 7},
+    {7, 4},
+    {16, 9},
+    {15, 8},
+    {10, 7}
+};
+
 float playhead_time = 0.0f;
 float loop_end = -1.0f;
 bool play_triggered_from_space = false;
+bool tuner_triggered = false;
 
 template<typename Stream>
 static void writeVarLen(Stream& f, uint32_t value) {
@@ -888,40 +866,6 @@ static void writeVarLen(Stream& f, uint32_t value) {
         buf[pos++] = 0x80 | (value & 0x7F);
     for (int i = pos - 1; i >= 0; --i)
         f.put(buf[i]);
-}
-
-// --- Write TreeNode recursively ---
-void writeTreeNode(std::ofstream& f, const TreeNode& node)
-{
-    // Write node value
-    f.write(reinterpret_cast<const char*>(&node.value), sizeof(node.value));
-
-    // Write number of children
-    uint32_t numChildren = static_cast<uint32_t>(node.children.size());
-    f.write(reinterpret_cast<const char*>(&numChildren), sizeof(numChildren));
-
-    // Write each child recursively
-    for (const auto& child : node.children) {
-        writeTreeNode(f, *child);
-    }
-}
-
-// --- Read TreeNode recursively ---
-std::unique_ptr<TreeNode> readTreeNode(std::ifstream& f)
-{
-    int value = 0;
-    f.read(reinterpret_cast<char*>(&value), sizeof(value));
-
-    auto node = std::make_unique<TreeNode>(value);
-
-    uint32_t numChildren = 0;
-    f.read(reinterpret_cast<char*>(&numChildren), sizeof(numChildren));
-
-    for (uint32_t i = 0; i < numChildren; ++i) {
-        node->children.push_back(readTreeNode(f));
-    }
-
-    return node;
 }
 
 // --- Write binary song file ---
@@ -1049,7 +993,7 @@ float parseDivisor(char* n) {
         while (j > s) {
             denominator += ((uint8_t)n[j] - 48) * std::pow(10, power);
             j--;
-            power++; 
+            power++;
         }
         printf("res: %f\n", numerator / denominator);
         std::fflush(stdout);
@@ -1111,6 +1055,7 @@ struct Canvas2D {
 
     bool placing = false;
     Vec2 anchorW{0,0};
+    Ratio anchorR{0,0};
     Event* anchor = (Event*)malloc(sizeof(Event));
     float anchorBeat = 0.0f;
     char anchorExpr[20];
@@ -1125,6 +1070,7 @@ struct Canvas2D {
     Event* originEv = nullptr;
 
     Vec2 hoverW{0,0};
+    Ratio hoverR{1,1};
     Vec2 unsnappedHoverW{0,0};
     float anchorBeatExact = 0.0f;
 
@@ -1145,7 +1091,7 @@ struct Canvas2D {
           printf("HOW?!?\n");
           std::fflush(stdout);
         }
-        printf("val: %f\n", toInsert->function.evaluate(b, t, 0, 0));
+        printf("val: %f\n", ratio_to_octave(toInsert->ratio));
         timeEvents.insert(toInsert);
     }
 
@@ -1211,16 +1157,15 @@ struct Canvas2D {
         return root;
     }
 
-    float snapRootHarmonics(Vec2 unsnappedHoverW, float root, Ratio &ratio) {
-      (void)ratio;
-      float closest = 99999999.0;
-      float current = root;
+    Ratio snapRootHarmonics(Vec2 unsnappedHoverW, Ratio root) {
+      Ratio closest = {99999999, 1};
+      Ratio current = root;
       while (true) {
-        if (std::abs(unsnappedHoverW.y - freq_to_octave(current)) < std::abs(unsnappedHoverW.y - closest))
-          closest = freq_to_octave(current);
+        if (std::abs(unsnappedHoverW.y - ratio_to_octave(current)) < std::abs(unsnappedHoverW.y - ratio_to_octave(closest)))
+          closest = current;
         else
           break;
-        current += root;
+        current = addR(current, root);
       }
       return closest;
     }
@@ -1268,34 +1213,6 @@ struct Canvas2D {
     // Round a value to nearest step (for snapping)
     static float snap(float v, float step) {
         return step > 0.f ? std::round(v / step) * step : v;
-    }
-
-    std::vector<float> get_bar_points(TreeNode* current, float currentStart, float currentEnd) {
-        std::vector<float> list = {currentStart, currentEnd};
-        float size = std::abs(currentEnd - currentStart);
-        // printf("size: %f\n", size);
-        for (const auto& child : current->children) {
-            // These are the divisions
-            int division = child->value;
-            // printf("division: %d\n", division);
-            for (int i = 1; i < division; i++) {
-                list.push_back(currentStart + ((i * size)/(float)division));
-                // printf("point: %f\n", currentStart + ((i * size)/(float)division));
-            }
-
-            for (const auto& childChild : child->children) {
-                // These are the beat within a division
-                int beat = childChild->value;
-                // printf("New start: %f, new end: %f\n", currentStart + ((beat * size) / (float)division),  (((beat + 1) * size) /  (float)division));
-                std::vector<float> currentList = get_bar_points(childChild.get(), currentStart + ((beat * size) / (float)division), currentStart + (((beat + 1) * size) /  (float)division));
-                for (int i = 0; i < (int)currentList.size(); i++) {
-                    list.push_back(currentList[i]);
-                }
-                // printf("\n");
-                // std::fflush(stdout);
-            }
-        }
-        return list;
     }
 
     float snap_beat(const Event* node, float v, float closest) {
@@ -1460,13 +1377,14 @@ struct Canvas2D {
       std::vector<float> simultaneous;
       while (current && std::abs(current->beat - beatEv->beat) < 1e-6) {
         if (current->type == EV_NOTE_START || current->type == EV_NOTE_END) {
-          if (current->function.root)
-            simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          if (!(current->ratio.num == 0 && current->ratio.den == 0))
+            simultaneous.push_back(ratio_to_octave(current->ratio));
           else {
             Event* evi = prev(current);
-            while (evi->id != current->id)
+            while (evi && evi->id != current->id)
               evi = prev(evi);
-            simultaneous.push_back(evi->function.evaluate(b, t, 0, 0));
+            if (evi)
+              simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
         }
         current = prev(current);
@@ -1474,13 +1392,14 @@ struct Canvas2D {
       current = beatEv;
       while (current && std::abs(current->beat - beatEv->beat) < 1e-6) {
         if (current->type == EV_NOTE_START || current->type == EV_NOTE_END) {
-          if (current->function.root)
-            simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          if (!(current->ratio.num == 0 && current->ratio.den == 0))
+            simultaneous.push_back(ratio_to_octave(current->ratio));
           else {
             Event* evi = prev(current);
             while (evi->id != current->id)
               evi = prev(evi);
-            simultaneous.push_back(evi->function.evaluate(b, t, 0, 0));
+            if (evi)
+              simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
         }
         current = next(current);
@@ -1535,8 +1454,6 @@ struct Canvas2D {
     }
 
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
-        // Reserve a canvas rect
-        // Vec2 avail = ImGui::GetContentRegionAvail();
         Vec2 topLeft  = { nw.x1, nw.y2};
         Vec2 bottomRight = { nw.x2, nw.y1 };
 
@@ -1576,13 +1493,6 @@ struct Canvas2D {
         //const float selCol[3] = { 1.0, 1.0, 0.2588 };
         //const float focusCol[3] = { 1.0, 0.63, 0.353 };
 
-        // Vertical: beats at integer positions within [wA.x, wB.x]
-        //int beatStart = std::max(std::floor(wA.x), (int)sorted.size() > 0 ? std::floor(sorted[0].beat_on) : -99999.0f);
-        //int beatEnd   = std::min(std::ceil (wB.x), std::ceil(end));
-        //std::vector<int> divisions;
-        //divisions.push_back(std::abs(beatEnd - beatStart));
-        //drawRhythmLines(splits.get(), sorted, sortedEnd, beatStart, beatEnd, divisions, currently_held, renderer, topLeft, bottomRight);
-
         // Draw playhead
         Vec2 s0 = worldToScreen(topLeft, { playhead_time, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, playheadCol[0], playheadCol[1], playheadCol[2]);
@@ -1595,8 +1505,6 @@ struct Canvas2D {
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
         Vec2 w = screenToWorld(topLeft, hover);
-        //printf("timeEvents:");
-        //timeEvents.inorder();
         float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
 
@@ -1617,7 +1525,10 @@ struct Canvas2D {
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
 
-        float currentFocus = -1.0f;
+        if (empty)
+          hoverR = {1, 1};
+
+        Ratio focusAtCursor = {99999999, 99999999};
 
         currentEvsAtCursor.clear();
         std::vector<Event*> noteStarts;
@@ -1625,16 +1536,12 @@ struct Canvas2D {
         int beatRLi = 0;
         float lastNoteEvTime = 0.0f;
         while (currentBeatEv) {
-            if (currentBeatEv->type == EV_NOTE_START || currentBeatEv->type == EV_NOTE_END) {
-                //printf("id: %d", currentBeatEv->id);
-            }
-            //printf("\n");
             if (currentBeatEv->type == EV_NOTE_START) {
                 if (snap_harmonics && !snap_foci && !noteStarts.empty() && prevEv && (int)noteStarts.size() > 1) {
-                  //Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   // Snap to harmonics
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
-                    //hoverW.y = snapRootHarmonics(unsnappedHoverW, root, snappedRatio);
+                    hoverR = snapRootHarmonics(unsnappedHoverW, root);
                   }
                 }
                 lastNoteEvTime = currentBeatEv->time;
@@ -1643,9 +1550,9 @@ struct Canvas2D {
                     currentEvsAtCursor.push_back(currentBeatEv);
             } else if (currentBeatEv->type == EV_NOTE_END) {
                 if (snap_harmonics && !snap_foci && (int)noteStarts.size() > 1 && prevEv) {
-                  //Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
-                    //hoverW.y = snapRootHarmonics(unsnappedHoverW, root);
+                    hoverR = snapRootHarmonics(unsnappedHoverW, root);
                   }
                 }
                 Event* noteEv = nullptr;
@@ -1660,22 +1567,19 @@ struct Canvas2D {
                 }
                 lastNoteEvTime = currentBeatEv->time;
                 //printf("noteEv: %d, ", noteEv != nullptr);
-                if (noteEv)
-                if (noteEv && noteEv->isConstant()) {
-                    // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
-                    Vec2 ap = worldToScreen(topLeft, { noteEv->time, noteEv->function.evaluate(b, t, 0, 0) });
-                    //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
-                    Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, noteEv->function.evaluate(b, t, 0, 0) });
-                    // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
-                    addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
-                    if (std::abs(std::floor(noteEv->beat) - noteEv->beat) < 1e-6) {
-                      // Draw rhythm line at note start
-                      addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
-                    }
-                    if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
-                      // Draw rhythm line at note end
-                      addCanvasRect(renderer, topLeft, bottomRight, bp.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
-                    }
+                // printf("value: %f, times: %f, %f!\n", noteEv->function.evaluate(b, t, 0, 0), noteEv->time, currentBeatEv->time);
+                Vec2 ap = worldToScreen(topLeft, { noteEv->time, freq_to_octave(ratio_to_freq(noteEv->ratio))});
+                //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
+                Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, freq_to_octave(ratio_to_freq(noteEv->ratio))});
+                // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
+                addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
+                if (std::abs(std::floor(noteEv->beat) - noteEv->beat) < 1e-6) {
+                  // Draw rhythm line at note start
+                  addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
+                }
+                if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
+                  // Draw rhythm line at note end
+                  addCanvasRect(renderer, topLeft, bottomRight, bp.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
                 }
             } else if (currentBeatEv->type == EV_BEAT) {
               draw_rhythm_line(currentBeatEv, renderer, topLeft, bottomRight);
@@ -1714,12 +1618,12 @@ struct Canvas2D {
         // Draw foci and related harmonics, snap to focus
         while (currentBeatEv) {
           // for each focus event
-          if (prevEv && prevEv->isConstant() && std::abs(prevEv->function.evaluate(b, t, 0, 0)) > 1e-6) {
+          if (prevEv && !(prevEv->ratio.num == 0 && prevEv->ratio.den == 0)) {
             // foci at 0 represent a break -> no drawing or snapping
 
             // Draw focus line from previous to current focus draw_events
-            Vec2 ap = worldToScreen(topLeft, { prevEv->time, prevEv->function.evaluate(b, t, 0, 0) });
-            Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, prevEv->function.evaluate(b, t, 0, 0) });
+            Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(prevEv->ratio) });
+            Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(prevEv->ratio) });
             printf("a: {%f, %f}, b: {%f, %f}\n", ap.x, ap.y, bp.x, bp.y);
             addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 1.0, 0.63, 0.353);
 
@@ -1729,33 +1633,35 @@ struct Canvas2D {
               Vec2 bottom = screenToWorld(topLeft, bottomRight);
               Vec2 top = screenToWorld(topLeft, topLeft);
 
-              float current = prevEv->function.evaluate(b, t, 0, 0);
-              while (current > bottom.y)
-                current = current - 1;
+              Ratio current = prevEv->ratio;
+              while (ratio_to_octave(current) > bottom.y)
+                current = divideR(current, {2, 1});
 
-              float closest = 999999999.0f;
+              Ratio closest = {999999999,1};
               bool hoveredWithin = unsnappedHoverW.x >= prevEv->time && \
                                unsnappedHoverW.x < currentBeatEv->time;
-              while (current < top.y) {
-                for (int i = 0; i < (int)sizeof(perfectIntervals) / 4; i++) {
-                  float currentAdded = current + std::log2(perfectIntervals[i]);
-                  if (currentAdded > top.y || currentAdded < bottom.y)
+              while (ratio_to_octave(current) < top.y) {
+                for (int i = 0; i < 17; i++) {
+                  Ratio currentAdded = multiplyR(current, perfectIntervalRatios[i]);
+                  //printf("currentInterval: %d/%d, currentAdded: %d/%d\n", perfectIntervalRatios[i].num, perfectIntervalRatios[i].den, currentAdded.num, currentAdded.den);
+                  if (ratio_to_octave(currentAdded) > top.y || ratio_to_octave(currentAdded) < bottom.y)
                     continue;
-                  if (std::abs(currentAdded - prevEv->function.evaluate(b, t, 0, 0)) > 1e-6) {
-                    Vec2 ap = worldToScreen(topLeft, { prevEv->time, currentAdded});
-                    Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, currentAdded});
+                  Ratio diff = subtractR(currentAdded, prevEv->ratio);
+                  if (!(diff.num == 0 && diff.den == 0)) {
+                    Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
+                    Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
                     addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, 0.73, 0.45882, 0.807);
                   }
                   if (hoveredWithin && \
-                      std::abs(unsnappedHoverW.y - currentAdded) < std::abs(unsnappedHoverW.y - closest)) {
+                      std::abs(unsnappedHoverW.y - ratio_to_octave(currentAdded)) < std::abs(unsnappedHoverW.y - ratio_to_octave(closest))) {
                     closest = currentAdded;
                   }
                 }
-                current += 1;
+                current = simplifyR(multiplyR(current, {2, 1}));
               }
-              if (hoveredWithin && closest < 999999.0f) {
-                currentFocus = prevEv->function.evaluate(b, t, 0, 0);
-                hoverW.y = closest;
+              if (hoveredWithin && closest.num != 999999999) {
+                focusAtCursor = prevEv->ratio;
+                hoverR = closest;
               }
             }
           } else {
@@ -1786,22 +1692,16 @@ struct Canvas2D {
 
         if (selectFirst && select1closest && select2closest) {
           // Draw measurement
-          printf("freqs: %f, %f\n", octave_to_freq(select2closest->function.evaluate(b, t, 0, 0)), octave_to_freq(select1closest->function.evaluate(b, t, 0, 0)));
-          int num, den;
-          float ratio = octave_to_freq(select2closest->function.evaluate(b, t, 0, 0)) / octave_to_freq(select1closest->function.evaluate(b, t, 0, 0));
-          floatToFraction(ratio, num, den);
-          printf("num, den: %d, %d\n", num, den);
-          while (num % 2 == 0 && num != 2)
-            num = num / 2;
-          while (den % 2 == 0 && den != 2)
-            den = den / 2;
-          sprintf(measureText, "%d/%d", num, den);
+          Ratio rat = simplifyR(divideR(select2closest->ratio, select1closest->ratio));
+          sprintf(measureText, "%d/%d", rat.num, rat.den);
           printf("%s\n", measureText);
           renderer.addText(measureText, bottomRight.x - 150, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
         if (hovered) {
+            if (containsKey(keys, 't'))
+              tuner_triggered = true;
             if (containsKey(keys, 'p'))
                 playhead_time = hoverW.x;
             if (containsKey(keys, 'u')) {
@@ -1868,8 +1768,8 @@ struct Canvas2D {
             float dist = 999999999999.0f;
             b = currentBeat;
             for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
-                if (std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y) < dist) {
-                    dist = std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y);
+                if (std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y) < dist) {
+                    dist = std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y);
                     closest = currentEvsAtCursor[i];
                 }
             }
@@ -1888,18 +1788,16 @@ struct Canvas2D {
 
         // Draw origin line
         if (closest && closest->origin) {
-          Vec2 ap = worldToScreen(topLeft, { closest->time, closest->function.evaluate(b, t, 0, 0)});
-          Vec2 bp = worldToScreen(topLeft, { closest->time + 2, closest->origin->function.evaluate(b, t, 0, 0)});
+          Vec2 ap = worldToScreen(topLeft, { closest->time, ratio_to_octave(closest->ratio)});
+          Vec2 bp = worldToScreen(topLeft, { closest->time + 2, ratio_to_octave(closest->origin->ratio)});
           addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, 2, bp.y - ap.y, 0.2235, 0.729, 0.196);
-          int num, den;
-          floatToFraction(octave_to_freq(closest->function.evaluate(b, t, 0, 0)) / octave_to_freq(closest->origin->function.evaluate(b, t, 0, 0)), num, den);
-          sprintf(originText, "%d/%d", num, den);
+          Ratio rat = simplifyR(divideR(closest->ratio, closest->origin->ratio));
+          sprintf(originText, "%d/%d", rat.num, rat.den);
           renderer.addText(originText, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
         if (hovered && (int)keys.size() != 0 && (int)currentEvsAtCursor.size() > 0) {
             // We can safely assume closest exists since there are more than zero currentEvs
-            ArithTree closestFunction = closest->function;
             char closestString[20];
             strcpy(closestString, closest->string_expr.c_str());
             printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
@@ -1920,25 +1818,15 @@ struct Canvas2D {
 
             if (containsKey(keys, 'j')) {
               // jump the frequency by the amount contained in jump (char* passed to draw())
-              float val = 0.0f;
-              int num, den;
+              uint32_t num, den;
               num = den = 0;
               char * current = jump;
               bool noVal;
               num = getNum(current, noVal);
               current += 1;
               den = getNum(current, noVal);
-              //readJump(jump, num, den, val);
-              printf("num: %d, den: %d\n", num, den);
-              printf("old function: %f\n", closest->function.evaluate(b, t, 0, 0));
-              char toUpdate[20];
-              if (val < 1e-6) {
-                sprintf(toUpdate, "%f", freq_to_octave(octave_to_freq(closest->function.evaluate(b, t, 0, 0)) * (float)num / (float)den));
-              } else {
-                sprintf(toUpdate, "%f", freq_to_octave(octave_to_freq(closest->function.evaluate(b, t, 0, 0)) * val));
-              }
-              closest->update_function(toUpdate);
-              printf("new Function: %f\n", closest->function.evaluate(b, t, 0, 0));
+              Ratio jump = {num, den};
+              closest->ratio = simplifyR(multiplyR(jump, closest->ratio));
             }
 
             if (containsKey(keys, 's')) {
@@ -2032,8 +1920,8 @@ struct Canvas2D {
                   // We can do this because a focus' string_expr is always
                   // copied from the note that was right clicked on
                   if (current->string_expr == closest->string_expr) {
-                    if (previous && previous->function.evaluate(b, t, 0, 0) != 0.0f) {
-                      current->update_function("0");
+                    if (previous && !(previous->ratio.num == 0 && previous->ratio.den == 0)) {
+                      current->ratio = {0, 0};
                     } else {
                       beatEvents.remove(current->beat, current->id);
                       deleted = true;
@@ -2051,14 +1939,14 @@ struct Canvas2D {
                   if (std::abs(hoverW.x - closest->time) < std::abs(hoverW.x - noteEnd->time)) {
                     anchorW.x = noteEnd->time;
                     b = noteEnd->beat;
-                    anchorW.y = closestFunction.evaluate(b, t, 0, 0);
+                    anchorR = closest->ratio;
                     strcpy(anchorExpr, closestString);
                     anchorBeat = noteEnd->beat;
                     anchorBeatExact= noteEnd->beat;
                   } else {
                     anchorW.x = closest->time;
                     b = closest->beat;
-                    anchorW.y = closestFunction.evaluate(b, t, 0, 0);
+                    anchorR = closest->ratio;
                     strcpy(anchorExpr, closestString);
                     anchorBeat = closest->beat;
                     anchorBeatExact= closest->beat;
@@ -2088,11 +1976,13 @@ struct Canvas2D {
             b = currentBeat;
             Event* closest;
             for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
-                if (std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y) < dist) {
-                    dist = std::abs(currentEvsAtCursor[i]->function.evaluate(b, t, 0, 0) - hoverW.y);
+                if (std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y) < dist) {
+                    dist = std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y);
                     closest = currentEvsAtCursor[i];
                 }
             }
+
+            printf("closest beat: %f\n", closest->beat);
 
             Event* closestOff = next(closest);
             while (!(closestOff->type == EV_NOTE_END && closestOff->id == closest->id))
@@ -2112,13 +2002,14 @@ struct Canvas2D {
             Event* prev = nullptr;
             Event* prevPrev = nullptr;
             while (currentFocus) {
+              printf("yo\n");
                 if (currentFocus->beat > currentBeat && !insertEv) {
                     // This index is the next focus change after the click point
                     insert = fociLength;
                     insertEv = currentFocus;
-                    if (currentFocus->isConstant() && currentFocus->function.evaluate(b, t, 0, 0) == 0.0f)
+                    if (currentFocus->ratio.num == 0 && currentFocus->ratio.den == 0)
                         focus_after = false;
-                    if (fociLength <= 1 || (prevPrev && prevPrev->isConstant() && prevPrev->function.evaluate(b, t, 0, 0) == 0.0f))
+                    if (fociLength <= 1 || (prevPrev && prevPrev->ratio.num == 0 && prevPrev->ratio.den == 0))
                         focus_before = false;
                 } else if (!next_type(currentFocus, EV_FOCUS) && !insertEv) {
                     insert = fociLength + 1;
@@ -2136,18 +2027,15 @@ struct Canvas2D {
             std::fflush(stdout);
             bool removePrevious = false;
             bool removeNext = false;
-            std::string previousOctave;
-            if (insert > 0 && prev)
-                previousOctave = prev->string_expr;
-            Event* start = new Event(0.0f, "0", EV_FOCUS);
-            Event* end = new Event(0.0f, "0", EV_FOCUS);
+            Event* start = new Event(0.0f, EV_FOCUS, {0, 0});
+            Event* end = new Event(0.0f, EV_FOCUS, {0, 0});
 
-            if (prevPrev && prevPrev->isConstant())
+            /*if (prevPrev && prevPrev->isConstant())
                 printf("prevPrev: %f, %f\n", prevPrev->beat, prevPrev->function.evaluate(b, t, 0, 0));
             if (prev && prev->isConstant())
                 printf("prev: %f, %f\n", prev->beat, prev->function.evaluate(b, t, 0, 0));
             if (insertEv && insertEv->isConstant())
-                printf("current: %f, %f\n", insertEv->beat, insertEv->function.evaluate(b, t, 0, 0));
+                printf("current: %f, %f\n", insertEv->beat, insertEv->function.evaluate(b, t, 0, 0));*/
 
             bool no_prev_or_closest_starts_after_prev = !prev || closest->beat > prev->beat;
             bool no_foci_or_after_foci_or_closest_ends_before_next = fociLength == 0 || insert == fociLength || (insertEv && closestOff->beat < insertEv->beat);
@@ -2155,29 +2043,29 @@ struct Canvas2D {
             bool closest_starts_at_prev = insert > 0 && prev && std::abs(closest->beat - prev->beat) < 1e-6;
             bool closest_ends_at_next_type_change = insert > 0 && insert <= fociLength - 1 && std::abs(closestOff->beat - insertEv->beat) < 1e-6;
 
-            printf("npcsap: %d, cebnfc: %d, csatpfc: %d, ceanfc: %d, fb: %d, fa: %d\n", no_prev_or_closest_starts_after_prev, no_foci_or_after_foci_or_closest_ends_before_next, closest_starts_at_prev, closest_ends_at_next_type_change, focus_before, focus_after);
+            printf("npcsap: %d, cebnfc: %d, csap: %d, ceantc: %d, fb: %d, fa: %d\n", no_prev_or_closest_starts_after_prev, no_foci_or_after_foci_or_closest_ends_before_next, closest_starts_at_prev, closest_ends_at_next_type_change, focus_before, focus_after);
 
             if (no_prev_or_closest_starts_after_prev) {
                 printf("A");
                 start->beat = closest->beat;
                 start->time = calc_time(&timeEvents, start->beat);
-                start->update_function(closest->string_expr);
+                start->ratio = closest->ratio;
             } else if (closest_starts_at_prev) {
                 printf("B");
-                prev->update_function(closest->string_expr);
+                prev->ratio = closest->ratio;
             } else if (!focus_before) { // From here onwards we will not extend to the start of closest
                 if (insert > 1 && closest->beat < prevPrev->beat) {
                     // Change insert - 2 to be the current frequency instead of zero, then delete insert - 1
-                    prevPrev->update_function(closest->string_expr);
+                    prevPrev->ratio = closest->ratio;
                     removePrevious = true;
                 } else {
                     prev->beat = closest->beat;
                     prev->time = calc_time(&timeEvents, prev->beat);
-                    prev->update_function(closest->string_expr);
+                    prev->ratio = closest->ratio;
                 }
             } else { // focus_before is true
                 if (prevPrev && !closest->string_expr.empty() && !prevPrev->string_expr.empty() && prevPrev->string_expr != closest->string_expr) {
-                    prev->update_function(closest->string_expr);
+                    prev->ratio = closest->ratio;
                 } else {
                     printf("IT\n");
                     removePrevious = true;
@@ -2189,7 +2077,7 @@ struct Canvas2D {
                 end->beat = closestOff->beat;
                 end->time = calc_time(&timeEvents, end->beat);
                 if (insert > 0 && prev) {
-                    end->update_function(previousOctave);
+                    end->ratio = prev->ratio;
                 }
             } else if (closest_ends_at_next_type_change) {
                 printf("D");
@@ -2200,7 +2088,7 @@ struct Canvas2D {
                 } else {
                     insertEv->beat = closestOff->beat;
                     insertEv->time = calc_time(&timeEvents, insertEv->beat);
-                    insertEv->update_function("0");
+                    insertEv->ratio = {0, 0};
                 }
             } else {
                 if (insertEv) {
@@ -2217,7 +2105,7 @@ struct Canvas2D {
                 }
             }
 
-            bool focus_exists = insert > 0 && (!prev || (start->beat == prev->beat && start->string_expr == prev->string_expr)) && end->beat == currentFocus->beat && end->string_expr == currentFocus->string_expr;
+            bool focus_exists = insert > 0 && (!prev || (start->beat == prev->beat && start->ratio.eval() - prev->ratio.eval() < 1e-6)) && end->beat == currentFocus->beat && end->ratio.eval() - currentFocus->ratio.eval() < 1e-6;
             // printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave));
             if (!focus_exists) {
                 if (removePrevious)
@@ -2245,7 +2133,7 @@ struct Canvas2D {
         if (placing && hovered) {
             float x0w = anchorW.x;
             float x1w = hoverW.x;
-            float y   = anchorW.y; // octave fixed from first click
+            float y   = ratio_to_octave(anchorR); // octave fixed from first click
             Vec2 a = worldToScreen(topLeft, { x0w, y });
             Vec2 b = worldToScreen(topLeft, { x1w, y });
 
@@ -2259,11 +2147,12 @@ struct Canvas2D {
 
         // Light-red preview dot (when Snap is on and hovered)
         if ((snap_to_grid || snap_harmonics) && hovered) {
-            Vec2 sd = worldToScreen(topLeft, hoverW);
-            // dl->AddCircleFilled(sd, 5.0f, IM_COL32(255,120,120,200));
+            Vec2 pos = {hoverW.x, ratio_to_octave(hoverR)};
+            printf("pos: %f, %f\n", pos.x, pos.y);
+            Vec2 sd = worldToScreen(topLeft, pos);
             renderer.addCircle(sd.x, sd.y, 5.0f, 0.8f, 0.2f, 0.2f);
             if (dragging) {
-                float y   = hoverW.y;
+                float y   = ratio_to_octave(hoverR);
                 // rectangle from (x0w,y±h/2) to (x1w,y±h/2); choose fixed height (e.g., 0.6 octave)
                 float halfH = 1.0/24.0;
                 Vec2 a = worldToScreen(topLeft, { calc_time(&timeEvents, currently_dragged.x), y + halfH });
@@ -2280,11 +2169,11 @@ struct Canvas2D {
         if (hovered && click == 1) {
             if (!placing) {
                 // First click: start note (snap already applied above)
-                if (currentFocus != -1.0f)
-                  originEv = findNote(beatEvents.get_first(), currentFocus);
+                if (focusAtCursor.num != 99999999 && focusAtCursor.den != 99999999)
+                  originEv = findNote(beatEvents.get_first(), focusAtCursor);
                 if (dragging) {
                   sprintf(anchorExpr, "%f", hoverW.y);
-                  Event* e1 = new Event(currently_dragged.x, anchorExpr, EV_NOTE_START);
+                  Event* e1 = new Event(currently_dragged.x, EV_NOTE_START, hoverR);
                   Event* e2 = new Event(currently_dragged.y, EV_NOTE_END);
                   if ((int)spareIDs.size() > 0) {
                     e1->id = spareIDs[(int)spareIDs.size() - 1];
@@ -2303,9 +2192,11 @@ struct Canvas2D {
                   beatEvents.ordered = false;
                   dragging = false;
                   originEv = nullptr;
+                  empty = false;
                 } else {
                   placing = true;
                   anchorW = hoverW;
+                  anchorR = hoverR;
                   sprintf(anchorExpr, "%f", hoverW.y);
                   printf("anchorExpr: %s\n", anchorExpr);
                   anchorBeat = snappedBeat;
@@ -2321,10 +2212,10 @@ struct Canvas2D {
                     Event* e1;
                     Event* e2;
                     if (anchorBeat > snappedBeat) {
-                        e1 = new Event(snappedBeat, anchorExpr, EV_NOTE_START);
+                        e1 = new Event(snappedBeat, EV_NOTE_START, anchorR);
                         e2 = new Event(anchorBeat, EV_NOTE_END);
                     } else if (snappedBeat >= anchorBeat) {
-                        e1 = new Event(anchorBeat, anchorExpr, EV_NOTE_START);
+                        e1 = new Event(anchorBeat, EV_NOTE_START, anchorR);
                         e2 = new Event(snappedBeat, EV_NOTE_END);
                     }
                     if ((int)spareIDs.size() > 0) {
@@ -2341,11 +2232,12 @@ struct Canvas2D {
                     e1->time = calc_time(&timeEvents, e1->beat);
                     e2->time = calc_time(&timeEvents, e2->beat);
                     e1->origin = originEv;
-                    printf("e1->function: %f\n", e1->function.evaluate(b, t, 0, 0));
+                    //printf("e1->function: %f\n", e1->function.evaluate(b, t, 0, 0));
                     printf("e1 time: %f, e2 time: %f\n", e1->time, e2->time);
                     beatEvents.inorder();
                     beatEvents.ordered = false;
                     originEv = nullptr;
+                    empty = false;
                 }
                 placing = false;
             }
@@ -2408,6 +2300,8 @@ bool load_song(const std::string& path,
 
     f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
     printf("beatEvents size: %d\n", eventCount);
+    if (eventCount > 0)
+      empty = false;
     std::fflush(stdout);
 
     for (int i = 0; i < (int)eventCount; i++) {
@@ -2511,6 +2405,7 @@ int main(int, char**)
     // Add tempo change event at beginning
     gBeatOctCanvas.setBPM("110", 0.0f);
 
+    engine.setFrequency(440.0f);
     engine.setGain(0.4f);
     engine.setWaveform(WaveformType::Sine);
     int waveType = 0;
@@ -2646,9 +2541,9 @@ int main(int, char**)
     while (running) {
         if (newAudioIn) {
           std::vector<float> v(audioIn, audioIn + audioBufferSize);
-          computeSTFT_FFTWn(v, pendingAudioOut, engine.sampleRate, audioBufferSize);
+          computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
           //memcpy(pendingAudioOut, audioIn, audioBufferSize);
-          printf("IN: %f, AUDIOOUT:%f\n", audioIn[0], pendingAudioOut[0]);
+          //printf("IN: %f, AUDIOOUT:%f\n", audioIn[0], pendingAudioOut[0]);
           //printf("frames: %d\n", frames);
           //printf("bin: %d\n", res.highBins[0]);
           //for (int i = 20; i >= 0; i--) {
@@ -2974,6 +2869,11 @@ int main(int, char**)
                 engine.setPlayState(false);
             }
             playing = !playing;
+        }
+
+        if (tuner_triggered) {
+          engine.toggleTuner();
+          tuner_triggered = false;
         }
 
         if (buttons[0].hit) {

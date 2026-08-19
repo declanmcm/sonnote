@@ -78,7 +78,6 @@ struct Event {
     int height;
     Event* left;
     Event* right;
-    Event* next_ev;
     Event* parent;
     float beatL;
     float beatR;
@@ -97,7 +96,19 @@ struct Event {
         left = NULL;
         right = NULL;
         parent = NULL;
-        next_ev = NULL;
+        origin = NULL;
+        height = 0;
+        id = 0;
+        den = 0;
+        profile = 0;
+        selected = false;
+        ratio = {0,0};
+    }
+
+    Event(float b, int t, Ratio r) : beat(b), ratio(r), type(t) {
+        left = NULL;
+        right = NULL;
+        parent = NULL;
         origin = NULL;
         height = 0;
         id = 0;
@@ -118,13 +129,13 @@ struct Event {
         left = NULL;
         right = NULL;
         parent = NULL;
-        next_ev = NULL;
         origin = NULL;
         height = 0;
         id = 0;
         den = 0;
         profile = 0;
         selected = false;
+        ratio = {0,0};
     }
 
     void update_function(const std::string& expr_string) {
@@ -544,10 +555,13 @@ public:
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
     void setProfile(Profile& p, int n);
+    void toggleTuner();
     Profile getProfile(int n);
 
     Profile profiles[10];
     float sampleRate = 48000.0f;
+
+    bool tunerEnabled = false;
 
     // Replace the entire event list
     // (Audio thread uses double-buffer swap)
@@ -568,6 +582,7 @@ private:
 
     // Current DSP parameters (updated via messages)
     float gain = 0.5f;
+    float ref = 440.0f;
     bool isPlaying = false;
     WaveformType waveform = WaveformType::Sine;
     ADSRParams adsr;
