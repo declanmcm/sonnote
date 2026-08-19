@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sched.h>
 #include <iostream>
+#include <fftw3.h>
 #include "audio_engine.hpp"
 
 struct AudioEngine::JackState {
@@ -36,6 +37,7 @@ AudioEngine::~AudioEngine() {
 
 bool freeze = false;
 
+
 // ======================================================
 // ================== JACK CALLBACK ======================
 // ======================================================
@@ -52,9 +54,32 @@ int jackProcess(jack_nframes_t nframes, void* arg)
     if (audioi + nframes >= audioBufferSize) {
       newAudioIn = true;
       audioi = 0;
-    } else
+    } else {
       audioi += nframes;
-    frames = nframes;
+      if (audioi > audioBufferSize)
+        audioi = audioBufferSize;
+    }
+
+    /*printf("i: %d\n", audioOuti);
+    if (newAudioOut && audioOuti == audioBufferSize) {
+      printf("reset\n");
+      memcpy(audioOut, pendingAudioOut, audioBufferSize);
+      audioOuti = 0;
+      newAudioOut = false;
+    }
+
+    if (audioOuti != audioBufferSize) {
+      int len = (audioOuti + nframes > audioBufferSize) ? audioBufferSize - audioOuti : nframes;
+      memcpy(outL, audioOut + audioOuti, len);
+      memcpy(outR, audioOut + audioOuti, len);
+      //printf("audioOuti: %d, nframes: %d, len: %d, outL: %f, audioOut:%f\n", audioOuti, nframes, len, outL[0], audioOut[audioOuti]);
+      audioOuti += len;
+      if (audioOuti > audioBufferSize) {
+        audioOuti = audioBufferSize;
+      }
+    } else {
+      printf("none\n");
+    }*/
 
     engine->processAudio(outL, outR, nframes);
 
@@ -188,10 +213,10 @@ void AudioEngine::setPlayState(bool on) {
     out = fopen("out.csv", "w+");
   else
     out = nullptr;
-    Message m;
-    m.type = MessageType::SetPlayState;
-    m.bValue = on;
-    messageQueue.push(m);
+  Message m;
+  m.type = MessageType::SetPlayState;
+  m.bValue = on;
+  messageQueue.push(m);
 }
 
 void AudioEngine::setWaveform(WaveformType w) {
@@ -238,16 +263,17 @@ void AudioEngine::setEvents(EventTree* newEvents) {
 void AudioEngine::resetSampleCounter(float playhead_beat, float loop_end) {
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
-    sampleCounter = std::floor(playhead_beat * samplesPerBeat);
-    if (sampleCounter == -1)
+    int newSc = std::floor(playhead_beat * samplesPerBeat);
+    if (newSc == -1)
       sampleCounter = 0;
-    printf("sampleCounter: %d\n", sampleCounter);
+    else
+      sampleCounter = newSc;
+    printf("sampleCounter: %ld\n", sampleCounter);
     loopStartSamples = sampleCounter;
     if (loop_end < 0)
       loopEndSamples = 0;
     else
       loopEndSamples = std::floor(loop_end * samplesPerBeat);
-    printf("sc: %d\n", sampleCounter);
     Message m;
     m.type = MessageType::ResetSampleCounter;
     messageQueue.push(m);
@@ -270,6 +296,9 @@ void AudioEngine::applyMessages() {
 
         case MessageType::SetPlayState:
             isPlaying = msg.bValue;
+            break;
+
+        case MessageType::SetFrequency:
             break;
 
         case MessageType::SetWaveform:
@@ -380,9 +409,6 @@ inline float generateSample(WaveformType wf, float phase) {
 //     return envelope;
 // }
 
-
-
-
 // ======================================================
 // ==================== PROCESS AUDIO ====================
 // ======================================================
@@ -411,7 +437,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
-    printf("%d\n", sampleCounter);
+    printf("%ld\n", sampleCounter);
     for (uint32_t in = 0; in < frames; ++in)
     {
         float s = 0.0f;
@@ -652,7 +678,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_beat, float duratio
     }
 
     const uint64_t totalFrames = (uint64_t)(durationSeconds * sampleRate);
-    printf("duration: %f, totalFrames: %d, sampleRate: %f\n", durationSeconds, totalFrames, sampleRate);
+    printf("duration: %f, totalFrames: %ld, sampleRate: %f\n", durationSeconds, totalFrames, sampleRate);
 
     std::vector<float> buffer(totalFrames * 2, 0.0f);
 
@@ -673,7 +699,6 @@ bool AudioEngine::exportWav(const char* path, float playhead_beat, float duratio
     float divisorSmooth = 1.0f;
 
     // Event sequencing (beat-based)
-    size_t evIndex = 0;
     double secondsPerBeat  = 60.0 / tempoBPM;
     double samplesPerBeat  = secondsPerBeat * sampleRate;
 
@@ -709,7 +734,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_beat, float duratio
       printf("no event\n");
     }
 
-    printf("totalFrames: %d\n", totalFrames);
+    printf("totalFrames: %ld\n", totalFrames);
 
     for (uint64_t in = 0; in < totalFrames; ++in)
     {
@@ -743,7 +768,7 @@ bool AudioEngine::exportWav(const char* path, float playhead_beat, float duratio
 
                 // Only trigger if we *passed* this beat within this audio block
                 if (currentEv->type == EV_NOTE_START) {
-                    printf("note on: %d at %d\n", currentEv->id, in);
+                    printf("note on: %d at %ld\n", currentEv->id, in);
 
                     // NOTE ON
                     size_t voiceIndex = MAX_VOICES;

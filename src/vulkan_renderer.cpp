@@ -376,7 +376,6 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
 
     if (!vertices.empty() && (int)vertices.size() >= 12) {
         VkBuffer tempBuffers[] = {vertexBuffer};
-        VkDeviceSize tempOffsets[] = {0};
         vkCmdBindVertexBuffers(cmd, 0, 1, tempBuffers, offsets);
         vkCmdDraw(cmd, 12, 1, 0, 0);
     }

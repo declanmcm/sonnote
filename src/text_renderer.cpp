@@ -276,6 +276,7 @@ VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyInd
 }
 
 void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, uint32_t queueFamilyIndex) {
+    (void)device; (void)queueFamilyIndex;
     vkEndCommandBuffer(commandBuffer);
 
     VkSubmitInfo submitInfo{};
@@ -288,16 +289,16 @@ void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQue
     vkQueueWaitIdle(queue); // Wait for execution to finish
 
     // 2. Clean up the temporary command pool/buffer
-    VkCommandPool commandPool;
+    //VkCommandPool commandPool;
     // NOTE: This assumes we can retrieve the pool from the buffer, which isn't standard.
     // A clean implementation would pass the pool explicitly or manage a pool internally.
     // For simplicity and to avoid modifying the header, we'll recreate the pool from
     // the family index and assume we can allocate/free the buffer manually.
     
-    VkCommandPoolCreateInfo poolInfo{};
+    /*VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = queueFamilyIndex;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT; 
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;*/ 
     
     // NOTE: This is slightly incorrect as it re-creates the pool but doesn't destroy the one created in beginSingleTimeCommands.
     // The safest way is to manage a static/member CommandPool, but since we cannot modify the TextRenderer class easily,
@@ -308,6 +309,7 @@ void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQue
 
 // Utility for image layout transitions
 void transitionImageLayout(VkCommandBuffer commandBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    (void)format;
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = oldLayout;
@@ -726,6 +728,7 @@ void TextRenderer::createVertexBuffers(const VulkanDeviceContext& context) {
 }
 
 void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, VkImage image, VkDeviceMemory imageMemory, uint32_t width, uint32_t height, const std::string& path) {
+    (void)imageMemory;
     // 1. Load image data from disk
     int texWidth, texHeight, texChannels;
     // Assuming your atlas is R8G8B8A8, 4 channels.
@@ -765,7 +768,7 @@ void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, Vk
     // 3. Copy image data to staging buffer
     // memcpy(data, pixels.data(), imageSize);
     memcpy(data, pixels, imageSize);
-    printf("size: %d\n", imageSize);
+    printf("size: %ld\n", imageSize);
     vkUnmapMemory(context.device, stagingBufferMemory);
     
     // 4. Record and submit commands
@@ -820,6 +823,7 @@ void TextRenderer::beginTextSubmission() {
 }
 
 void TextRenderer::addText(const std::string& text, float x, float y, float scale, const glm::vec4& color, VkCommandBuffer commandBuffer) {
+    (void)commandBuffer;
     float cursorX = x;
     float cursorY = y;
     float lineHeight = 1.0f * scale; // Adjust this based on your font's line height metric

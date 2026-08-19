@@ -32,7 +32,7 @@ struct Operand {
   ArithNode* node;
   Operand* next;
 
-  Operand(ArithNode* n, char op) : node(n), operation(op) {
+  Operand(ArithNode* n, char op) : operation(op), node(n) {
     next = nullptr;
   }
 };

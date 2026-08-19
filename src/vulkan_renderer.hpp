@@ -346,7 +346,7 @@ private:
 
     VkPipelineLayout spectroPipelineLayout{};
     VkPipeline spectroPipeline{};
-    
+
     // Transient quad buffer
     VkBuffer transientQuadBuffer = VK_NULL_HANDLE;
     VkDeviceMemory transientQuadMemory = VK_NULL_HANDLE;
@@ -359,10 +359,11 @@ private:
         VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
         VkDebugUtilsMessageTypeFlagsEXT             messageType,
         const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-        void*                                       pUserData) 
+        void*                                       pUserData)
     {
-        std::cerr << "Vulkan Validation: " << pCallbackData->pMessage << std::endl;
-        return VK_FALSE;
+      (void)messageSeverity; (void)messageType; (void)pUserData;
+      std::cerr << "Vulkan Validation: " << pCallbackData->pMessage << std::endl;
+      return VK_FALSE;
     }
 
     // Private helper functions
@@ -387,7 +388,7 @@ private:
         const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
         createInfo.enabledLayerCount = 1;
         createInfo.ppEnabledLayerNames = validationLayers;
-        
+
         VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
         debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
         debugCreateInfo.messageSeverity =
@@ -398,7 +399,7 @@ private:
             VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-        debugCreateInfo.pfnUserCallback = debugCallback;  // you write this function
+        debugCreateInfo.pfnUserCallback = debugCallback;
 
         createInfo.pNext = &debugCreateInfo;
 

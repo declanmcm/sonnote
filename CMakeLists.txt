@@ -99,6 +99,6 @@ endif()
 
 # Optional: stricter warnings for your code (not third-party)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -g)
+  target_compile_options(app PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Wno-stringop-overflow -g)
 endif()
 

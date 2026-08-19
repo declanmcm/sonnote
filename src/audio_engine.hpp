@@ -52,11 +52,14 @@ struct SeqEvent {
 extern double b;
 extern double t;
 
-extern const int audioBufferSize;
+extern const uint16_t audioBufferSize;
 extern float audioIn[4096];
+extern float audioOut[4096];
+extern float pendingAudioOut[4096];
+extern int audioOuti;
 extern int audioi;
-extern int frames;
 extern bool newAudioIn;
+extern bool newAudioOut;
 
 #define EV_TEMPO 2
 #define EV_NOTE_START 1
@@ -90,7 +93,7 @@ struct Event {
     int type;
     uint32_t id;
 
-    Event(float b, int t) : beat(b), type(t), function() {
+    Event(float b, int t) : beat(b), function(), type(t) {
         left = NULL;
         right = NULL;
         parent = NULL;
@@ -103,7 +106,7 @@ struct Event {
         selected = false;
     }
 
-    Event(float b, const std::string& expr_string, int t) : beat(b), height(1), type(t), function(const_cast<char*>(expr_string.c_str())) {
+    Event(float b, const std::string& expr_string, int t) : beat(b), function(const_cast<char*>(expr_string.c_str())), height(1), type(t) {
         //functionOld.register_symbol_table(table);
         //if (!parser.compile(expr_string, functionOld)) {
         //    throw std::runtime_error("Expression parse error: " + parser.error());
@@ -134,7 +137,7 @@ struct Event {
     }
 
     bool isConstant() {
-        for (int i = 0; i < string_expr.length(); i++) {
+        for (int i = 0; i < (int)string_expr.length(); i++) {
             if (string_expr[i] == 't' || string_expr[i] == 'b') {
               printf("t or b found\n");
               std::fflush(stdout);
@@ -298,7 +301,6 @@ private:
         if (!node)
             return value;
 
-        Event* newNode;
         if (value->beat < node->beat) {
           if (node->left) {
             node->left = insert(node->left, value);
@@ -334,7 +336,7 @@ private:
     }
 
     // ---------- Delete ----------
-    Event* remove(Event* node, float key, int id) {
+    Event* remove(Event* node, float key, uint32_t id) {
         if (!node) return nullptr;
 
         if (key < node->beat)
@@ -406,7 +408,7 @@ private:
     void inorder(const Event* node, uint8_t level) const {
         if (!node) return;
         inorder(node->left, level + 1);
-        printf("%f, %d (%d) - %s", node->beat, node->id, level, node->string_expr);
+        printf("%f, %d (%d) - %s", node->beat, node->id, level, node->string_expr.c_str());
         printf("\n");
         // std::cout << node->beat << "(" << level << ") ";
         inorder(node->right, level + 1);
