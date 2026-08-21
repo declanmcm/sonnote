@@ -812,7 +812,7 @@ inline GrayImage buildSpectrogramTextureR8(
 
 
 float perfectIntervals[] = {
-    1.0, 
+    1.0,
     3.0 / 2.0, // Fifth
     4.0 / 3.0, // Fourth
     5.0 / 4.0, // Major third
@@ -882,7 +882,7 @@ bool save_song(const std::string& path,
     char expr[40];
     float v;
     int t, l, p;
-    uint32_t id, den;
+    uint32_t id, numB, denB, numR, denR;
     uint32_t eventCount = 0;
 
     // Write number of time events followed by time Events in order
@@ -933,13 +933,19 @@ bool save_song(const std::string& path,
       t = current->type;
       p = current->profile;
       id = current->id;
-      den = current->den;
+      numB = current->num;
+      denB = current->den;
+      numR = current->ratio.num;
+      denR = current->ratio.den;
       f.write(reinterpret_cast<const char*>(&v), sizeof(float));
       f.write(reinterpret_cast<const char*>(&l), sizeof(int));
       f.write(expr, l);
       f.write(reinterpret_cast<const char*>(&t), sizeof(int));
       f.write(reinterpret_cast<const char*>(&id), sizeof(uint32_t));
-      f.write(reinterpret_cast<const char*>(&den), sizeof(uint32_t));
+      f.write(reinterpret_cast<const char*>(&numR), sizeof(uint32_t));
+      f.write(reinterpret_cast<const char*>(&denR), sizeof(uint32_t));
+      f.write(reinterpret_cast<const char*>(&numB), sizeof(uint32_t));
+      f.write(reinterpret_cast<const char*>(&denB), sizeof(uint32_t));
       f.write(reinterpret_cast<const char*>(&p), sizeof(int));
       current = next(current);
     }
@@ -1003,36 +1009,36 @@ float parseDivisor(char* n) {
     }
 }
 
-char buttonLabels[28][32] = {"Export WAV", 
-    "BPM:          ", 
-    "Attack:          ", 
-    "Decay:          ", 
-    "Gain:            ", 
+char buttonLabels[28][32] = {"Export WAV",
+    "BPM:          ",
+    "Attack:          ",
+    "Decay:          ",
+    "Gain:            ",
     "Wav name:",
-    "Jump size:", 
-    "Split size:", 
-    "Export MIDI", 
-    "Save project", 
-    "Load project", 
-    "Change wave", 
-    "Sustain:          ", 
-    "Release:          ", 
+    "Jump size:",
+    "Split size:",
+    "Export MIDI",
+    "Save project",
+    "Load project",
+    "Change wave",
+    "Sustain:          ",
+    "Release:          ",
     "OSC1: Sine",
     "OSC2: Sine",
-    "Attack:          ", 
-    "Decay:          ", 
-    "Sustain:          ", 
+    "Attack:          ",
+    "Decay:          ",
+    "Sustain:          ",
     "Release:          ",
     "Gain:              ",
     "OSC3: Sine",
-    "Attack:          ", 
-    "Decay:          ", 
-    "Sustain:          ", 
+    "Attack:          ",
+    "Decay:          ",
+    "Sustain:          ",
     "Release:          ",
     "Gain:              ",
     "Ref. Freq.:"
     };
-char texts[4][32] = {"file.wav", "              ", "              ", "             "};
+char texts[4][32] = {"file.wav", "              ", "              ", "440"};
 char originText[64];
 char measureText[64];
 
@@ -1189,8 +1195,8 @@ struct Canvas2D {
 
         Ratio currentFreq = root;
         while (true) {
-          Vec2 a = worldToScreen(topLeft, { start, freq_to_octave(currentFreq.eval() * ref) });
-          Vec2 b = worldToScreen(topLeft, { end, freq_to_octave(currentFreq.eval() * ref) });
+          Vec2 a = worldToScreen(topLeft, { start, ratio_to_octave(currentFreq) });
+          Vec2 b = worldToScreen(topLeft, { end, ratio_to_octave(currentFreq) });
           if (a.y - height < 2) {
             if (height == 0) {
               currentFreq = addR(currentFreq, root);
@@ -1201,8 +1207,9 @@ struct Canvas2D {
           height = a.y;
           if (a.y > topLeft.y)
             break;
-          else if (a.y > bottomRight.y)
+          else if (a.y > bottomRight.y) {
             addCanvasRect(renderer, topLeft, bottomRight, a.x, a.y - 1, b.x - a.x, 1, 1.0, 0.0, 1.0);
+          }
           currentFreq = addR(currentFreq, root);
         }
 
@@ -1551,6 +1558,7 @@ struct Canvas2D {
             } else if (currentBeatEv->type == EV_NOTE_END) {
                 if (snap_harmonics && !snap_foci && (int)noteStarts.size() > 1 && prevEv) {
                   Ratio root = drawFundamental(renderer, topLeft, bottomRight, lastNoteEvTime, currentBeatEv->time, noteStarts);
+                  printf("root ratio: %d/%d\n", root.num, root.den);
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
                     hoverR = snapRootHarmonics(unsnappedHoverW, root);
                   }
@@ -1693,7 +1701,17 @@ struct Canvas2D {
         if (selectFirst && select1closest && select2closest) {
           // Draw measurement
           Ratio rat = simplifyR(divideR(select2closest->ratio, select1closest->ratio));
-          sprintf(measureText, "%d/%d", rat.num, rat.den);
+          Ratio simpRat = rat;
+          if (simpRat.num > simpRat.den) {
+            while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
+              simpRat.num /= 2;
+            }
+          } else {
+            while (simpRat.den % 2 == 0 && simpRat.den > simpRat.num * 2) {
+              simpRat.den /= 2;
+            }
+          }
+          sprintf(measureText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
           printf("%s\n", measureText);
           renderer.addText(measureText, bottomRight.x - 150, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
@@ -1719,12 +1737,12 @@ struct Canvas2D {
                 // Paste notes
                 Event* current = beatEvents.get_first();
                 std::vector<Event*> noteStarts;
-                float firstSelectedTime = 0.0f;
+                float firstSelectedTime = -1.0f;
                 while (current) {
                   if (current->type == EV_NOTE_START) {
                     if (current->selected) {
                         printf("new note: %f, %s\n", current->beat, current->string_expr.c_str());
-                      if (firstSelectedTime < 1e-6)
+                      if (std::abs(firstSelectedTime + 1.0f) < 1e-6)
                         firstSelectedTime = current->beat;
                       noteStarts.push_back(current);
                     }
@@ -1732,9 +1750,7 @@ struct Canvas2D {
                     for (int i = 0; i < (int)noteStarts.size(); i++) {
                       if (noteStarts[i]->id == current->id) {
                         // Process note
-                        char expr[20];
-                        strcpy(expr, noteStarts[i]->string_expr.c_str());
-                        Event* e1 = new Event(calc_beat(&timeEvents, hoverW.x) + noteStarts[i]->beat - firstSelectedTime, expr, EV_NOTE_START);
+                        Event* e1 = new Event(calc_beat(&timeEvents, hoverW.x) + noteStarts[i]->beat - firstSelectedTime, EV_NOTE_START, noteStarts[i]->ratio);
                         Event* e2 = new Event(calc_beat(&timeEvents, hoverW.x) + current->beat - firstSelectedTime, EV_NOTE_END);
                         if ((int)spareIDs.size() > 0) {
                           e1->id = spareIDs[(int)spareIDs.size() - 1];
@@ -1792,7 +1808,17 @@ struct Canvas2D {
           Vec2 bp = worldToScreen(topLeft, { closest->time + 2, ratio_to_octave(closest->origin->ratio)});
           addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, 2, bp.y - ap.y, 0.2235, 0.729, 0.196);
           Ratio rat = simplifyR(divideR(closest->ratio, closest->origin->ratio));
-          sprintf(originText, "%d/%d", rat.num, rat.den);
+          Ratio simpRat = rat;
+          if (simpRat.num > simpRat.den) {
+            while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
+              simpRat.num /= 2;
+            }
+          } else {
+            while (simpRat.den % 2 == 0 && simpRat.den > simpRat.num * 2) {
+              simpRat.den /= 2;
+            }
+          }
+          sprintf(originText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
           renderer.addText(originText, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
@@ -1835,19 +1861,19 @@ struct Canvas2D {
               else {
                 printf("START");
                 // Insert divisions between split_start and snappedBeat
-                if (std::abs(snappedBeat - split_start) > 1e-6) {
-                  float start = split_start;
-                  float end = snappedBeat;
-                  if (snappedBeat < split_start) {
+                if (std::abs(snappedBeat - split_start) > 1e-6) { // If split_start has been defined
+                  float start = split_start; // between split_start
+                  float end = snappedBeat; // and snappedBeat
+                  if (snappedBeat < split_start) { // Or vice versa
                     start = snappedBeat;
                     end = split_start;
                   }
-                  float inc = (end - start) / std::atof(split);
-                  float i = start + inc;
+                  float inc = (end - start) / std::atof(split); // Split into split divisions
+                  float i = start + inc; // The first division will be at start + inc
                   int num = 1;
                   int den = std::atoi(split);
-                  Event* ev1 = findBeatEv(beatEvents.root, start);
-                  Event* ev2 = findBeatEv(beatEvents.root, end);
+                  Event* ev1 = findBeatEv(beatEvents.root, start); // Find events at start
+                  Event* ev2 = findBeatEv(beatEvents.root, end); // and end
                   int offset = std::floor(end) - std::floor(start);
                   int startNum, startDen, endNum, endDen;
                   startNum = endNum = 0;
@@ -1919,7 +1945,7 @@ struct Canvas2D {
                 while (current) {
                   // We can do this because a focus' string_expr is always
                   // copied from the note that was right clicked on
-                  if (current->string_expr == closest->string_expr) {
+                  if (current->ratio.num == closest->ratio.num && current->ratio.den == closest->ratio.den) {
                     if (previous && !(previous->ratio.num == 0 && previous->ratio.den == 0)) {
                       current->ratio = {0, 0};
                     } else {
@@ -2267,7 +2293,7 @@ bool load_song(const std::string& path,
     float v;
     char expr[40];
     int t, l, p;
-    uint32_t id, den;
+    uint32_t id, numR, denR, numB, denB;
     uint32_t next_id = 0;
     // Read time events
 
@@ -2313,7 +2339,10 @@ bool load_song(const std::string& path,
       expr[l] = '\0';
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
       f.read(reinterpret_cast<char*>(&id), sizeof(uint32_t));
-      f.read(reinterpret_cast<char*>(&den), sizeof(uint32_t));
+      f.read(reinterpret_cast<char*>(&numR), sizeof(uint32_t));
+      f.read(reinterpret_cast<char*>(&denR), sizeof(uint32_t));
+      f.read(reinterpret_cast<char*>(&numB), sizeof(uint32_t));
+      f.read(reinterpret_cast<char*>(&denB), sizeof(uint32_t));
       f.read(reinterpret_cast<char*>(&p), sizeof(int));
       printf("read: %f, %s, %d, %d, %d\n", v, expr, l, t, id);
       Event* toInsert;
@@ -2326,9 +2355,11 @@ bool load_song(const std::string& path,
       if (toInsert->id > next_id) {
         next_id = toInsert->id;
       }
-      toInsert->den = den;
+      toInsert->num = numB;
+      toInsert->den = denB;
       if (toInsert->den != 0)
-        toInsert->primeFactors = getPrimeFactors(den);
+        toInsert->primeFactors = getPrimeFactors(denB);
+      toInsert->ratio = {numR, denR};
       toInsert->time = calc_time(&canvas->timeEvents, v);
       toInsert->profile = p;
       std::fflush(stdout);
@@ -2606,7 +2637,7 @@ int main(int, char**)
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
-                            if (i == 5 || i == 6 || i == 7) selected = i;
+                            if (i == 5 || i == 6 || i == 7 || i == 27) selected = i;
                             buttons[i].hit = true;
                             if (i != 14 && i != 15 && i != 21)
                                 buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
@@ -2805,19 +2836,27 @@ int main(int, char**)
                     buttons[26].value = profileSettings.settings[2].gain;
                 }
                 if (selected != -1) {
-                    if (key >= 32 && key <= 126 && (selected == 5 || selected == 6 || selected == 7) && strlen(buttons[selected].text) <= 14) {
-                        if (buttons[selected].text[0] == ' ') {
-                            sprintf(buttons[selected].text, "%c", key); 
-                        } else
-                            sprintf(buttons[selected].text, "%s%c", buttons[selected].text, key);
+                  if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
+                    if (buttons[selected].text[0] == ' ')
+                      sprintf(buttons[selected].text, "%c", key);
+                    else
+                      sprintf(buttons[selected].text, "%s%c", buttons[selected].text, key);
+                    if (selected == 27) {
+                      ref = atof(buttons[selected].text);
+                      engine.setFrequency(ref);
                     }
-                    else if ((key == 127 || key == 8) && strlen(buttons[selected].text) > 0) {
-                        buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
-                    }
+                  }
+                  else if ((key == 127 || key == 8) && strlen(buttons[selected].text) > 0) {
+                      buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
+                      if (selected == 27 && strlen(buttons[selected].text) > 0) {
+                        ref = atof(buttons[selected].text);
+                        engine.setFrequency(ref);
+                      }
+                  }
                 } else {
-                    if (key == 'n') {
-                        engine.toggleFreeze();
-                    }
+                  if (key == 'n') {
+                      engine.toggleFreeze();
+                  }
                 }
             }
             if (e.type == SDL_KEYUP) {
@@ -2830,7 +2869,7 @@ int main(int, char**)
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
                 float nx = e.button.x  / (float)dw;
                 float ny = ((float)dh - e.button.y) / (float)dh;
-                
+
                 if (nx >= nw.x1 && nx <= nw.x2 && ny >= nw.y1 && ny <= nw.y2) {
                     hover.x = nx;
                     hover.y = ny;
@@ -3046,7 +3085,6 @@ int main(int, char**)
             Vec2 screenHover;
             screenHover.x = hover.x * dw;
             screenHover.y = hover.y * dh;
-
             gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
 
             renderer.updateVertexData();

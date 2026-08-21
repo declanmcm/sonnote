@@ -443,7 +443,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 
     const double secondsPerBeat = 60.0 / tempoBPM;
     const double samplesPerBeat = secondsPerBeat * sampleRate;
-    printf("%ld\n", sampleCounter);
+    //printf("%ld\n", sampleCounter);
     for (uint32_t in = 0; in < frames; ++in)
     {
         float s = 0.0f;
