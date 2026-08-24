@@ -66,6 +66,7 @@ extern bool newAudioOut;
 #define EV_NOTE_END 0
 #define EV_BEAT 3
 #define EV_FOCUS 4
+#define EV_PERC 5
 
 // Using AVL tree
 struct Event {
@@ -478,6 +479,8 @@ struct OSCSettings  {
     float sustain;
     float release;
     float gain;
+    float freq;
+    float hold;
 };
 
 struct Profile {

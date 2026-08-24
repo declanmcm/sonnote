@@ -404,6 +404,7 @@ struct CurrentBox {
 #define F_BUTTON_CW 4
 #define F_SLIDER_CW 5
 #define F_TEXT_BOX_CW 6
+#define F_TEXT_BOXL_CW 7
 
 #define NW_HEIGHT 0.75f
 
@@ -1009,7 +1010,7 @@ float parseDivisor(char* n) {
     }
 }
 
-char buttonLabels[28][32] = {"Export WAV",
+char buttonLabels[34][32] = {"Export WAV",
     "BPM:          ",
     "Attack:          ",
     "Decay:          ",
@@ -1036,9 +1037,15 @@ char buttonLabels[28][32] = {"Export WAV",
     "Sustain:          ",
     "Release:          ",
     "Gain:              ",
-    "Ref. Freq.:"
+    "Ref. Freq.:",
+    "Hold:            ",
+    "Freq:         ",
+    "Hold:            ",
+    "Freq:       ",
+    "Hold:            ",
+    "Freq:       "
     };
-char texts[4][32] = {"file.wav", "              ", "              ", "440"};
+char texts[7][32] = {"file.wav", "              ", "              ", "440", "30", "30", "30"};
 char originText[64];
 char measureText[64];
 
@@ -1085,6 +1092,7 @@ struct Canvas2D {
     Event* select1closest;
     Event* select2closest;
     bool selectFirst = true;
+    bool noteMode = true;
 
     Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
 
@@ -1113,13 +1121,9 @@ struct Canvas2D {
 
         if (x < topLeft.x) {
             x = topLeft.x;
-        } else if (x > bottomRight.x) {
-            x = bottomRight.x;
         }
         if (y < bottomRight.y) {
             y = bottomRight.y;
-        } else if (y > topLeft.y) {
-            y = topLeft.y;
         }
         if (x + w > bottomRight.x) {
             w = std::abs(x  - bottomRight.x);
@@ -1134,6 +1138,16 @@ struct Canvas2D {
         if (w != 0 && h != 0) {
             renderer.addRect(x, y, w, h, r, g, b);
         }
+    }
+
+    void addCanvasPercBlip(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float x, float y, float t, float l, float r, float g, float b) {
+      float xp = x;
+      float yp = y;
+
+      if (x + l < topLeft.x || x > bottomRight.x || y + (t / 2) < bottomRight.y || y > topLeft.y)
+        return;
+
+      renderer.addPercBlip(xp, yp, t, l, r, g, b);
     }
 
     // Transform: world -> screen
@@ -1393,6 +1407,8 @@ struct Canvas2D {
             if (evi)
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
+        } else if (current->type == EV_PERC) {
+          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
         }
         current = prev(current);
       }
@@ -1408,6 +1424,8 @@ struct Canvas2D {
             if (evi)
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
+        } else if (current->type == EV_PERC) {
+          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
         }
         current = next(current);
       }
@@ -1525,7 +1543,7 @@ struct Canvas2D {
 
         Event* currentBeatEv = beatEvents.get_first();
 
-        while (currentBeatEv && (currentBeatEv->type != EV_NOTE_START && currentBeatEv->type != EV_BEAT))
+        while (currentBeatEv && (currentBeatEv->type != EV_NOTE_START && currentBeatEv->type != EV_BEAT && currentBeatEv->type != EV_PERC))
           currentBeatEv = next(currentBeatEv);
 
         Vec2 unsnappedHoverW = screenToWorld(topLeft, hover);
@@ -1591,6 +1609,13 @@ struct Canvas2D {
                 }
             } else if (currentBeatEv->type == EV_BEAT) {
               draw_rhythm_line(currentBeatEv, renderer, topLeft, bottomRight);
+            } else if (currentBeatEv->type == EV_PERC) {
+              Vec2 ap = worldToScreen(topLeft, { currentBeatEv->time, currentBeatEv->function.evaluate(b, t, 0, 0)});
+              addCanvasPercBlip(renderer, topLeft, bottomRight, ap.x, ap.y, 4, 4, 0.83, 0.275, 0.165);
+              if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
+                // Draw rhythm line at note start
+                addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
+              }
             }
             if (prevEv) {
               // Catch up with regular beat lines
@@ -1820,6 +1845,10 @@ struct Canvas2D {
           }
           sprintf(originText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
           renderer.addText(originText, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+
+        if (containsKey(keys, 'm')) {
+          noteMode = !noteMode;
         }
 
         if (hovered && (int)keys.size() != 0 && (int)currentEvsAtCursor.size() > 0) {
@@ -2174,6 +2203,8 @@ struct Canvas2D {
         // Light-red preview dot (when Snap is on and hovered)
         if ((snap_to_grid || snap_harmonics) && hovered) {
             Vec2 pos = {hoverW.x, ratio_to_octave(hoverR)};
+            if (!noteMode)
+              pos.y = hoverW.y;
             printf("pos: %f, %f\n", pos.x, pos.y);
             Vec2 sd = worldToScreen(topLeft, pos);
             renderer.addCircle(sd.x, sd.y, 5.0f, 0.8f, 0.2f, 0.2f);
@@ -2193,6 +2224,7 @@ struct Canvas2D {
 
         // Input: left-click to place/finish
         if (hovered && click == 1) {
+          if (noteMode) {
             if (!placing) {
                 // First click: start note (snap already applied above)
                 if (focusAtCursor.num != 99999999 && focusAtCursor.den != 99999999)
@@ -2267,6 +2299,14 @@ struct Canvas2D {
                 }
                 placing = false;
             }
+          } else {
+            char expr[20];
+            sprintf(expr, "%f", hoverW.y);
+            Event* ev = new Event(snappedBeat, expr, EV_PERC);
+            ev->time = calc_time(&timeEvents, ev->beat);
+            beatEvents.insert(ev);
+            beatEvents.inorder();
+          }
         }
     }
 };
@@ -2402,6 +2442,15 @@ bool load_song(const std::string& path,
 }
 
 
+void drawMargin(VulkanRenderer& renderer, CurrentBox& nw) {
+  Vec2 topLeft  = { nw.x1, nw.y2};
+  Vec2 bottomRight = { nw.x2, nw.y1 };
+  float w = bottomRight.y;
+  renderer.addRect(0, topLeft.y, bottomRight.x - topLeft.x + 2 * w, w, 0.07f, 0.07f, 0.07f);
+  renderer.addRect(0, 0, bottomRight.x - topLeft.x + 2 * w, w, 0.07f, 0.07f, 0.07f);
+  renderer.addRect(0, 0, w, topLeft.y - bottomRight.y + 2 * w, 0.07f, 0.07f, 0.07f);
+  renderer.addRect(bottomRight.x, 0, w, topLeft.y - bottomRight.y + 2 * w, 0.07f, 0.07f, 0.07f);
+}
 
 static Canvas2D gBeatOctCanvas;
 
@@ -2476,9 +2525,15 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[25], false, 0.0083333f); // Release 3 (value * 3 is sent)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[26], false, 0.0f); // Gain 3 (value is sent as is)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[27], false, 0.0f, texts[3]); // Reference frequency
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[28], false, 0.1f); // OSC1 Hold
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[29], false, 0.1f, texts[4]); // Freq
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[30], false, 0.1f); // OSC2 Hold
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[31], false, 0.1f, texts[5]); // Freq
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[32], false, 0.1f); // OSC3 Hold
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[33], false, 0.1f, texts[6]); // Freq
     engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
-    rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
+    //rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
     rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
@@ -2491,11 +2546,13 @@ int main(int, char**)
     rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
     rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
     rects.push_back({140.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 28.0f, F_SLIDER_CW});
+    rects.push_back({190.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 29.0f, F_TEXT_BOXL_CW});
     // WAV Save name, jump size, split size text boxes
     rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
     rects.push_back({10.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
-    rects.push_back({140.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 27.0f, F_TEXT_BOX_CW});
+    rects.push_back({140.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 27.0f, F_TEXT_BOX_CW});
     // Export WAV, export MIDI, save project, load project buttons
     rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
     rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});
@@ -2509,6 +2566,8 @@ int main(int, char**)
     rects.push_back({270.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 18.0f, F_SLIDER_CW});
     rects.push_back({270.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 19.0f, F_SLIDER_CW});
     rects.push_back({270.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 20.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 30.0f, F_SLIDER_CW});
+    rects.push_back({320.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 31.0f, F_TEXT_BOXL_CW});
     // OSC3 Settings
     rects.push_back({400.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 21.0f, F_BUTTON_CW});
     rects.push_back({400.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 22.0f, F_SLIDER_CW});
@@ -2516,6 +2575,8 @@ int main(int, char**)
     rects.push_back({400.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 24.0f, F_SLIDER_CW});
     rects.push_back({400.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 25.0f, F_SLIDER_CW});
     rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 32.0f, F_SLIDER_CW});
+    rects.push_back({450.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 33.0f, F_TEXT_BOXL_CW});
 
     // 1) Build spectrogram on CPU
     // GrayImage img = buildSpectrogramTextureR8(
@@ -2637,7 +2698,7 @@ int main(int, char**)
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
-                            if (i == 5 || i == 6 || i == 7 || i == 27) selected = i;
+                            if (i == 5 || i == 6 || i == 7 || i == 27 || i == 29 || i == 31 || i == 33) selected = i;
                             buttons[i].hit = true;
                             if (i != 14 && i != 15 && i != 21)
                                 buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
@@ -3003,9 +3064,10 @@ int main(int, char**)
                 switch (r.function) {
                     case F_SLIDER_CW:
                     case F_TEXT_BOX_CW:
+                    case F_TEXT_BOXL_CW:
                     case F_BUTTON_CW: {
                         // x is distance from left edge of control window
-                        // y is distances from top edge of control window
+                        // y is distance from top edge of control window
                         x = r.x + (cw.x1 * dw);
                         y = (cw.y2 * (int)dh) - r.y - r.h;
                         w = r.w;
@@ -3028,14 +3090,21 @@ int main(int, char**)
                                 sprintf(buttons[(int)r.utility].label, "Release: %.3f", buttons[(int)r.utility].value * 3.0f);
                             } else if (buttons[(int)r.utility].label[0] == 'G') {
                                 sprintf(buttons[(int)r.utility].label, "Gain: %.3f", buttons[(int)r.utility].value * 5.0);
+                            } else if (buttons[(int)r.utility].label[0] == 'H') {
+                              sprintf(buttons[(int)r.utility].label, "Hold: %.3f", buttons[(int)r.utility].value * 3.0f);
                             }
                         } else if (r.function == F_TEXT_BOX_CW) {
                             if (selected == (int)r.utility)
                                 selection = true;
                             renderer.addText(buttons[(int)r.utility].label, x + 2, y + 19, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
                             renderer.addText(buttons[(int)r.utility].text, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                        } else if (r.function == F_TEXT_BOXL_CW) {
+                          if (selected == (int)r.utility)
+                            selection = true;
+                          renderer.addText(buttons[(int)r.utility].label, x - 50, y + 2, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                          renderer.addText(buttons[(int)r.utility].text, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
                         }
-                        if (r.function != F_TEXT_BOX_CW)
+                        if (r.function != F_TEXT_BOX_CW && r.function != F_TEXT_BOXL_CW)
                             renderer.addText(buttons[(int)r.utility].label, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
                         break;
                     } case F_BORDER:
@@ -3086,6 +3155,7 @@ int main(int, char**)
             screenHover.x = hover.x * dw;
             screenHover.y = hover.y * dh;
             gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
+            drawMargin(renderer, screenNw);
 
             renderer.updateVertexData();
             renderer.drawFrame(std::floor(screenNw.x1), std::floor(screenNw.y1), std::floor(screenNw.x2 - screenNw.x1), std::floor(screenNw.y2 - screenNw.y1));

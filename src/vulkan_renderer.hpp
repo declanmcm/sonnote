@@ -6,6 +6,7 @@
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <cmath>
 #include <stdexcept>
 #include <array>
 #include "text_renderer.hpp"
@@ -50,21 +51,102 @@ public:
 
     void addText(const char* text, float x, float y, float scale, const glm::vec4& colour);
 
-    std::vector<Vertex> vertices; 
+    std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
 
     void addRect(float x, float y, float w, float h, float r, float g, float b) {
         // Convert to NDC
-        float x1 = (x / windowWidth)  * 2.0f - 1.0f;
-        float y1 = 1.0f - (y / windowHeight) * 2.0f;
-        float x2 = ((x + w) / windowWidth)  * 2.0f - 1.0f;
-        float y2 = 1.0f - ((y + h) / windowHeight) * 2.0f;
+        float x1 = normaliseX(x);
+        float y1 = normaliseY(y);
+        float x2 = normaliseX(x + w);
+        float y2 = normaliseY(y + h);
 
         Vertex v0 = {{x1, y1}, {r, g, b}};
         Vertex v1 = {{x2, y1}, {r, g, b}};
         Vertex v2 = {{x2, y2}, {r, g, b}};
         Vertex v3 = {{x1, y2}, {r, g, b}};
         vertices.insert(vertices.end(), {v0, v1, v2, v2, v3, v0});
+    }
+
+    void addLine(float x1, float y1, float x2, float y2, float thickness, float r, float g, float b) {
+      float x1n = normaliseX(x1);
+      float x2n = normaliseX(x2);
+      float y1n = normaliseY(y1);
+      float y2n = normaliseY(y2);
+
+      float mag = std::sqrt(std::pow(x2n - x1n, 2) + std::pow(y2n - y1n, 2));
+      float ux = (x2n - x1n) / mag;
+      float uy = (y2n - y1n) / mag;
+
+      float x1a = x1n - 1 * uy * (thickness / 2);
+      float y1a = y1n + ux * (thickness / 2);
+      float x1b = x1n + uy * (thickness / 2);
+      float y1b = y1n - 1 * ux * (thickness / 2);
+      float x2a = x2n - 1 * uy * (thickness / 2);
+      float y2a = y2n + ux * (thickness / 2);
+      float x2b = x2n + uy * (thickness / 2);
+      float y2b = y2n - 1 * ux * (thickness / 2);
+
+      Vertex v0 = {{x1a, y1a}, {r, g, b}};
+      Vertex v1 = {{x1b, y1b}, {r, g, b}};
+      Vertex v2 = {{x2a, y2a}, {r, g, b}};
+      Vertex v3 = {{x2b, y2b}, {r, g, b}};
+      vertices.insert(vertices.end(), {v0, v1, v2, v2, v3, v1});
+    }
+
+    void addTriangle(float xa, float ya, float xb, float yb, float xc, float yc, float r, float g, float b) {
+      Vertex v0 = {{normaliseX(xa), normaliseY(ya)}, {r, g, b}};
+      Vertex v1 = {{normaliseX(xb), normaliseY(yb)}, {r, g, b}};
+      Vertex v2 = {{normaliseX(xc), normaliseY(yc)}, {r, g, b}};
+      vertices.insert(vertices.end(), {v0, v1, v2});
+    }
+
+    void addPercBlip(float x, float y, float t, float l, float r, float b, float g) {
+      float xn = normaliseX(x);
+      float yn = normaliseY(y);
+      float yu = normaliseY(y + (t / 2));
+      float yd = normaliseY(y - (t / 2));
+      float xa = normaliseX(x + l);
+
+      Vertex v0 = {{xn, yu}, {r, g, b}};
+      Vertex v1 = {{xn, yd}, {r, g, b}};
+      Vertex v2 = {{xa, yn}, {r, g, b}};
+      vertices.insert(vertices.end(), {v0, v1, v2});
+    }
+
+    void addPartialXPercBlip(float x, float y, float t, float l, float s, float r, float b, float g) {
+      float xn = normaliseX(x);
+      float yu = normaliseY(y + (t / 2));
+      float yd = normaliseY(y - (t / 2));
+      float xs = normaliseX(x + s);
+      float h = (l - s) * (t / 2) / (2 * l);
+      float yut = normaliseY(y + h);
+      float ydt = normaliseY(y - h);
+
+      Vertex v0 = {{xn, yu}, {r, g, b}};
+      Vertex v1 = {{xn, yd}, {r, g, b}};
+      Vertex v2 = {{xs, yut}, {r, g, b}};
+      Vertex v3 = {{xs, ydt}, {r, g, b}};
+      vertices.insert(vertices.end(), {v0, v1, v2, v2, v1, v3});
+    }
+
+    void addPartialYPercBlip(float x, float y, float t, float l, float s, float r, float g, float b) {
+      float xn = normaliseX(x);
+      float xs = normaliseX(x + l - (2 * l * std::abs(s) / t));
+      if (s > 0.0f) {
+        float yu = normaliseY(y + s);
+        float yd = normaliseY(y - (t / 2));
+        Vertex v0 = {{xn, yu}, {r, g, b}};
+        Vertex v1 = {{xn, yd}, {r, g, b}};
+        Vertex v2 = {{xs, yu}, {r, g, b}};
+        Vertex v3 = {{normaliseX(x + l), normaliseY(y)}, {r, g, b}};
+        vertices.insert(vertices.end(), {v0, v1, v2, v1, v2, v3});
+      } else {
+        //float yu = normaliseY(y + (t / 2));
+        //float yd = normaliseY(y + s);
+        //Vertex v0 = {{xn, yd}, {r, g, b}};
+        //Vertex v1 = {{}}
+      }
     }
 
     void addCircle(float cx, float cy, float radius, float r, float g, float b, int segments = 32) {
@@ -354,6 +436,14 @@ private:
 
     bool hasSpectrogram = false;
     int spectroW = 0, spectroH = 0;
+
+    float normaliseX(float x) {
+      return (x / windowWidth) * 2.0f - 1.0f;
+    }
+
+    float normaliseY(float y) {
+      return 1.0f - (y / windowHeight) * 2.0f;
+    }
 
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
