@@ -105,6 +105,25 @@ bool AudioEngine::start() {
         profiles[i].settings[2] = startingProfile;
         profiles[i].settings[1].gain = 0.0f;
         profiles[i].settings[2].gain = 0.0f;
+        profiles[i].settings[0].freq = 0.0f;
+        profiles[i].settings[1].freq = 0.0f;
+        profiles[i].settings[2].freq = 0.0f;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        profilesPerc[i].settings[0] = startingProfile;
+        profilesPerc[i].settings[1] = startingProfile;
+        profilesPerc[i].settings[2] = startingProfile;
+        profilesPerc[i].settings[1].gain = 0.0f;
+        profilesPerc[i].settings[2].gain = 0.0f;
+        float freq = 3133.375 * std::log(1.00737564 * (i + 1));
+        printf("freq: %f\n", freq);
+        profiles[i].settings[0].freq = freq;
+        profiles[i].settings[1].freq = freq;
+        profiles[i].settings[2].freq = freq;
+        profiles[i].settings[0].hold = 0.1f;
+        profiles[i].settings[1].hold = 0.1f;
+        profiles[i].settings[2].hold = 0.1f;
     }
 
     const char* clientName = "AudioEngine";

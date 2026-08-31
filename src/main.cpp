@@ -30,6 +30,7 @@ double t;
 bool empty = true;
 float inputFreq = 0.0f;
 float ref = 440.0f;
+bool noteMode = true;
 
 const uint16_t audioBufferSize = 4096;
 float audioIn[audioBufferSize];
@@ -57,6 +58,75 @@ static inline float ratio_to_freq(Ratio ratio) {
 
 static inline float ratio_to_octave(Ratio ratio) {
   return freq_to_octave(ratio_to_freq(ratio));
+}
+
+std::vector<int> extractHRange(char* in) {
+  bool noVal = true;
+  int a, b;
+  bool dash = false;
+  std::vector<int> newRange;
+  while (in[0] != '\0') {
+    if (dash) {
+      b = getInt(in, noVal);
+      if (noVal)
+        break;
+      int i = a;
+      while (i <= b) {
+        newRange.push_back(std::pow(2, i)); i++;
+      }
+    } else {
+      a = getInt(in, noVal);
+      if (noVal)
+        break;
+    }
+    if (in[0] == '-')
+      dash = true;
+    else if (in[0] == ',')
+      dash = false;
+    else
+      break;
+    in++;
+  }
+  return newRange;
+}
+
+bool isPow2(uint32_t n) {
+  int count = 0;
+  for (int i = 0; i < 32; i++) {
+    if ((n & (1 << i)) == (uint32_t)(1 << i))
+      count++;
+  }
+  return count == 1;
+}
+
+std::vector<int> extractARange(char* in) {
+  bool noVal = true;
+  int a, b;
+  bool dash = false;
+  std::vector<int> newRange;
+  while (in[0] != '\0') {
+    if (dash) {
+      b = getInt(in, noVal);
+      int i = a;
+      while (i <= b) {
+        if (!isPow2((uint32_t)i))
+          newRange.push_back(i);
+        i++;
+      }
+    } else {
+      a = getInt(in, noVal);
+      if (noVal)
+        break;
+    }
+    if (in[0] == '-')
+      dash = true;
+    else if (in[0] == ',')
+      dash = false;
+    else
+      break;
+    in++;
+  }
+  return newRange;
 }
 
 // Compute greatest common divisor
@@ -405,6 +475,7 @@ struct CurrentBox {
 #define F_SLIDER_CW 5
 #define F_TEXT_BOX_CW 6
 #define F_TEXT_BOXL_CW 7
+#define F_SLIDER_P_CW 8
 
 #define NW_HEIGHT 0.75f
 
@@ -645,7 +716,6 @@ inline STFTMag computeSTFT_FFTW(
               }
             }
         }
-        //out.highBins[frame] = maxBin;
     }
     out.highBin = maxBin;
 
@@ -833,24 +903,38 @@ float perfectIntervals[] = {
     10.0 / 7.0
 };
 
-Ratio perfectIntervalRatios[] = {
-    {1, 1},
-    {3, 2},
-    {4, 3},
-    {5, 4},
-    {6, 5},
-    {7, 6},
-    {8, 7},
-    {9, 8},
-    {16, 15},
-    {7, 5},
-    {8, 5},
-    {5, 3},
-    {12, 7},
-    {7, 4},
-    {16, 9},
-    {15, 8},
-    {10, 7}
+Ratio perfectIntervalRatios[] {
+  {1, 1},
+  {3, 2},
+  {5, 4},
+  {7, 4},
+  {9, 8},
+  {11, 8},
+  {13, 8},
+  {15, 8},
+  {17, 16},
+  {19, 16},
+  {21, 16},
+  {23, 16},
+  {25, 16},
+  {27, 16},
+  {29, 16},
+  {31, 16},
+  {4, 3},
+  {5, 3},
+  {6, 5},
+  {7, 5},
+  {8, 5},
+  {9, 5},
+  {7, 6},
+  {9, 6},
+  {11, 6},
+  {8, 7},
+  {9, 7},
+  {10, 7},
+  {11, 7},
+  {12, 7},
+  {13, 7}
 };
 
 float playhead_time = 0.0f;
@@ -1010,7 +1094,7 @@ float parseDivisor(char* n) {
     }
 }
 
-char buttonLabels[34][32] = {"Export WAV",
+char buttonLabels[36][32] = {"Export WAV",
     "BPM:          ",
     "Attack:          ",
     "Decay:          ",
@@ -1043,9 +1127,11 @@ char buttonLabels[34][32] = {"Export WAV",
     "Hold:            ",
     "Freq:       ",
     "Hold:            ",
-    "Freq:       "
+    "Freq:       ",
+    "Harm. Range: ",
+    "Alt. H. Range: "
     };
-char texts[7][32] = {"file.wav", "              ", "              ", "440", "30", "30", "30"};
+char texts[9][32] = {"file.wav", "              ", "              ", "440", "30", "30", "30", "2-3", "3-7"};
 char originText[64];
 char measureText[64];
 
@@ -1092,7 +1178,6 @@ struct Canvas2D {
     Event* select1closest;
     Event* select2closest;
     bool selectFirst = true;
-    bool noteMode = true;
 
     Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
 
@@ -1674,20 +1759,73 @@ struct Canvas2D {
               bool hoveredWithin = unsnappedHoverW.x >= prevEv->time && \
                                unsnappedHoverW.x < currentBeatEv->time;
               while (ratio_to_octave(current) < top.y) {
-                for (int i = 0; i < 17; i++) {
-                  Ratio currentAdded = multiplyR(current, perfectIntervalRatios[i]);
-                  //printf("currentInterval: %d/%d, currentAdded: %d/%d\n", perfectIntervalRatios[i].num, perfectIntervalRatios[i].den, currentAdded.num, currentAdded.den);
-                  if (ratio_to_octave(currentAdded) > top.y || ratio_to_octave(currentAdded) < bottom.y)
+                uint32_t hRange = std::pow(2, std::atoi(texts[7]));
+                std::vector<int> altHRange = extractARange(texts[8]);
+                float r = 0.73;
+                float g = 0.45882;
+                float b = 0.807;
+                for (uint32_t i = hRange; i < hRange * 2; i++) {
+                  Ratio interval = {i, hRange};
+                  Ratio currentAdded = multiplyR(current, interval);
+                  if (ratio_to_octave(currentAdded) > top.y)
+                    break;
+                  else if (ratio_to_octave(currentAdded) < bottom.y)
                     continue;
                   Ratio diff = subtractR(currentAdded, prevEv->ratio);
                   if (!(diff.num == 0 && diff.den == 0)) {
                     Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
-                    addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, 0.73, 0.45882, 0.807);
+                    int factor = std::log2(simplifyR(interval).den);
+                    float cr = r * factor;
+                    cr = cr - std::floor(cr);
+                    float cg = g * factor;
+                    cg = cg - std::floor(cg);
+                    addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, cr, cg, 0.807);
                   }
                   if (hoveredWithin && \
                       std::abs(unsnappedHoverW.y - ratio_to_octave(currentAdded)) < std::abs(unsnappedHoverW.y - ratio_to_octave(closest))) {
                     closest = currentAdded;
+                  }
+                }
+                for (int i = 0; i < (int)altHRange.size(); i++) {
+                  Ratio interval = {altHRange[i] + 1, altHRange[i]};
+                  while (interval.num < interval.den * 2) {
+                    int simpDen = simplifyR(interval).den;
+                    if (simpDen != interval.den) {
+                      bool match = false;
+                      if (isPow2(simpDen) && simpDen <= hRange)
+                        match = true;
+                      for (int j = 0; j < i; j++) {
+                        if (altHRange[j] == simpDen)
+                          match = true;
+                      }
+                      if (match) {
+                        interval.num++;
+                        continue;
+                      }
+                    }
+                    Ratio currentAdded = multiplyR(current, interval);
+                    if (ratio_to_octave(currentAdded) > top.y)
+                      break;
+                    else if (ratio_to_octave(currentAdded) < bottom.y) {
+                      interval.num++;
+                      continue;
+                    }
+                    Ratio diff = subtractR(currentAdded, prevEv->ratio);
+                    if (!(diff.num == 0 && diff.den == 0)) {
+                      Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
+                      Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
+                      float cr = r * (i + 1);
+                      cr = cr - std::floor(cr);
+                      float cb = b * (i + 1);
+                      cb = cb - std::floor(cb);
+                      addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, cr, g, cb);
+                    }
+                    if (hoveredWithin && \
+                        std::abs(unsnappedHoverW.y - ratio_to_octave(currentAdded)) < std::abs(unsnappedHoverW.y - ratio_to_octave(closest))) {
+                      closest = currentAdded;
+                    }
+                    interval.num++;
                   }
                 }
                 current = simplifyR(multiplyR(current, {2, 1}));
@@ -2531,6 +2669,8 @@ int main(int, char**)
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[31], false, 0.1f, texts[5]); // Freq
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[32], false, 0.1f); // OSC3 Hold
     buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[33], false, 0.1f, texts[6]); // Freq
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[34], false, 0.0f, texts[7]); // Harmonic range
+    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[35], false, 0.0f, texts[8]); // Alt. harmonic range
     engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
 
     //rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
@@ -2546,7 +2686,7 @@ int main(int, char**)
     rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
     rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
     rects.push_back({140.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 28.0f, F_SLIDER_CW});
+    rects.push_back({140.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 28.0f, F_SLIDER_P_CW});
     rects.push_back({190.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 29.0f, F_TEXT_BOXL_CW});
     // WAV Save name, jump size, split size text boxes
     rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
@@ -2566,8 +2706,10 @@ int main(int, char**)
     rects.push_back({270.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 18.0f, F_SLIDER_CW});
     rects.push_back({270.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 19.0f, F_SLIDER_CW});
     rects.push_back({270.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 20.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 30.0f, F_SLIDER_CW});
+    rects.push_back({270.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 30.0f, F_SLIDER_P_CW});
     rects.push_back({320.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 31.0f, F_TEXT_BOXL_CW});
+    rects.push_back({270.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 34.0f, F_TEXT_BOX_CW});
+    rects.push_back({270.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 35.0f, F_TEXT_BOX_CW});
     // OSC3 Settings
     rects.push_back({400.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 21.0f, F_BUTTON_CW});
     rects.push_back({400.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 22.0f, F_SLIDER_CW});
@@ -2575,7 +2717,7 @@ int main(int, char**)
     rects.push_back({400.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 24.0f, F_SLIDER_CW});
     rects.push_back({400.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 25.0f, F_SLIDER_CW});
     rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 32.0f, F_SLIDER_CW});
+    rects.push_back({400.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 32.0f, F_SLIDER_P_CW});
     rects.push_back({450.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 33.0f, F_TEXT_BOXL_CW});
 
     // 1) Build spectrogram on CPU
@@ -2633,7 +2775,11 @@ int main(int, char**)
     while (running) {
         if (newAudioIn) {
           std::vector<float> v(audioIn, audioIn + audioBufferSize);
-          computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
+          for (int i = 0; i < 3; i++) {
+            printf("%f, ", v[i]);
+          }
+          printf("\n");
+          res = computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
           //memcpy(pendingAudioOut, audioIn, audioBufferSize);
           //printf("IN: %f, AUDIOOUT:%f\n", audioIn[0], pendingAudioOut[0]);
           //printf("frames: %d\n", frames);
@@ -2650,7 +2796,7 @@ int main(int, char**)
             inputFreqi++;
             if (inputFreqi == 3) {
               inputFreq = inputFreqSum / 3;
-              //printf("inputFreq: %f\n", inputFreq);
+              printf("inputFreq: %f\n", inputFreq);
               rerender = true;
               inputFreqi = 0;
               inputFreqSum = 0;
@@ -2698,7 +2844,7 @@ int main(int, char**)
                     for (int i = 0; i < (int)buttons.size(); i++) {
                         if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
                             ay >= buttons[i].y1 && ay <= buttons[i].y2) {
-                            if (i == 5 || i == 6 || i == 7 || i == 27 || i == 29 || i == 31 || i == 33) selected = i;
+                            if (i == 5 || i == 6 || i == 7 || i == 27 || i == 29 || i == 31 || i == 33 || i == 34 || i == 35) selected = i;
                             buttons[i].hit = true;
                             if (i != 14 && i != 15 && i != 21)
                                 buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
@@ -2895,6 +3041,13 @@ int main(int, char**)
                     buttons[24].value = profileSettings.settings[2].sustain;
                     buttons[25].value = profileSettings.settings[2].release / 3.0f;
                     buttons[26].value = profileSettings.settings[2].gain;
+                    buttons[28].value = profileSettings.settings[0].hold;
+                    buttons[29].value = profileSettings.settings[0].freq;
+                    printf("value: %f\n", profileSettings.settings[0].hold);
+                    buttons[30].value = profileSettings.settings[1].hold;
+                    buttons[31].value = profileSettings.settings[1].freq;
+                    buttons[32].value = profileSettings.settings[2].hold;
+                    buttons[33].value = profileSettings.settings[2].freq;
                 }
                 if (selected != -1) {
                   if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
@@ -3061,8 +3214,11 @@ int main(int, char**)
                 w = r.w * dw;
                 h = r.h * dh;
                 bool selection = false;
+                if (noteMode && (r.function == F_SLIDER_P_CW || r.function == F_TEXT_BOXL_CW))
+                  continue;
                 switch (r.function) {
                     case F_SLIDER_CW:
+                    case F_SLIDER_P_CW:
                     case F_TEXT_BOX_CW:
                     case F_TEXT_BOXL_CW:
                     case F_BUTTON_CW: {
@@ -3076,7 +3232,8 @@ int main(int, char**)
                         buttons[(int)r.utility].x2 = x + w;
                         buttons[(int)r.utility].y1 = y;
                         buttons[(int)r.utility].y2 = y + h;
-                        if (r.function == F_SLIDER_CW) {
+                        if (r.function == F_SLIDER_CW || r.function == F_SLIDER_P_CW) {
+                          printf("render slider: %c\n", buttons[(int)r.utility].label[0]);
                             sliderPoint = x + r.w * buttons[(int)r.utility].value;
                             if (buttons[(int)r.utility].label[0] == 'B') {
                                 sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));
@@ -3091,6 +3248,7 @@ int main(int, char**)
                             } else if (buttons[(int)r.utility].label[0] == 'G') {
                                 sprintf(buttons[(int)r.utility].label, "Gain: %.3f", buttons[(int)r.utility].value * 5.0);
                             } else if (buttons[(int)r.utility].label[0] == 'H') {
+                              printf("hold: %f\n", buttons[(int)r.utility].value * 3.0f);
                               sprintf(buttons[(int)r.utility].label, "Hold: %.3f", buttons[(int)r.utility].value * 3.0f);
                             }
                         } else if (r.function == F_TEXT_BOX_CW) {

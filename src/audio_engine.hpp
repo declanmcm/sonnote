@@ -562,6 +562,7 @@ public:
     Profile getProfile(int n);
 
     Profile profiles[10];
+    Profile profilesPerc[10];
     float sampleRate = 48000.0f;
 
     bool tunerEnabled = false;
