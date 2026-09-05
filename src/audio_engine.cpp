@@ -118,12 +118,12 @@ bool AudioEngine::start() {
         profilesPerc[i].settings[2].gain = 0.0f;
         float freq = 3133.375 * std::log(1.00737564 * (i + 1));
         printf("freq: %f\n", freq);
-        profiles[i].settings[0].freq = freq;
-        profiles[i].settings[1].freq = freq;
-        profiles[i].settings[2].freq = freq;
-        profiles[i].settings[0].hold = 0.1f;
-        profiles[i].settings[1].hold = 0.1f;
-        profiles[i].settings[2].hold = 0.1f;
+        profilesPerc[i].settings[0].freq = freq;
+        profilesPerc[i].settings[1].freq = freq;
+        profilesPerc[i].settings[2].freq = freq;
+        profilesPerc[i].settings[0].hold = 0.1f;
+        profilesPerc[i].settings[1].hold = 0.1f;
+        profilesPerc[i].settings[2].hold = 0.1f;
     }
 
     const char* clientName = "AudioEngine";
@@ -260,12 +260,19 @@ void AudioEngine::setADSR(const ADSRParams& a) {
     messageQueue.push(m);
 }
 
-void AudioEngine::setProfile(Profile& p, int n) {
+void AudioEngine::setProfile(Profile& p, int n, bool noteMode) {
+  if (noteMode)
     profiles[n] = p;
+  else
+    profilesPerc[n] = p;
 }
 
-Profile AudioEngine::getProfile(int n) {
+Profile AudioEngine::getProfile(int n, bool noteMode) {
+  if (noteMode) {
     return profiles[n];
+  } else {
+    return profilesPerc[n];
+  }
 }
 
 void AudioEngine::toggleFreeze() {

@@ -102,6 +102,7 @@ bool isPow2(uint32_t n) {
 std::vector<int> extractARange(char* in) {
   bool noVal = true;
   int a, b;
+  a = -1;
   bool dash = false;
   std::vector<int> newRange;
   while (in[0] != '\0') {
@@ -113,17 +114,25 @@ std::vector<int> extractARange(char* in) {
           newRange.push_back(i);
         i++;
       }
+      a = -1;
     } else {
       a = getInt(in, noVal);
+      printf("int gotten: %d, next char: %c\n", a, in[0]);
       if (noVal)
         break;
     }
     if (in[0] == '-')
       dash = true;
-    else if (in[0] == ',')
+    else if (in[0] == ',') {
+      if (!isPow2((uint32_t)a))
+        newRange.push_back(a);
+      a = -1;
       dash = false;
-    else
+    } else {
+      if (a != -1 && !isPow2(a))
+        newRange.push_back(a);
       break;
+    }
     in++;
   }
   return newRange;
@@ -1131,7 +1140,7 @@ char buttonLabels[36][32] = {"Export WAV",
     "Harm. Range: ",
     "Alt. H. Range: "
     };
-char texts[9][32] = {"file.wav", "              ", "              ", "440", "30", "30", "30", "2-3", "3-7"};
+char texts[9][32] = {"file.wav", "              ", "              ", "440", "30", "30", "30", "2", "3"};
 char originText[64];
 char measureText[64];
 
@@ -1735,6 +1744,7 @@ struct Canvas2D {
 
         // Draw foci and related harmonics, snap to focus
         while (currentBeatEv) {
+          printf("focusEv: %d/%d\n", currentBeatEv->ratio.num, currentBeatEv->ratio.den);
           // for each focus event
           if (prevEv && !(prevEv->ratio.num == 0 && prevEv->ratio.den == 0)) {
             // foci at 0 represent a break -> no drawing or snapping
@@ -1761,6 +1771,10 @@ struct Canvas2D {
               while (ratio_to_octave(current) < top.y) {
                 uint32_t hRange = std::pow(2, std::atoi(texts[7]));
                 std::vector<int> altHRange = extractARange(texts[8]);
+                printf("Arange:\n");
+                for (int i = 0; i < (int)altHRange.size(); i++) {
+                  printf("%d, ", altHRange[i]);
+                }
                 float r = 0.73;
                 float g = 0.45882;
                 float b = 0.807;
@@ -1772,7 +1786,9 @@ struct Canvas2D {
                   else if (ratio_to_octave(currentAdded) < bottom.y)
                     continue;
                   Ratio diff = subtractR(currentAdded, prevEv->ratio);
-                  if (!(diff.num == 0 && diff.den == 0)) {
+                  printf("currentAdded: %d/%d, prevEv: %d/%d\n", currentAdded.num, currentAdded.den, prevEv->ratio.num, prevEv->ratio.den);
+                  if (diff.num != 0) {
+                    printf("in\n");
                     Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
                     int factor = std::log2(simplifyR(interval).den);
@@ -1812,12 +1828,12 @@ struct Canvas2D {
                       continue;
                     }
                     Ratio diff = subtractR(currentAdded, prevEv->ratio);
-                    if (!(diff.num == 0 && diff.den == 0)) {
+                    if (diff.num != 0) {
                       Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
                       Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
-                      float cr = r * (i + 1);
+                      float cr = r * altHRange[i];
                       cr = cr - std::floor(cr);
-                      float cb = b * (i + 1);
+                      float cb = b * altHRange[i];
                       cb = cb - std::floor(cb);
                       addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y, bp.x - ap.x, 1, cr, g, cb);
                     }
@@ -1833,6 +1849,18 @@ struct Canvas2D {
               if (hoveredWithin && closest.num != 999999999) {
                 focusAtCursor = prevEv->ratio;
                 hoverR = closest;
+                Ratio simpRat = closest;
+                if (simpRat.num > simpRat.den) {
+                  while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
+                    simpRat.num /= 2;
+                  }
+                } else {
+                  while (simpRat.den % 2 == 0 && simpRat.den > simpRat.num * 2) {
+                    simpRat.den /= 2;
+                  }
+                }
+                sprintf(measureText, "%d/%d (%d/%d)", closest.num, closest.den, simpRat.num, simpRat.den);
+                renderer.addText(measureText, bottomRight.x - 150, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
               }
             }
           } else {
@@ -2937,7 +2965,7 @@ int main(int, char**)
                                 profileSettings.settings[2].release = buttons[25].value * 3.0f;
                                 profileSettings.settings[2].gain = buttons[26].value;
                                 printf("SP");
-                                engine.setProfile(profileSettings, currentProfile);
+                                engine.setProfile(profileSettings, currentProfile, noteMode);
                                 // engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
                             } else if (i == 4) {
                                 engine.setGain(buttons[4].value);
@@ -2962,7 +2990,8 @@ int main(int, char**)
 
                 if (key >= 48 && key <= 57) {
                     currentProfile = (int)key - 48;
-                    profileSettings = engine.getProfile(currentProfile);
+                    printf("noteMode: %d\n", noteMode);
+                    profileSettings = engine.getProfile(currentProfile, noteMode);
                     switch (profileSettings.settings[0].waveType) {
                         case (WaveformType::Sine):
                             buttons[14].value = 0.0f;
@@ -3043,11 +3072,13 @@ int main(int, char**)
                     buttons[26].value = profileSettings.settings[2].gain;
                     buttons[28].value = profileSettings.settings[0].hold;
                     buttons[29].value = profileSettings.settings[0].freq;
-                    printf("value: %f\n", profileSettings.settings[0].hold);
+                    sprintf(texts[4], "%.2f", profileSettings.settings[0].freq);
                     buttons[30].value = profileSettings.settings[1].hold;
                     buttons[31].value = profileSettings.settings[1].freq;
+                    sprintf(texts[5], "%.2f", profileSettings.settings[1].freq);
                     buttons[32].value = profileSettings.settings[2].hold;
                     buttons[33].value = profileSettings.settings[2].freq;
+                    sprintf(texts[6], "%.2f", profileSettings.settings[2].freq);
                 }
                 if (selected != -1) {
                   if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
@@ -3152,7 +3183,7 @@ int main(int, char**)
         if (buttons[9].hit) { // if save project button is pressed
             Profile ps[10];
             for (int i = 0; i < 10; i++) {
-                ps[i] = engine.getProfile(i);
+                ps[i] = engine.getProfile(i, noteMode);
                 if (i == 0) {
                     printf("attack: %f\n", ps[i].settings[0].attack);
                     uint32_t val_number32;
@@ -3174,7 +3205,7 @@ int main(int, char**)
                 if (i == 0) {
                     printf("attack: %f", ps[i].settings[0].attack);
                 }
-                engine.setProfile(ps[i], i);
+                engine.setProfile(ps[i], i, noteMode);
             }
             buttons[10].hit = false;
         }

@@ -557,9 +557,9 @@ public:
     void setTempo(float bpm);
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
-    void setProfile(Profile& p, int n);
+    void setProfile(Profile& p, int n, bool noteMode);
     void toggleTuner();
-    Profile getProfile(int n);
+    Profile getProfile(int n, bool noteMode);
 
     Profile profiles[10];
     Profile profilesPerc[10];
