@@ -31,6 +31,7 @@ bool empty = true;
 float inputFreq = 0.0f;
 float ref = 440.0f;
 bool noteMode = true;
+float snapBlip = 0.0f;
 
 const uint16_t audioBufferSize = 4096;
 float audioIn[audioBufferSize];
@@ -40,6 +41,10 @@ int audioOuti = 0;
 int audioi = 0;
 bool newAudioIn = false;
 bool newAudioOut = false;
+
+struct ProfileDisplaySettings {
+
+};
 
 float c4 = 220.0f * std::pow(2.0f, 3.0/12.0);
 
@@ -59,6 +64,12 @@ static inline float ratio_to_freq(Ratio ratio) {
 static inline float ratio_to_octave(Ratio ratio) {
   return freq_to_octave(ratio_to_freq(ratio));
 }
+
+struct Sequence {
+  int first;
+  uint32_t ref;
+  std::vector<uint32_t> seq;
+};
 
 std::vector<int> extractHRange(char* in) {
   bool noVal = true;
@@ -99,18 +110,18 @@ bool isPow2(uint32_t n) {
   return count == 1;
 }
 
-std::vector<int> extractARange(char* in) {
+std::vector<uint32_t> extractARange(char* in) {
   bool noVal = true;
   int a, b;
   a = -1;
   bool dash = false;
-  std::vector<int> newRange;
+  std::vector<uint32_t> newRange;
   while (in[0] != '\0') {
     if (dash) {
       b = getInt(in, noVal);
-      int i = a;
-      while (i <= b) {
-        if (!isPow2((uint32_t)i))
+      uint32_t i = a;
+      while (i <= (uint32_t)b) {
+        if (!isPow2(i))
           newRange.push_back(i);
         i++;
       }
@@ -125,12 +136,12 @@ std::vector<int> extractARange(char* in) {
       dash = true;
     else if (in[0] == ',') {
       if (!isPow2((uint32_t)a))
-        newRange.push_back(a);
+        newRange.push_back((uint32_t)a);
       a = -1;
       dash = false;
     } else {
       if (a != -1 && !isPow2(a))
-        newRange.push_back(a);
+        newRange.push_back((uint32_t)a);
       break;
     }
     in++;
@@ -175,6 +186,53 @@ std::vector<uint32_t> getPrimeFactors(int n) {
     i++;
   }
   return res;
+}
+
+
+uint32_t nextPrime(uint32_t n) {
+  while (!isPrime(n)) n++;
+  return n;
+}
+
+std::vector<uint32_t> getNumbersAtComplexity(uint32_t n, std::vector<std::vector<Sequence>> seqs, std::vector<uint32_t> excl) {
+  std::vector<Sequence> current;
+  std::vector<uint32_t> nums;
+  nums.push_back(n);
+  uint32_t p = 2;
+  while (p < ((float)n / 2.0)) {
+    uint16_t index = n - p - 4;
+    uint32_t num = p;
+    for (int i = 0; i < (int)seqs[index].size(); i++) {
+      if (seqs[index][i].first != -1) {
+        std::vector<uint32_t> newExcl;
+        newExcl.reserve(seqs[index][i].seq.size() + excl.size());
+        newExcl.insert(seqs[index][i].seq.end(), seqs[index][i].seq.begin(), seqs[index][i].seq.end());
+        newExcl.insert(newExcl.end(), excl.begin(), excl.end());
+        std::vector<uint32_t> minusPNumbers = getNumbersAtComplexity(seqs[index][i].ref, seqs, newExcl);
+        for (int j = 0; j < (int)minusPNumbers.size(); j++) {
+          nums.push_back(p * seqs[index][i].first * minusPNumbers[j]);
+        }
+      }
+    }
+    p = nextPrime(p);
+  }
+  seqs.push_back(current);
+  return nums;
+}
+
+void computeComplexityOrder(int n) {
+  std::vector<std::vector<uint32_t>> map;
+  for (int i = 0; i < n; i++) {
+    // Calculate all equivalently complex integers to i
+    std::vector<uint32_t> toAdd;
+    for (int j = 2; j < i; j++) {
+
+    }
+    for (int j = 1; j < i; j++) {
+      // Compute possible equivalently complex intervals for j, i - j
+
+    }
+  }
 }
 
 // Convert float to simplified fraction
@@ -1644,6 +1702,9 @@ struct Canvas2D {
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
 
+        if (!noteMode)
+          hoverW.y = freq_to_octave(snapBlip);
+
         if (empty)
           hoverR = {1, 1};
 
@@ -1770,7 +1831,7 @@ struct Canvas2D {
                                unsnappedHoverW.x < currentBeatEv->time;
               while (ratio_to_octave(current) < top.y) {
                 uint32_t hRange = std::pow(2, std::atoi(texts[7]));
-                std::vector<int> altHRange = extractARange(texts[8]);
+                std::vector<uint32_t> altHRange = extractARange(texts[8]);
                 printf("Arange:\n");
                 for (int i = 0; i < (int)altHRange.size(); i++) {
                   printf("%d, ", altHRange[i]);
@@ -1806,7 +1867,7 @@ struct Canvas2D {
                 for (int i = 0; i < (int)altHRange.size(); i++) {
                   Ratio interval = {altHRange[i] + 1, altHRange[i]};
                   while (interval.num < interval.den * 2) {
-                    int simpDen = simplifyR(interval).den;
+                    uint32_t simpDen = simplifyR(interval).den;
                     if (simpDen != interval.den) {
                       bool match = false;
                       if (isPow2(simpDen) && simpDen <= hRange)
@@ -2013,21 +2074,17 @@ struct Canvas2D {
           renderer.addText(originText, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
-        if (containsKey(keys, 'm')) {
-          noteMode = !noteMode;
-        }
-
         if (hovered && (int)keys.size() != 0 && (int)currentEvsAtCursor.size() > 0) {
-            // We can safely assume closest exists since there are more than zero currentEvs
-            char closestString[20];
-            strcpy(closestString, closest->string_expr.c_str());
-            printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
+          // We can safely assume closest exists since there are more than zero currentEvs
+          char closestString[20];
+          strcpy(closestString, closest->string_expr.c_str());
+          printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
 
-            int number = numberContained(keys);
+          int number = numberContained(keys);
 
-            if (number != -1) {
-                closest->profile = number;
-            }
+          if (number != -1) {
+            closest->profile = number;
+          }
 
             if (containsKey(keys, 'q')) {
               beatEvents.inorder();
@@ -2622,6 +2679,7 @@ static Canvas2D gBeatOctCanvas;
 
 int main(int, char**)
 {
+  computeComplexityOrder(20);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
         return 1;
@@ -2800,13 +2858,15 @@ int main(int, char**)
     float inputFreqSum = 0.0f;
     int inputFreqi = 0;
     STFTMag res;
+    bool lastMode = noteMode;
     while (running) {
+        //if (lastMode != noteMode) {
+        //  engine.getProfile(currentProfile, noteMode);
+        //  lastMode = noteMode;
+        //}
+
         if (newAudioIn) {
           std::vector<float> v(audioIn, audioIn + audioBufferSize);
-          for (int i = 0; i < 3; i++) {
-            printf("%f, ", v[i]);
-          }
-          printf("\n");
           res = computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
           //memcpy(pendingAudioOut, audioIn, audioBufferSize);
           //printf("IN: %f, AUDIOOUT:%f\n", audioIn[0], pendingAudioOut[0]);
@@ -2988,10 +3048,13 @@ int main(int, char**)
                 }
                 if (key == SDLK_ESCAPE) running = false;
 
-                if (key >= 48 && key <= 57) {
-                    currentProfile = (int)key - 48;
-                    printf("noteMode: %d\n", noteMode);
+                if ((key >= 48 && key <= 57) || key == 'm') {
+                    if (key != 'm')
+                      currentProfile = (int)key - 48;
+                    else
+                      noteMode = !noteMode;
                     profileSettings = engine.getProfile(currentProfile, noteMode);
+                    //TODO: fillProfileDisplayData(profileSettings, profileDisplaySettings)
                     switch (profileSettings.settings[0].waveType) {
                         case (WaveformType::Sine):
                             buttons[14].value = 0.0f;
@@ -3073,6 +3136,7 @@ int main(int, char**)
                     buttons[28].value = profileSettings.settings[0].hold;
                     buttons[29].value = profileSettings.settings[0].freq;
                     sprintf(texts[4], "%.2f", profileSettings.settings[0].freq);
+                    snapBlip = profileSettings.settings[0].freq;
                     buttons[30].value = profileSettings.settings[1].hold;
                     buttons[31].value = profileSettings.settings[1].freq;
                     sprintf(texts[5], "%.2f", profileSettings.settings[1].freq);
@@ -3097,6 +3161,14 @@ int main(int, char**)
                         ref = atof(buttons[selected].text);
                         engine.setFrequency(ref);
                       }
+                  }
+                  if (selected == 6) {
+                    char* current = buttons[selected].text;
+                    bool noVal = false;
+                    int num = getNum(current, noVal);
+                    current += 1;
+                    int den = getNum(current, noVal);
+                    engine.setJump((float)num / (float) den);
                   }
                 } else {
                   if (key == 'n') {
@@ -3264,7 +3336,6 @@ int main(int, char**)
                         buttons[(int)r.utility].y1 = y;
                         buttons[(int)r.utility].y2 = y + h;
                         if (r.function == F_SLIDER_CW || r.function == F_SLIDER_P_CW) {
-                          printf("render slider: %c\n", buttons[(int)r.utility].label[0]);
                             sliderPoint = x + r.w * buttons[(int)r.utility].value;
                             if (buttons[(int)r.utility].label[0] == 'B') {
                                 sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));

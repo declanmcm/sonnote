@@ -457,6 +457,7 @@ enum class MessageType {
     ResetSampleCounter,
     SetADSR,
     SetWaveform,
+    JumpSize,
     SetTempo,
     Freeze,
 };
@@ -551,6 +552,7 @@ public:
     // Control-thread API (safe to call)
     // ================================
     void setFrequency(float hz);
+    void setJump(float j);
     void setGain(float g);
     void setPlayState(bool on);
     void setWaveform(WaveformType type);
@@ -587,6 +589,7 @@ private:
     // Current DSP parameters (updated via messages)
     float gain = 0.5f;
     float ref = 440.0f;
+    float power = 4.0 / 3.0;
     bool isPlaying = false;
     WaveformType waveform = WaveformType::Sine;
     ADSRParams adsr;
@@ -610,13 +613,14 @@ private:
     // Polyphonic voice state
     // ============================
     static constexpr size_t MAX_VOICES = 64;
-    std::array<float, MAX_VOICES> voiceFreqs{};
-    std::array<float, MAX_VOICES> voicePhases{};
     std::array<uint32_t, MAX_VOICES> voiceIDs{};
     // std::array<float, MAX_VOICES> voiceEnvs{};
     // std::array<uint8_t, MAX_VOICES> voiceStates{}; // 0=off,1=attack,2=sustain/decay,3=release
     float voiceEnvs[64][3];
     float voiceStates[64][3];
+    float voiceFreqs[64][3];
+    float voicePhases[64][3];
+    int voiceTimers[64][3];
     std::array<uint8_t, MAX_VOICES> voiceProfiles{};
 
     float divisorSmooth = 1.0f;  // for dividing by voice count smoothly
