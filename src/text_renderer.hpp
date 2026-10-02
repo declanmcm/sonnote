@@ -83,7 +83,13 @@ public:
         const glm::vec4& color,
         VkCommandBuffer commandBuffer
     ); // <-- MISSING DECLARATION FOR ERROR 
-    void endTextSubmission(VkCommandBuffer commandBuffer); // <-- MISSING DECLARATION FOR ERROR
+    void endTextSubmission(VkCommandBuffer commandBuffer); // upload + draw everything staged
+
+    // For layered drawing: upload everything staged once, then draw it in slices
+    // so other geometry can be drawn between the slices.
+    size_t stagedVertexCount() const { return m_stagedVertices.size(); }
+    void uploadStaged();
+    void drawStaged(VkCommandBuffer commandBuffer, uint32_t firstVertex, uint32_t vertexCount);
 
     //layout(binding = 1) uniform sampler2D msdfAtlasSampler;
 private:
@@ -115,6 +121,7 @@ private:
     void* m_vertexDataMapped = nullptr;
     size_t m_maxVertices = 4096;
     std::vector<TextVertex> m_stagedVertices;
+    size_t m_uploadedVertices = 0;   // how many staged vertices are in the GPU buffer
 
     // Misc (unchanged)
     glm::mat4 m_projectionMatrix;

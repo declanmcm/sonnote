@@ -8,6 +8,7 @@
 #include <cmath>
 #include <numeric>
 #include <cstring>
+#include <string>
 #include <map>
 #include <memory>
 #include <iostream>
@@ -16,6 +17,7 @@
 #include "parser.hpp"
 #include "audio_engine.hpp"
 #include "utils.hpp"
+#include "ui.hpp"
 
 #if defined(__APPLE__)
   #define GL_SILENCE_DEPRECATION
@@ -504,7 +506,7 @@ struct MidiEvent {
     std::vector<uint8_t> data;
 };
 
-struct Rect {
+/*struct Rect {
     float x;
     float y;
     float w;
@@ -514,7 +516,7 @@ struct Rect {
     float b;
     float utility;
     int function;
-};
+};*/
 
 struct Button {
     float x1;
@@ -545,6 +547,8 @@ struct CurrentBox {
 #define F_SLIDER_P_CW 8
 
 #define NW_HEIGHT 0.75f
+#define CW_HEIGHT 0.1f
+#define SW_HEIGHT 0.2f
 
 constexpr int FFT_SIZE = 2048;
 constexpr int HOP_SIZE = 512;
@@ -1202,6 +1206,16 @@ char texts[9][32] = {"file.wav", "              ", "              ", "440", "30"
 char originText[64];
 char measureText[64];
 
+struct EditorSettings {
+    std::string wavName      = "file.wav";
+    std::string jump;
+    std::string split;
+    std::string refFreq      = "440";
+    std::string harmRange    = "2";
+    std::string altHarmRange = "3";
+};
+EditorSettings g_settings;
+
 struct Canvas2D {
     // World-space units
     // x = beats, y = octaves (increasing upward)
@@ -1830,8 +1844,8 @@ struct Canvas2D {
               bool hoveredWithin = unsnappedHoverW.x >= prevEv->time && \
                                unsnappedHoverW.x < currentBeatEv->time;
               while (ratio_to_octave(current) < top.y) {
-                uint32_t hRange = std::pow(2, std::atoi(texts[7]));
-                std::vector<uint32_t> altHRange = extractARange(texts[8]);
+                uint32_t hRange = std::pow(2, std::atoi(g_settings.harmRange.c_str()));
+                std::vector<uint32_t> altHRange = extractARange(g_settings.altHarmRange.data());
                 printf("Arange:\n");
                 for (int i = 0; i < (int)altHRange.size(); i++) {
                   printf("%d, ", altHRange[i]);
@@ -2664,771 +2678,396 @@ bool load_song(const std::string& path,
     return true;
 }
 
-
-void drawMargin(VulkanRenderer& renderer, CurrentBox& nw) {
-  Vec2 topLeft  = { nw.x1, nw.y2};
-  Vec2 bottomRight = { nw.x2, nw.y1 };
-  float w = bottomRight.y;
-  renderer.addRect(0, topLeft.y, bottomRight.x - topLeft.x + 2 * w, w, 0.07f, 0.07f, 0.07f);
-  renderer.addRect(0, 0, bottomRight.x - topLeft.x + 2 * w, w, 0.07f, 0.07f, 0.07f);
-  renderer.addRect(0, 0, w, topLeft.y - bottomRight.y + 2 * w, 0.07f, 0.07f, 0.07f);
-  renderer.addRect(bottomRight.x, 0, w, topLeft.y - bottomRight.y + 2 * w, 0.07f, 0.07f, 0.07f);
+// Draws a frame `m` pixels wide around the note window (nw is y-up: y1 = bottom, y2 = top)
+void drawMargin(VulkanRenderer& renderer, CurrentBox& nw, float m = 5.0f) {
+    const float c = 0.07f;
+    const float w = nw.x2 - nw.x1, h = nw.y2 - nw.y1;
+    renderer.addRect(nw.x1 - m, nw.y2,     w + 2 * m, m, c, c, c);  // top
+    renderer.addRect(nw.x1 - m, nw.y1 - m, w + 2 * m, m, c, c, c);  // bottom
+    renderer.addRect(nw.x1 - m, nw.y1,     m, h,         c, c, c);  // left
+    renderer.addRect(nw.x2,     nw.y1,     m, h,         c, c, c);  // right
 }
 
 static Canvas2D gBeatOctCanvas;
 
+static const char* waveName(WaveformType w) {
+    switch (w) {
+        case WaveformType::Sine:     return "Sine";
+        case WaveformType::Square:   return "Square";
+        case WaveformType::Saw:      return "Saw";
+        case WaveformType::Triangle: return "Triangle";
+        default:                     return "Noise";
+    }
+}
+
+static WaveformType nextWave(WaveformType w) {
+    switch (w) {
+        case WaveformType::Sine:     return WaveformType::Square;
+        case WaveformType::Square:   return WaveformType::Saw;
+        case WaveformType::Saw:      return WaveformType::Triangle;
+        case WaveformType::Triangle: return WaveformType::Noise;
+        default:                     return WaveformType::Sine;
+    }
+}
+
+// Everything the control panel edits lives here. Sliders hold pointers into
+// `profile`, so an App must not be moved or copied after buildUI().
+struct App {
+    AudioEngine& engine;
+    ui::UI       ui;
+    ui::Widget*  noteWindow = nullptr;
+
+    Profile     profile;
+    int         currentProfile = 0;
+    float       bpm = 110.0f;
+    std::string freqText[3];         // percussion freq text boxes
+
+    explicit App(AudioEngine& e) : engine(e) {}
+    App(const App&) = delete;
+    App& operator=(const App&) = delete;
+
+    void sendProfile() { engine.setProfile(profile, currentProfile, noteMode); }
+
+    // Pull a profile from the engine; every bound widget updates automatically.
+    void loadProfile(int index) {
+        currentProfile = index;
+        profile = engine.getProfile(index, noteMode);
+        for (int k = 0; k < 3; k++) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.2f", profile.settings[k].freq);
+            freqText[k] = buf;
+        }
+        snapBlip = profile.settings[0].freq;
+    }
+
+    void exportWav() {
+        float length = 0.0f;
+        for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next_note(e))
+            length = e->time;
+        if (length > 0.0f) {
+            engine.setEvents(&gBeatOctCanvas.beatEvents);
+            SDL_Delay(50);
+            engine.exportWav(g_settings.wavName.data(), playhead_time, length);
+        }
+    }
+ 
+    void saveProject() {
+        Profile ps[10];
+        for (int i = 0; i < 10; i++) ps[i] = engine.getProfile(i, noteMode);
+        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, ps);
+    }
+ 
+    void loadProject() {
+        Profile ps[10];
+        load_song("session.son", &gBeatOctCanvas, ps, &gBeatOctCanvas.nextID);
+        gBeatOctCanvas.beatEvents.inorder();
+        gBeatOctCanvas.beatEvents.find_loop();
+        for (int i = 0; i < 10; i++) engine.setProfile(ps[i], i, noteMode);
+        loadProfile(currentProfile);   // refresh the panel
+    } 
+};
+
+// One oscillator column. The three columns differ only in x and index.
+static void addOscColumn(ui::Widget& cw, App& app, int k, float x) {
+    using namespace ui;
+    OSCSettings& s = app.profile.settings[k];
+    auto send     = [&app](Widget&) { app.sendProfile(); };
+    auto percOnly = [] { return !noteMode; };
+    std::string name = "OSC" + std::to_string(k + 1);
+
+    cw.add(button({x, 10, 120, 15}, "", [&app, k](Widget&) {
+        auto& wt = app.profile.settings[k].waveType;
+        wt = nextWave(wt);
+        app.sendProfile();
+    }))->labelFn = [&app, k, name] {
+        return name + ": " + waveName(app.profile.settings[k].waveType);
+    };
+
+    cw.add(slider({x,  30, 120, 15}, "Attack",  &s.attack,  0, 3, 1, send));
+    cw.add(slider({x,  50, 120, 15}, "Decay",   &s.decay,   0, 3, 1, send));
+    cw.add(slider({x,  70, 120, 15}, "Sustain", &s.sustain, 0, 1, 1, send));
+    cw.add(slider({x,  90, 120, 15}, "Release", &s.release, 0, 3, 1, send));
+    cw.add(slider({x, 110, 120, 15}, "Gain",    &s.gain,    0, 1, 5, send));
+    cw.add(slider({x, 130, 120, 15}, "Hold",    &s.hold,    0, 1, 3, send))
+        ->visibleFn = percOnly;
+
+    cw.add(textBox({x + 50, 150, 70, 15}, "Freq:", &app.freqText[k], [&app, k](Widget&) {
+        if (app.freqText[k].empty()) return;
+        app.profile.settings[k].freq = (float)std::atof(app.freqText[k].c_str());
+        if (k == 0) snapBlip = app.profile.settings[0].freq;
+        app.sendProfile();
+    }, /*labelLeft=*/true, {0.8f, 0.7f, 0.3f}))->visibleFn = percOnly;
+}
+
+static void buildUI(App& app) {
+    using namespace ui;
+    Widget& root = app.ui.root;
+ 
+    constexpr float MENU_BAR_H = 22.0f;
+ 
+    // Everything below the menu bar. An invisible container, so the old
+    // 75% / 25% split now applies to the space left after the menu bar.
+    Widget* content = root.add(panelFn([](const Rect& p) {
+        return Rect{p.x, p.y + MENU_BAR_H, p.w, p.h - MENU_BAR_H};
+    }, {}, /*fill=*/false));
+ 
+    // Bottom 75%: note window. Canvas2D draws inside its screen rect.
+    // Added first so the control panel draws on top of it, as before.
+    app.noteWindow = content->add(panel({0.0f, CW_HEIGHT, 1.0f, 1 - CW_HEIGHT - SW_HEIGHT},
+                                        {0, 0, 0}, 5.0f, true, Kind::Canvas));
+ 
+    // Top 25%: grey border panel, with the dark control window inset inside it
+    Widget* border = content->add(panel({0.0f, 0.0f, 1.0f, CW_HEIGHT},
+                                        {0.15f, 0.15f, 0.15f}, 2.0f, /*relative=*/true));
+    Widget* cw = border->add(panel({0, 0, 1, 1}, {0.01f, 0.03f, 0.07f}, 3.0f, true));
+
+    Widget* sBorder = content->add(panel({0.0f, 1 - SW_HEIGHT, 1.0f, SW_HEIGHT},
+                                        {0.15f, 0.15f, 0.15f}, 2.0f, true));
+    Widget* sw = sBorder->add(panel({0, 0, 1, 1}, {0.001f, 0.003f, 0.007f}, 3.0f, true));
+ 
+    // ---- Menu bar (added after `content` so it's on top) ----
+    Widget* menuBar = root.add(panelFn([](const Rect& p) {
+        return Rect{p.x, p.y, p.w, MENU_BAR_H};
+    }, {0.10f, 0.10f, 0.10f}));
+ 
+    // File menu. Item positions are relative to the "File" header.
+    Widget* file = menuBar->add(menu({4, 2, 40, 18}, "File"));
+    file->add(menuItem({0, 22, 150, 18}, "Export WAV",   [&app](Widget&) { app.exportWav(); }));
+    file->add(menuItem({0, 42, 150, 18}, "Save project", [&app](Widget&) { app.saveProject(); }));
+    file->add(menuItem({0, 62, 150, 18}, "Load project", [&app](Widget&) { app.loadProject(); }));
+    file->add(textBox({0, 102, 150, 18}, "Wav name:", &g_settings.wavName,
+                      {}, false, {0.85f, 0.85f, 0.85f}));
+ 
+    // ---- Control panel, left column ----
+    cw->add(slider({10, 10, 120, 15}, "BPM", &app.bpm, 20, 200, 1,
+                   [&app](Widget&) { app.engine.setTempo(app.bpm); }))
+        ->labelFn = [&app] { return "BPM: " + std::to_string((int)app.bpm); };
+
+    cw->add(textBox({10, 45, 120, 15}, "Ref. Freq.:", &g_settings.refFreq, [&app](Widget&) {
+        if (g_settings.refFreq.empty()) return;
+        ref = (float)std::atof(g_settings.refFreq.c_str());
+        app.engine.setFrequency(ref);
+    }));
+ 
+    cw->add(textBox({140, 25, 120, 15}, "Jump size:", &g_settings.jump, [&app](Widget&) {
+        std::string tmp = g_settings.jump;
+        char* p = tmp.data();
+        bool noVal = false;
+        int num = getNum(p, noVal);
+        p += 1;
+        int den = getNum(p, noVal);
+        if (den != 0) app.engine.setJump((float)num / (float)den);
+    }));
+    cw->add(textBox({140, 60, 120, 15}, "Split size:", &g_settings.split));
+
+    cw->add(textBox({270, 25, 120, 15}, "Harm. Range: ",   &g_settings.harmRange));
+    cw->add(textBox({270, 60, 120, 15}, "Alt. H. Range: ", &g_settings.altHarmRange));
+ 
+    // Oscillator columns
+    //for (int k = 0; k < 3; k++) addOscColumn(*cw, app, k, 140.0f + 130.0f * k);
+}
+
 int main(int, char**)
 {
-  computeComplexityOrder(20);
+    computeComplexityOrder(20);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
         return 1;
     }
-
+ 
     SDL_Window* window = SDL_CreateWindow(
         "Sonnote",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 720,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
-
+ 
     VulkanRenderer renderer = VulkanRenderer(window);
-
-    //table.add_variable("b", b);
-    //table.add_variable("t", t);
-    //table.add_constants();
-
-    // Audio
+ 
     AudioEngine engine;
     if (!engine.start()) {
         std::cerr << "Failed to start audio engine." << std::endl;
         return 1;
     }
     std::cout << "Audio engine started." << std::endl;
-
-    // Add tempo change event at beginning
+ 
     gBeatOctCanvas.setBPM("110", 0.0f);
-
+ 
     engine.setFrequency(440.0f);
     engine.setGain(0.4f);
     engine.setWaveform(WaveformType::Sine);
-    int waveType = 0;
     engine.setTempo(120.0f);
-
-    std::vector<Rect> rects;
-
-    CurrentBox nw;
-    CurrentBox cw;
-
-    std::vector<Button> buttons;
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[0], false); // Export wav
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[1], false, 0.5f); // BPM (110)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[2], false, 0.06667f); // Attack 1 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[3], false, 0.06667f); // Decay 1 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[4], false, 0.16f); // Gain 1 (value is sent as is)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[5], false, 0.0f, texts[0]); // WAV name
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[6], false, 0.0f, texts[1]); // Jump size
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[7], false, 0.0f, texts[2]); // Split size
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[8], false); // export MIDI
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[9], false); // Save project
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[10], false); // Load project
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[11], false); // Change wave
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[12], false, 0.7f); // Sustain 1
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[13], false, 0.0083333f); // Release 1
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[14], false, 0.0f); // Wavetype 1
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[15], false, 0.0f); // Wavetype 2
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[16], false, 0.06667f); // Attack 2 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[17], false, 0.06667f); // Decay 2 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[18], false, 0.7f); // Sustain 2 (value is sent as is)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[19], false, 0.0083333f); // Release 2 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[20], false, 0.0f); // Gain 2 (value is sent as is)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[21], false, 0.0f); // Wavetype 3
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[22], false, 0.06667f); // Attack 3 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[23], false, 0.06667f); // Decay 3 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[24], false, 0.7f); // Sustain 3 (value is sent as is)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[25], false, 0.0083333f); // Release 3 (value * 3 is sent)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[26], false, 0.0f); // Gain 3 (value is sent as is)
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[27], false, 0.0f, texts[3]); // Reference frequency
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[28], false, 0.1f); // OSC1 Hold
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[29], false, 0.1f, texts[4]); // Freq
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[30], false, 0.1f); // OSC2 Hold
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[31], false, 0.1f, texts[5]); // Freq
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[32], false, 0.1f); // OSC3 Hold
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[33], false, 0.1f, texts[6]); // Freq
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[34], false, 0.0f, texts[7]); // Harmonic range
-    buttons.emplace_back(0.0f, 0.0f, 0.0f, 0.0f, buttonLabels[35], false, 0.0f, texts[8]); // Alt. harmonic range
-    engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
-
-    //rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.07f, 0.07f, 0.07f, 2.0f, F_MARGIN_PANEL});
-    rects.push_back({0.0f, 0.0f, 1.0f, NW_HEIGHT, 0.0f, 0.0f, 0.0f, 5.0f, F_NOTE_WINDOW});
-    rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.15f, 0.15f, 0.15f, 2.0f, F_MARGIN_PANEL});
-    rects.push_back({0.0f, NW_HEIGHT, 1.0f, 1 - NW_HEIGHT, 0.01f, 0.03f, 0.07f, 5.0f, F_CONTROL_WINDOW});
-    // BPM
-    rects.push_back({10.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 1.0f, F_SLIDER_CW});
-    // OSC1 Settings
-    rects.push_back({140.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 14.0f, F_BUTTON_CW});
-    rects.push_back({140.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 2.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 3.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 12.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 13.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 4.0f, F_SLIDER_CW});
-    rects.push_back({140.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 28.0f, F_SLIDER_P_CW});
-    rects.push_back({190.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 29.0f, F_TEXT_BOXL_CW});
-    // WAV Save name, jump size, split size text boxes
-    rects.push_back({10.0f, 145.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 5.0f, F_TEXT_BOX_CW});
-    rects.push_back({10.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 6.0f, F_TEXT_BOX_CW});
-    rects.push_back({10.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 7.0f, F_TEXT_BOX_CW});
-    rects.push_back({140.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 27.0f, F_TEXT_BOX_CW});
-    // Export WAV, export MIDI, save project, load project buttons
-    rects.push_back({10.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 0.0f, F_BUTTON_CW});
-    rects.push_back({10.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 8.0f, F_BUTTON_CW});
-    rects.push_back({10.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 9.0f, F_BUTTON_CW});
-    rects.push_back({10.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 10.0f, F_BUTTON_CW});
-    rects.push_back({10.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 11.0f, F_BUTTON_CW});
-    // OSC2 Settings
-    rects.push_back({270.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 15.0f, F_BUTTON_CW});
-    rects.push_back({270.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 16.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 17.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 18.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 19.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 20.0f, F_SLIDER_CW});
-    rects.push_back({270.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 30.0f, F_SLIDER_P_CW});
-    rects.push_back({320.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 31.0f, F_TEXT_BOXL_CW});
-    rects.push_back({270.0f, 180.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 34.0f, F_TEXT_BOX_CW});
-    rects.push_back({270.0f, 215.0f, 120.0f, 15.0f, 0.2f, 0.2f, 0.2f, 35.0f, F_TEXT_BOX_CW});
-    // OSC3 Settings
-    rects.push_back({400.0f, 10.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 21.0f, F_BUTTON_CW});
-    rects.push_back({400.0f, 30.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 22.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 50.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 23.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 70.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 24.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 90.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 25.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 110.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 26.0f, F_SLIDER_CW});
-    rects.push_back({400.0f, 130.0f, 120.0f, 15.0f, 0.8f, 0.7f, 0.3f, 32.0f, F_SLIDER_P_CW});
-    rects.push_back({450.0f, 150.0f, 70.0f, 15.0f, 0.8f, 0.7f, 0.3f, 33.0f, F_TEXT_BOXL_CW});
-
-    // 1) Build spectrogram on CPU
-    // GrayImage img = buildSpectrogramTextureR8(
-    //     "file.wav",
-    //     2048,        // FFT size
-    //     512,         // hop
-    //     512,         // log rows
-    //     4096,        // texture width
-    //     -80.0f,      // dB floor
-    //     20.0f,
-    //     20000.0f
-    // );
-
-    // // for (int i = 0; i < (int)img.px.size(); i++) {
-    // //     printf("%d ", img.px[i]);
-    // // }
-
-    // AudioData audio = loadWavMono("file.wav");
-
+    engine.setADSR({0.2f, 0.2f, 0.7f, 0.025f});   // same values the old buttons produced
+ 
+    App app(engine);
+    buildUI(app);
+    app.loadProfile(0);
+ 
     renderer.createSpectrogramPipeline();
-
-    // // 2) Upload to GPU
-    // renderer.uploadSpectrogramR8(
-    //     img.px.data(),
-    //     img.w,
-    //     img.h
-    // );
-
-    // --- Cache metadata for rendering ---
-    // spectrogram.loaded = true;
-    // spectrogram.durationSeconds =
-    //     (float)audio.mono.size() / (float)audio.sampleRate;
-    // spectrogram.textureWidth = img.w;
-
+ 
     bool running = true;
     bool playing = false;
-    bool size_changed = false;
     bool rerender = true;
     bool ctrl = false;
-    //uint32_t bpm = 110;
-    int selected = -1;
     int click = 0;
-    int dx, dy;
+    int dx = 0, dy = 0;
     int sens = 15;
-    int currentProfile = 0;
     bool windowActive = true;
-    dx = dy = 0;
     Vec2 hover = {-1.0f, -1.0f};
     std::vector<char> keys;
-    Profile profileSettings;
     float inputFreqSum = 0.0f;
     int inputFreqi = 0;
     STFTMag res;
-    bool lastMode = noteMode;
+ 
     while (running) {
-        //if (lastMode != noteMode) {
-        //  engine.getProfile(currentProfile, noteMode);
-        //  lastMode = noteMode;
-        //}
-
         if (newAudioIn) {
-          std::vector<float> v(audioIn, audioIn + audioBufferSize);
-          res = computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
-          //memcpy(pendingAudioOut, audioIn, audioBufferSize);
-          //printf("IN: %f, AUDIOOUT:%f\n", audioIn[0], pendingAudioOut[0]);
-          //printf("frames: %d\n", frames);
-          //printf("bin: %d\n", res.highBins[0]);
-          //for (int i = 20; i >= 0; i--) {
-          //  printf("%d\n", res.highBins[frames - i]);
-          //}
-
-          //printf("resolution: %f, current Freq: %f\n", engine.sampleRate / audioBufferSize, (engine.sampleRate * res.highBin) / audioBufferSize);
-
-          float resFreq = (engine.sampleRate * res.highBin) / audioBufferSize;
-          if (!isnan(resFreq)) {
-            inputFreqSum += resFreq;
-            inputFreqi++;
-            if (inputFreqi == 3) {
-              inputFreq = inputFreqSum / 3;
-              printf("inputFreq: %f\n", inputFreq);
-              rerender = true;
-              inputFreqi = 0;
-              inputFreqSum = 0;
+            std::vector<float> v(audioIn, audioIn + audioBufferSize);
+            res = computeSTFT_FFTW(v, engine.sampleRate, audioBufferSize);
+            float resFreq = (engine.sampleRate * res.highBin) / audioBufferSize;
+            if (!isnan(resFreq)) {
+                inputFreqSum += resFreq;
+                inputFreqi++;
+                if (inputFreqi == 3) {
+                    inputFreq = inputFreqSum / 3;
+                    rerender = true;
+                    inputFreqi = 0;
+                    inputFreqSum = 0;
+                }
             }
-          }
-
-          newAudioOut = true;
-          newAudioIn = false;
+            newAudioOut = true;
+            newAudioIn = false;
         }
+ 
         SDL_Event e;
         keys.clear();
-        if (ctrl) {
-            keys.push_back('~');
-        }
+        if (ctrl) keys.push_back('~');
         dx = dy = 0;
+ 
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_WINDOWEVENT) {
-                switch (e.window.event) {
-                    case SDL_WINDOWEVENT_FOCUS_GAINED:
-                        windowActive = true;
-                        break;
-
-                    case SDL_WINDOWEVENT_FOCUS_LOST:
-                        windowActive = false;
-                        break;
-                }
-            }
             rerender = true;
-            if (e.type == SDL_QUIT) running = false;
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
-                e.window.windowID == SDL_GetWindowID(window)) running = false;
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                size_changed = true;
-                renderer.onResize(window);
-            }
-            if (e.type == SDL_MOUSEBUTTONDOWN) {
-                selected = -1;
-                int dw, dh;
-                SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
-                float ax = e.button.x;
-                float ay = (float)dh - e.button.y;
-
-                if (e.button.button == SDL_BUTTON_LEFT) {
-                    click = 1;
-                    for (int i = 0; i < (int)buttons.size(); i++) {
-                        if (ax >= buttons[i].x1 && ax <= buttons[i].x2 && \
-                            ay >= buttons[i].y1 && ay <= buttons[i].y2) {
-                            if (i == 5 || i == 6 || i == 7 || i == 27 || i == 29 || i == 31 || i == 33 || i == 34 || i == 35) selected = i;
-                            buttons[i].hit = true;
-                            if (i != 14 && i != 15 && i != 21)
-                                buttons[i].value = (ax - buttons[i].x1) / (buttons[i].x2  - buttons[i].x1);
-                            if (i == 1) {
-                                engine.setTempo(buttons[1].value * 180 + 20);
-                            } else if (i == 2 || i == 3 || i == 4 || (i >= 12 && i <= 26)) {
-                                // Set and send current profile
-                                profileSettings.settings[0].attack = buttons[2].value * 3.0f;
-                                profileSettings.settings[0].decay = buttons[3].value * 3.0f;
-                                profileSettings.settings[0].gain = buttons[4].value;
-                                profileSettings.settings[0].sustain = buttons[12].value;
-                                profileSettings.settings[0].release = buttons[13].value * 3.0f;
-                                if (i == 14) {
-                                    buttons[14].value = buttons[14].value + 1.0f;
-                                    if (std::floor(buttons[14].value) == 5) {
-                                        buttons[14].value = 0.0f;
-                                    }
-                                }
-                                int type = (int)buttons[14].value;
-                                if (type == 0) {
-                                    profileSettings.settings[0].waveType = WaveformType::Sine;
-                                    sprintf(buttons[14].label, "OSC1: Sine");
-                                } else if (type == 1) {
-                                    profileSettings.settings[0].waveType = WaveformType::Square;
-                                    sprintf(buttons[14].label, "OSC1: Square");
-                                } else if (type == 2) {
-                                    profileSettings.settings[0].waveType = WaveformType::Saw;
-                                    sprintf(buttons[14].label, "OSC1: Saw");
-                                } else if (type == 3) {
-                                    profileSettings.settings[0].waveType = WaveformType::Triangle;
-                                    sprintf(buttons[14].label, "OSC1: Triangle");
-                                } else if (type == 4) {
-                                    profileSettings.settings[0].waveType = WaveformType::Noise;
-                                    sprintf(buttons[14].label, "OSC1: Noise");
-                                }
-                                if (i == 15) {
-                                    buttons[15].value = buttons[15].value + 1.0f;
-                                    if (std::floor(buttons[15].value) == 5) {
-                                        buttons[15].value = 0.0f;
-                                    }
-                                }
-                                type = (int)buttons[15].value;
-                                if (type == 0) {
-                                    profileSettings.settings[1].waveType = WaveformType::Sine;
-                                    sprintf(buttons[15].label, "OSC2: Sine");
-                                } else if (type == 1) {
-                                    profileSettings.settings[1].waveType = WaveformType::Square;
-                                    sprintf(buttons[15].label, "OSC2: Square");
-                                } else if (type == 2) {
-                                    profileSettings.settings[1].waveType = WaveformType::Saw;
-                                    sprintf(buttons[15].label, "OSC2: Saw");
-                                } else if (type == 3) {
-                                    profileSettings.settings[1].waveType = WaveformType::Triangle;
-                                    sprintf(buttons[15].label, "OSC2: Triangle");
-                                } else if (type == 4) {
-                                    profileSettings.settings[1].waveType = WaveformType::Noise;
-                                    sprintf(buttons[15].label, "OSC2: Noise");
-                                }
-                                profileSettings.settings[1].attack = buttons[16].value * 3.0f;
-                                profileSettings.settings[1].decay = buttons[17].value * 3.0f;
-                                profileSettings.settings[1].sustain = buttons[18].value;
-                                profileSettings.settings[1].release = buttons[19].value * 3.0f;
-                                profileSettings.settings[1].gain = buttons[20].value;
-                                if (i == 21) {
-                                    buttons[i].value = buttons[21].value + 1.0f;
-                                    if (std::floor(buttons[i].value) == 5) {
-                                        buttons[i].value = 0.0f;
-                                    }
-                                }
-                                type = (int)buttons[21].value;
-                                if (type == 0) {
-                                    profileSettings.settings[2].waveType = WaveformType::Sine;
-                                    sprintf(buttons[21].label, "OSC3: Sine");
-                                } else if (type == 1) {
-                                    profileSettings.settings[2].waveType = WaveformType::Square;
-                                    sprintf(buttons[21].label, "OSC3: Square");
-                                } else if (type == 2) {
-                                    profileSettings.settings[2].waveType = WaveformType::Saw;
-                                    sprintf(buttons[21].label, "OSC3: Saw");
-                                } else if (type == 3) {
-                                    profileSettings.settings[2].waveType = WaveformType::Triangle;
-                                    sprintf(buttons[21].label, "OSC3: Triangle");
-                                } else if (type == 4) {
-                                    profileSettings.settings[2].waveType = WaveformType::Noise;
-                                    sprintf(buttons[21].label, "OSC3: Noise");
-                                }
-                                profileSettings.settings[2].attack = buttons[22].value * 3.0f;
-                                profileSettings.settings[2].decay = buttons[23].value * 3.0f;
-                                profileSettings.settings[2].sustain = buttons[24].value;
-                                profileSettings.settings[2].release = buttons[25].value * 3.0f;
-                                profileSettings.settings[2].gain = buttons[26].value;
-                                printf("SP");
-                                engine.setProfile(profileSettings, currentProfile, noteMode);
-                                // engine.setADSR({buttons[2].value * 3.0f, buttons[3].value * 3.0f, buttons[12].value, buttons[13].value * 3.0f});
-                            } else if (i == 4) {
-                                engine.setGain(buttons[4].value);
-                            }
-                        }
-                    }
-                } else if (e.button.button == SDL_BUTTON_RIGHT) {
-                    click = 2;
-                }
-            }
-            if (e.type == SDL_MOUSEBUTTONUP) {
+            switch (e.type) {
+            case SDL_QUIT:
+                running = false;
+                break;
+ 
+            case SDL_WINDOWEVENT:
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) windowActive = true;
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   windowActive = false;
+                if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) renderer.onResize(window);
+                if (e.window.event == SDL_WINDOWEVENT_CLOSE &&
+                    e.window.windowID == SDL_GetWindowID(window)) running = false;
+                break;
+ 
+            case SDL_MOUSEBUTTONDOWN:
+               if (e.button.button == SDL_BUTTON_LEFT) {
+                 if (!app.ui.mouseDown((float)e.button.x, (float)e.button.y))
+                   click = 1;
+               } else if (e.button.button == SDL_BUTTON_RIGHT) {
+                 if (app.ui.openMenu) app.ui.closeMenu();
+                 else click = 2;
+               }
+               break;
+ 
+            case SDL_MOUSEBUTTONUP:
                 click = 0;
-            }
-            if (e.type == SDL_KEYDOWN) {
+                break;
+ 
+            case SDL_KEYDOWN: {
                 char key = e.key.keysym.sym;
-                if (e.key.keysym.sym == SDLK_LCTRL) {
-                    ctrl = true;
-                } else {
-                    keys.push_back(key);
+                if (key == SDLK_ESCAPE) {
+                  if (app.ui.openMenu) app.ui.closeMenu();
+                  else running = false;
+                  break;
                 }
-                if (key == SDLK_ESCAPE) running = false;
-
-                if ((key >= 48 && key <= 57) || key == 'm') {
-                    if (key != 'm')
-                      currentProfile = (int)key - 48;
-                    else
-                      noteMode = !noteMode;
-                    profileSettings = engine.getProfile(currentProfile, noteMode);
-                    //TODO: fillProfileDisplayData(profileSettings, profileDisplaySettings)
-                    switch (profileSettings.settings[0].waveType) {
-                        case (WaveformType::Sine):
-                            buttons[14].value = 0.0f;
-                            sprintf(buttons[14].label, "OSC1: Sine");
-                            break;
-                        case (WaveformType::Square):
-                            buttons[14].value = 1.0f;
-                            sprintf(buttons[14].label, "OSC1: Square");
-                            break;
-                        case (WaveformType::Saw):
-                            buttons[14].value = 2.0f;
-                            sprintf(buttons[14].label, "OSC1: Saw");
-                            break;
-                        case (WaveformType::Triangle):
-                            buttons[14].value = 3.0f;
-                            sprintf(buttons[14].label, "OSC1: Triangle");
-                            break;
-                        default:
-                            buttons[14].value = 4.0f;
-                            sprintf(buttons[14].label, "OSC1: Noise");
-                    }
-                    switch (profileSettings.settings[1].waveType) {
-                        case (WaveformType::Sine):
-                            buttons[15].value = 0.0f;
-                            sprintf(buttons[15].label, "OSC2: Sine");
-                            break;
-                        case (WaveformType::Square):
-                            buttons[15].value = 1.0f;
-                            sprintf(buttons[15].label, "OSC2: Square");
-                            break;
-                        case (WaveformType::Saw):
-                            buttons[15].value = 2.0f;
-                            sprintf(buttons[15].label, "OSC2: Saw");
-                            break;
-                        case (WaveformType::Triangle):
-                            buttons[15].value = 3.0f;
-                            sprintf(buttons[15].label, "OSC2: Triangle");
-                            break;
-                        default:
-                            buttons[15].value = 4.0f;
-                            sprintf(buttons[15].label, "OSC2: Noise");
-                    }
-                    switch (profileSettings.settings[2].waveType) {
-                        case (WaveformType::Sine):
-                            buttons[21].value = 0.0f;
-                            sprintf(buttons[21].label, "OSC3: Sine");
-                            break;
-                        case (WaveformType::Square):
-                            buttons[21].value = 1.0f;
-                            sprintf(buttons[21].label, "OSC3: Square");
-                            break;
-                        case (WaveformType::Saw):
-                            buttons[21].value = 2.0f;
-                            sprintf(buttons[21].label, "OSC3: Saw");
-                            break;
-                        case (WaveformType::Triangle):
-                            buttons[21].value = 3.0f;
-                            sprintf(buttons[21].label, "OSC3: Triangle");
-                            break;
-                        default:
-                            buttons[21].value = 4.0f;
-                            sprintf(buttons[21].label, "OSC3: Noise");
-                    }
-                    buttons[2].value = profileSettings.settings[0].attack / 3.0f;
-                    buttons[3].value = profileSettings.settings[0].decay / 3.0f;
-                    buttons[4].value = profileSettings.settings[0].gain;
-                    buttons[12].value = profileSettings.settings[0].sustain;
-                    buttons[13].value = profileSettings.settings[0].release / 3.0f;
-                    buttons[16].value = profileSettings.settings[1].attack / 3.0f;
-                    buttons[17].value = profileSettings.settings[1].decay / 3.0f;
-                    buttons[18].value = profileSettings.settings[1].sustain;
-                    buttons[19].value = profileSettings.settings[1].release / 3.0f;
-                    buttons[20].value = profileSettings.settings[1].gain;
-                    buttons[22].value = profileSettings.settings[2].attack / 3.0f;
-                    buttons[23].value = profileSettings.settings[2].decay / 3.0f;
-                    buttons[24].value = profileSettings.settings[2].sustain;
-                    buttons[25].value = profileSettings.settings[2].release / 3.0f;
-                    buttons[26].value = profileSettings.settings[2].gain;
-                    buttons[28].value = profileSettings.settings[0].hold;
-                    buttons[29].value = profileSettings.settings[0].freq;
-                    sprintf(texts[4], "%.2f", profileSettings.settings[0].freq);
-                    snapBlip = profileSettings.settings[0].freq;
-                    buttons[30].value = profileSettings.settings[1].hold;
-                    buttons[31].value = profileSettings.settings[1].freq;
-                    sprintf(texts[5], "%.2f", profileSettings.settings[1].freq);
-                    buttons[32].value = profileSettings.settings[2].hold;
-                    buttons[33].value = profileSettings.settings[2].freq;
-                    sprintf(texts[6], "%.2f", profileSettings.settings[2].freq);
+                if (e.key.keysym.sym == SDLK_LCTRL) { ctrl = true; break; }
+ 
+                // Typing into a text box shouldn't also trigger shortcuts
+                if (app.ui.keyDown(key)) break;
+ 
+                keys.push_back(key);
+                if (key >= '0' && key <= '9') {
+                    app.loadProfile(key - '0');
+                } else if (key == 'm') {
+                    noteMode = !noteMode;
+                    app.loadProfile(app.currentProfile);
+                } else if (key == 'n') {
+                    engine.toggleFreeze();
                 }
-                if (selected != -1) {
-                  if (key >= 32 && key <= 126 && strlen(buttons[selected].text) <= 14) {
-                    if (buttons[selected].text[0] == ' ')
-                      sprintf(buttons[selected].text, "%c", key);
-                    else
-                      sprintf(buttons[selected].text, "%s%c", buttons[selected].text, key);
-                    if (selected == 27) {
-                      ref = atof(buttons[selected].text);
-                      engine.setFrequency(ref);
-                    }
-                  }
-                  else if ((key == 127 || key == 8) && strlen(buttons[selected].text) > 0) {
-                      buttons[selected].text[strlen(buttons[selected].text) - 1] = '\0';
-                      if (selected == 27 && strlen(buttons[selected].text) > 0) {
-                        ref = atof(buttons[selected].text);
-                        engine.setFrequency(ref);
-                      }
-                  }
-                  if (selected == 6) {
-                    char* current = buttons[selected].text;
-                    bool noVal = false;
-                    int num = getNum(current, noVal);
-                    current += 1;
-                    int den = getNum(current, noVal);
-                    engine.setJump((float)num / (float) den);
-                  }
-                } else {
-                  if (key == 'n') {
-                      engine.toggleFreeze();
-                  }
-                }
+                break;
             }
-            if (e.type == SDL_KEYUP) {
-                if (e.key.keysym.sym == SDLK_LCTRL) {
-                    ctrl = false;
-                }
-            }
-            if (e.type == SDL_MOUSEMOTION) {
+ 
+            case SDL_KEYUP:
+                if (e.key.keysym.sym == SDLK_LCTRL) ctrl = false;
+                break;
+ 
+            case SDL_MOUSEMOTION: {
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
-                float nx = e.button.x  / (float)dw;
-                float ny = ((float)dh - e.button.y) / (float)dh;
-
-                if (nx >= nw.x1 && nx <= nw.x2 && ny >= nw.y1 && ny <= nw.y2) {
-                    hover.x = nx;
-                    hover.y = ny;
-                } else {
-                    hover.x = -1.0f;
-                    hover.y = -1.0f;
-                }
+                float mx = (float)e.motion.x, my = (float)e.motion.y;
+                if (!app.ui.openMenu && app.noteWindow->screen.contains(mx, my))
+                    hover = {mx, (float)dh - my};       // canvas expects y-up pixels
+                else
+                    hover = {-1.0f, -1.0f};
+                break;
             }
-            if (e.type == SDL_MOUSEWHEEL) {
+ 
+            case SDL_MOUSEWHEEL:
                 dx = e.wheel.x * sens;
                 dy = e.wheel.y * sens;
-
-                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
-                    dx = -dx;
-                    dy = -dy;
-                }
+                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { dx = -dx; dy = -dy; }
+                break;
             }
         }
-
-        // Process events
-
-        //bpm = (int)(buttons[1].value * 180 + 20);
-
-        if (play_triggered_from_space) { // Handle play
+ 
+        if (play_triggered_from_space) {
             play_triggered_from_space = false;
             if (!playing) {
-                // Build events from current points
-
-                //gBeatOctCanvas.beatEvents.create_order();
-
                 engine.setEvents(&(gBeatOctCanvas.beatEvents));
-                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time), calc_beat(&gBeatOctCanvas.timeEvents, loop_end));
-                printf("playhead_beat: %f\n", calc_beat(&gBeatOctCanvas.timeEvents, playhead_time));
+                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time),
+                                          calc_beat(&gBeatOctCanvas.timeEvents, loop_end));
                 engine.setPlayState(true);
             } else {
                 engine.setPlayState(false);
             }
             playing = !playing;
         }
-
+ 
         if (tuner_triggered) {
-          engine.toggleTuner();
-          tuner_triggered = false;
+            engine.toggleTuner();
+            tuner_triggered = false;
         }
-
-        if (buttons[0].hit) {
-            Event* current = gBeatOctCanvas.beatEvents.get_first();
-            float length = 0.0f;
-            while (current) {
-              length = current->time;
-              current = next_note(current);
-            }
-
-            if (length > 0.0) {
-                engine.setEvents(&gBeatOctCanvas.beatEvents);
-                SDL_Delay(50);
-                engine.exportWav(buttons[5].text, playhead_time, length);
-            }
-            buttons[0].hit = false;
-        }
-
-        if (buttons[8].hit) { // if export midi button is pressed
-            buttons[8].hit = false;
-        }
-
-        if (buttons[9].hit) { // if save project button is pressed
-            Profile ps[10];
-            for (int i = 0; i < 10; i++) {
-                ps[i] = engine.getProfile(i, noteMode);
-                if (i == 0) {
-                    printf("attack: %f\n", ps[i].settings[0].attack);
-                    uint32_t val_number32;
-                    memcpy(&val_number32, &ps[i].settings[0].attack, sizeof(val_number32));
-                    printf("attackNum: %08x", val_number32);
-                }
-            }
-            save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, ps);
-            buttons[9].hit = false;
-        }
-
-        if (buttons[10].hit) { // If load project button is pressed
-            Profile ps[10];
-            load_song("session.son", &gBeatOctCanvas, ps, &gBeatOctCanvas.nextID);
-            printf("nextID: %d\n", gBeatOctCanvas.nextID);
-            gBeatOctCanvas.beatEvents.inorder();
-            gBeatOctCanvas.beatEvents.find_loop();
-            for (int i = 0; i < 10; i++) {
-                if (i == 0) {
-                    printf("attack: %f", ps[i].settings[0].attack);
-                }
-                engine.setProfile(ps[i], i, noteMode);
-            }
-            buttons[10].hit = false;
-        }
-
-        if (buttons[11].hit) {
-            switch (waveType) {
-                case 0:
-                    engine.setWaveform(WaveformType::Square);
-                    break;
-                case 1:
-                    engine.setWaveform(WaveformType::Saw);
-                    break;
-                case 2:
-                    engine.setWaveform(WaveformType::Triangle);
-                    break;
-                case 3:
-                    engine.setWaveform(WaveformType::Sine);
-                    break;
-            }
-            printf("waveType: %d\n", waveType);
-            waveType++;
-            if (waveType == 4) waveType = 0;
-            buttons[11].hit = false;
-        }
-
-        // Refer to notes for what was here
-        // Clear vertex list and rebuild from rectangles
+ 
         if (windowActive && rerender) {
             renderer.vertices.clear();
             int dw, dh;
             SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
-            for (auto& r : rects) {
-                float x, y, w, h;
-                float sliderPoint = -1.0f;
-                x = r.x * dw;
-                y = r.y * dh;
-                w = r.w * dw;
-                h = r.h * dh;
-                bool selection = false;
-                if (noteMode && (r.function == F_SLIDER_P_CW || r.function == F_TEXT_BOXL_CW))
-                  continue;
-                switch (r.function) {
-                    case F_SLIDER_CW:
-                    case F_SLIDER_P_CW:
-                    case F_TEXT_BOX_CW:
-                    case F_TEXT_BOXL_CW:
-                    case F_BUTTON_CW: {
-                        // x is distance from left edge of control window
-                        // y is distance from top edge of control window
-                        x = r.x + (cw.x1 * dw);
-                        y = (cw.y2 * (int)dh) - r.y - r.h;
-                        w = r.w;
-                        h = r.h;
-                        buttons[(int)r.utility].x1 = x;
-                        buttons[(int)r.utility].x2 = x + w;
-                        buttons[(int)r.utility].y1 = y;
-                        buttons[(int)r.utility].y2 = y + h;
-                        if (r.function == F_SLIDER_CW || r.function == F_SLIDER_P_CW) {
-                            sliderPoint = x + r.w * buttons[(int)r.utility].value;
-                            if (buttons[(int)r.utility].label[0] == 'B') {
-                                sprintf(buttons[(int)r.utility].label, "BPM: %d", (int)std::floor(buttons[(int)r.utility].value * 180 + 20));
-                            } else if (buttons[(int)r.utility].label[0] == 'A') {
-                                sprintf(buttons[(int)r.utility].label, "Attack: %.3f", buttons[(int)r.utility].value * 3.0f);
-                            } else if (buttons[(int)r.utility].label[0] == 'D') {
-                                sprintf(buttons[(int)r.utility].label, "Decay: %.3f", buttons[(int)r.utility].value * 3.0f);
-                            } else if (buttons[(int)r.utility].label[0] == 'S') {
-                                sprintf(buttons[(int)r.utility].label, "Sustain: %.3f", buttons[(int)r.utility].value);
-                            } else if (buttons[(int)r.utility].label[0] == 'R') {
-                                sprintf(buttons[(int)r.utility].label, "Release: %.3f", buttons[(int)r.utility].value * 3.0f);
-                            } else if (buttons[(int)r.utility].label[0] == 'G') {
-                                sprintf(buttons[(int)r.utility].label, "Gain: %.3f", buttons[(int)r.utility].value * 5.0);
-                            } else if (buttons[(int)r.utility].label[0] == 'H') {
-                              printf("hold: %f\n", buttons[(int)r.utility].value * 3.0f);
-                              sprintf(buttons[(int)r.utility].label, "Hold: %.3f", buttons[(int)r.utility].value * 3.0f);
-                            }
-                        } else if (r.function == F_TEXT_BOX_CW) {
-                            if (selected == (int)r.utility)
-                                selection = true;
-                            renderer.addText(buttons[(int)r.utility].label, x + 2, y + 19, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-                            renderer.addText(buttons[(int)r.utility].text, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-                        } else if (r.function == F_TEXT_BOXL_CW) {
-                          if (selected == (int)r.utility)
-                            selection = true;
-                          renderer.addText(buttons[(int)r.utility].label, x - 50, y + 2, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-                          renderer.addText(buttons[(int)r.utility].text, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-                        }
-                        if (r.function != F_TEXT_BOX_CW && r.function != F_TEXT_BOXL_CW)
-                            renderer.addText(buttons[(int)r.utility].label, x + 2, y + 2, 15.0f, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-                        break;
-                    } case F_BORDER:
-                        x -= r.utility;
-                        y -= r.utility;
-                        w += r.utility * 2;
-                        h += r.utility * 2;
-                        break;
-                    case F_MARGIN_PANEL:
-                    case F_NOTE_WINDOW:
-                    case F_CONTROL_WINDOW:
-                        x += r.utility;
-                        y += r.utility;
-                        w -= r.utility * 2;
-                        h -= r.utility * 2;
-                        if (size_changed) {
-                            if (r.function == F_NOTE_WINDOW) {
-                                nw.x1 = x / dw;
-                                nw.y1 = y / dh;
-                                nw.x2 = (x + w) / dw;
-                                nw.y2 = (y + h) / dh;
-                            } else if (r.function == F_CONTROL_WINDOW) {
-                                cw.x1 = x / dw;
-                                cw.y1 = y / dh;
-                                cw.x2 = (x + w) / dw;
-                                cw.y2 = (y + h) / dh;
-                            }
-                        }
-                        break;
-                }
-
-                if (!selection)
-                    renderer.addRect(x, y, w, h, r.r, r.g, r.b);
-                else
-                    renderer.addRect(x, y, w, h, 0.4f, 0.4f, 0.8f);
-                if (sliderPoint != -1.0f)
-                    renderer.addRect(sliderPoint - 1, y, 2, h, 0.8f, 0.0, 0.0);
-            }
-            // printf("1");
-
-            CurrentBox screenNw;
-            screenNw.x1 = nw.x1 * dw;
-            screenNw.x2 = nw.x2 * dw;
-            screenNw.y1 = nw.y1 * dh;
-            screenNw.y2 = nw.y2 * dh;
-
-            Vec2 screenHover;
-            screenHover.x = hover.x * dw;
-            screenHover.y = hover.y * dh;
-            gBeatOctCanvas.draw(renderer, screenNw, screenHover, click, keys, buttons[6].text, buttons[7].text, dx, dy);
+ 
+            app.ui.layout((float)dw, (float)dh);
+            app.ui.draw(renderer, (float)dh);
+ 
+            const ui::Rect& s = app.noteWindow->screen;
+            printf("nws: {%f, %f, %f, %f}\n", s.x, s.y, s.w, s.h);
+            CurrentBox screenNw{ s.x, (float)dh - (s.y + s.h), s.x + s.w, (float)dh - s.y };
+ 
+            char* jump  = g_settings.jump.data();
+            char* split = g_settings.split.data();
+            gBeatOctCanvas.draw(renderer, screenNw, hover, click, keys, jump, split, dx, dy);
             drawMargin(renderer, screenNw);
-
+            renderer.nextLayer();
+            app.ui.drawOverlay(renderer, (float)dh);   // dropdowns on top of everything
+ 
             renderer.updateVertexData();
-            renderer.drawFrame(std::floor(screenNw.x1), std::floor(screenNw.y1), std::floor(screenNw.x2 - screenNw.x1), std::floor(screenNw.y2 - screenNw.y1));
-            if (size_changed) size_changed = false;
+            renderer.drawFrame(std::floor(screenNw.x1), std::floor(screenNw.y1),
+                               std::floor(screenNw.x2 - screenNw.x1),
+                               std::floor(screenNw.y2 - screenNw.y1));
             rerender = false;
         } else {
             SDL_Delay(50);
         }
     }
-
+ 
     engine.stop();
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
 }
-

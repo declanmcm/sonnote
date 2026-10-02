@@ -51,6 +51,10 @@ public:
 
     void addText(const char* text, float x, float y, float scale, const glm::vec4& colour);
 
+    // Start a new draw layer. Everything (rects AND text) added after this call
+    // is drawn on top of everything added before it. Layers reset every frame.
+    void nextLayer() { layerStarts.push_back({vertices.size(), texts.size()}); }
+
     std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
 
@@ -415,6 +419,10 @@ private:
     VkSemaphore imageAvailable{}, renderFinished{};
 
     std::vector<Text> texts;
+
+    // Where each layer after the first begins (see nextLayer())
+    struct LayerStart { size_t vertex; size_t text; };
+    std::vector<LayerStart> layerStarts;
 
     // --- Spectrogram texture resources ---
     VkImage spectroImage{};

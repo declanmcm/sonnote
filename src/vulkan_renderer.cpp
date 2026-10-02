@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <algorithm>
 
 VulkanRenderer::VulkanRenderer(SDL_Window* win) : window(win) {
     if (createInstance() < 0) {
@@ -369,86 +370,91 @@ void VulkanRenderer::drawFrame(uint32_t canvasX, uint32_t canvasY, uint32_t canv
     updateTransientVertexBuffer(blackQuad, sizeof(blackQuad));
     VkBuffer buffers[] = { transientQuadBuffer };
     VkDeviceSize offsets[] = {0};
-    // vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-    // vkCmdDraw(cmd, 6, 1, 0, 0);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    // ============================================================
+    // 3) LAYERS
+    // Each layer draws its rects, then its text, before the next
+    // layer starts — so a later layer covers earlier text too.
+    // ============================================================
+    std::vector<LayerStart> starts;
+    starts.push_back({0, 0});
+    for (const auto& ls : layerStarts) starts.push_back(ls);
+    const size_t layerCount = starts.size();
 
-    if (!vertices.empty() && (int)vertices.size() >= 12) {
-        VkBuffer tempBuffers[] = {vertexBuffer};
-        vkCmdBindVertexBuffers(cmd, 0, 1, tempBuffers, offsets);
-        vkCmdDraw(cmd, 12, 1, 0, 0);
+    // Stage all text once, remembering where each layer's glyphs begin.
+    // textVertStart[L] .. textVertStart[L+1] are layer L's text vertices.
+    textRenderer.beginTextSubmission();
+    std::vector<uint32_t> textVertStart(layerCount + 1, 0);
+    {
+        size_t layer = 0;
+        for (size_t i = 0; i < texts.size(); ++i) {
+            while (layer + 1 < layerCount && i >= starts[layer + 1].text)
+                textVertStart[++layer] = (uint32_t)textRenderer.stagedVertexCount();
+            const Text& t = texts[i];
+            textRenderer.addText(t.text, t.x, t.y, t.size, t.colour, cmd);
+        }
+        while (layer < layerCount)
+            textVertStart[++layer] = (uint32_t)textRenderer.stagedVertexCount();
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, spectroPipeline);
-
-    if (hasSpectrogram) {
-
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            spectroPipelineLayout,
-            0, 1, &spectroDescSet,
-            0, nullptr
-        );
-
-        // float u0 = viewStartSeconds / totalDurationSeconds;
-        // float u1 = viewEndSeconds   / totalDurationSeconds;
-        // u0 = std::clamp(u0, 0.0f, 1.0f);
-        // u1 = std::clamp(u1, 0.0f, 1.0f);
-        float u0 = 0.0;
-        float u1 = 1.0;
-
-        float uvRect[4] = { u0, 0.0f, u1, 1.0f };
-
-        vkCmdPushConstants(
-            cmd,
-            spectroPipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT,
-            0,
-            sizeof(uvRect),
-            uvRect
-        );
-
-        // reuse same quad geometry
-        vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-        vkCmdDraw(cmd, 6, 1, 0, 0);
-    }
-
-    // // ============================================================
-    // // 4) RESTORE FULL SCISSOR
-    // // ============================================================
-    // VkRect2D fullScissor{};
-    // fullScissor.offset = {0,0};
-    // fullScissor.extent = swapchainExtent;
-    // vkCmdSetScissor(cmd, 0, 1, &fullScissor);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-    if (!vertices.empty() && (int)vertices.size() > 12) {
-        VkBuffer tempBuffers[] = {vertexBuffer};
-        VkDeviceSize tempOffsets[] = {0};
-        vkCmdBindVertexBuffers(cmd, 0, 1, tempBuffers, tempOffsets);
-        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size() - 12), 1, 12, 0);
-    }
-
-    // Begin staging all text strings
-    textRenderer.beginTextSubmission(); 
-
-    for (const auto& t : texts) {
-        // printf("text: %s, x: %f, y: %f, size: %f", t.text, t.x, t.y, t.size);
-        // Add multiple text strings (all text will be batched into a single draw call)
-        textRenderer.addText(
-            t.text,
-            t.x, t.y,
-            t.size,
-            t.colour,
-            cmd
-        );
-    }
+    textRenderer.uploadStaged();
     texts.clear();
 
-    // End submission, which updates the vertex buffer and issues the draw command(s)
-    textRenderer.endTextSubmission(cmd);
+    VkBuffer rectBuffers[] = { vertexBuffer };
+    auto drawRects = [&](size_t first, size_t end) {
+        if (end <= first) return;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindVertexBuffers(cmd, 0, 1, rectBuffers, offsets);
+        vkCmdDraw(cmd, (uint32_t)(end - first), 1, (uint32_t)first, 0);
+    };
+
+    for (size_t L = 0; L < layerCount; ++L) {
+        size_t vBegin = std::min(starts[L].vertex, vertices.size());
+        size_t vEnd   = (L + 1 < layerCount) ? std::min(starts[L + 1].vertex, vertices.size())
+                                             : vertices.size();
+
+        if (L == 0) {
+            // First 12 vertices go underneath the spectrogram, as before
+            size_t split = std::min<size_t>(12, vEnd);
+            drawRects(vBegin, split);
+
+            if (hasSpectrogram) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, spectroPipeline);
+                vkCmdBindDescriptorSets(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    spectroPipelineLayout,
+                    0, 1, &spectroDescSet,
+                    0, nullptr
+                );
+
+                // float u0 = viewStartSeconds / totalDurationSeconds;
+                // float u1 = viewEndSeconds   / totalDurationSeconds;
+                float u0 = 0.0;
+                float u1 = 1.0;
+                float uvRect[4] = { u0, 0.0f, u1, 1.0f };
+
+                vkCmdPushConstants(
+                    cmd,
+                    spectroPipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT,
+                    0,
+                    sizeof(uvRect),
+                    uvRect
+                );
+
+                // reuse same quad geometry
+                vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
+                vkCmdDraw(cmd, 6, 1, 0, 0);
+            }
+
+            drawRects(split, vEnd);
+        } else {
+            drawRects(vBegin, vEnd);
+        }
+
+        textRenderer.drawStaged(cmd, textVertStart[L], textVertStart[L + 1] - textVertStart[L]);
+    }
+    layerStarts.clear();
 
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <sstream>
+#include <algorithm>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -898,15 +900,25 @@ void TextRenderer::addText(const std::string& text, float x, float y, float scal
 }
 
 void TextRenderer::endTextSubmission(VkCommandBuffer commandBuffer) {
-    if (m_stagedVertices.empty()) return;
+    uploadStaged();
+    drawStaged(commandBuffer, 0, (uint32_t)m_uploadedVertices);
+}
 
-    // 1. Copy staged vertex data to GPU buffer
-    size_t vertexBufferSize = m_stagedVertices.size() * sizeof(TextVertex);
-    if (vertexBufferSize > m_maxVertices * sizeof(TextVertex)) {
+void TextRenderer::uploadStaged() {
+    m_uploadedVertices = m_stagedVertices.size();
+    if (m_uploadedVertices > m_maxVertices) {
         std::cerr << "Text buffer overflow: Clipping text." << std::endl;
-        vertexBufferSize = m_maxVertices * sizeof(TextVertex);
+        m_uploadedVertices = m_maxVertices;
     }
-    memcpy(m_vertexDataMapped, m_stagedVertices.data(), vertexBufferSize);
+    if (m_uploadedVertices > 0)
+        memcpy(m_vertexDataMapped, m_stagedVertices.data(), m_uploadedVertices * sizeof(TextVertex));
+}
+
+void TextRenderer::drawStaged(VkCommandBuffer commandBuffer, uint32_t firstVertex, uint32_t vertexCount) {
+    // Clamp to what was actually uploaded
+    if (firstVertex >= m_uploadedVertices) return;
+    vertexCount = std::min<uint32_t>(vertexCount, (uint32_t)(m_uploadedVertices - firstVertex));
+    if (vertexCount == 0) return;
 
     // 2. Bind Pipeline
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
@@ -945,5 +957,5 @@ void TextRenderer::endTextSubmission(VkCommandBuffer commandBuffer) {
     );
 
     // 6. Draw command
-    vkCmdDraw(commandBuffer, static_cast<uint32_t>(m_stagedVertices.size()), 1, 0, 0);
+    vkCmdDraw(commandBuffer, vertexCount, 1, firstVertex, 0);
 }
