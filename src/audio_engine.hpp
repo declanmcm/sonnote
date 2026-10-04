@@ -9,6 +9,7 @@
 //#include "exprtk.hpp"
 #include "parser.hpp"
 #include "utils.hpp"
+#include "pd_host.hpp"
 
 // =============================================
 // ========== PUBLIC AUDIO ENGINE API ==========
@@ -71,7 +72,7 @@ extern bool newAudioOut;
 // Using AVL tree
 struct Event {
     float beat;
-    float time;
+    float time = 0.0f;
     std::string string_expr;
     ArithTree function;
     //exprtk::expression<double> functionOld;
@@ -80,15 +81,15 @@ struct Event {
     Event* left;
     Event* right;
     Event* parent;
-    float beatL;
-    float beatR;
-    uint32_t num;
-    uint32_t den;
+    float beatL = 0.0f;
+    float beatR = 0.0f;
+    uint32_t num = 0;
+    uint32_t den = 0;
     std::vector<uint32_t> primeFactors;
     Event* origin;
-    bool selected;
-    bool finalEv;
-    int velocity;
+    bool selected = false;
+    bool finalEv = false;   // last tempo event; used by Canvas2D::accum_beats
+    int velocity = 0;
     int profile;
     int type;
     uint32_t id;
@@ -215,11 +216,15 @@ public:
       }
     }
 
+    // Marks the last event (in beat order) as final and clears the flag on
+    // all others. Call after any change to the tempo events.
     void setFinalEv() {
-      Event* current = get_first();
+      clearFinal(root);
+      Event* current = root;
       while (current && current->right)
         current = current->right;
-      current->finalEv = true;
+      if (current)
+        current->finalEv = true;
     }
 
     Event* get_first() {
@@ -233,6 +238,13 @@ public:
     bool ordered;
 
 private:
+
+    static void clearFinal(Event* node) {
+      if (!node) return;
+      node->finalEv = false;
+      clearFinal(node->left);
+      clearFinal(node->right);
+    }
 
     void find_loop(Event* node) {
       printf("beat, id: %f, %d\n", node->beat, node->id);
@@ -486,6 +498,11 @@ struct OSCSettings  {
 
 struct Profile {
     OSCSettings settings[3];
+    // Pd patch for this profile (file name, resolved against PdHost::patchDir).
+    // Empty = use the built-in oscillators. Only used by note profiles.
+    char pdPatch[64] = "";
+    // Gain sent to the patch as [r $0-gain], in dB (PdHost::MIN_DB = silent).
+    float pdGainDb = 0.0f;
 };
 
 // =========================================================
@@ -565,6 +582,9 @@ public:
 
     Profile profiles[10];
     Profile profilesPerc[10];
+
+    // Embedded Pure Data. Main thread: pd.setPatch / pd.openEditor / pd.poll.
+    PdHost pd;
     float sampleRate = 48000.0f;
 
     bool tunerEnabled = false;

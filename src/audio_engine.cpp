@@ -142,6 +142,9 @@ bool AudioEngine::start() {
 
     sampleRate = jack_get_sample_rate(jack->client);
 
+    if (!pd.init((int)sampleRate))
+        std::cerr << "libpd failed to initialise; Pd patches won't play\n";
+
     jack->outL = jack_port_register(
         jack->client, "out_L",
         JACK_DEFAULT_AUDIO_TYPE,
@@ -339,11 +342,14 @@ void AudioEngine::applyMessages() {
 
         case MessageType::SetPlayState:
             isPlaying = msg.bValue;
+            pd.setPlaying(isPlaying);
+            if (!isPlaying) pd.allNotesOff();
             std::fflush(stdout);
             break;
 
         case MessageType::SetFrequency:
             ref = msg.fValue;
+            pd.setRefFreq(ref);
             for (int i = 0; i < 10; i++)
               phaseF[i] = 0.0f;
             break;
@@ -360,6 +366,7 @@ void AudioEngine::applyMessages() {
 
         case MessageType::SetTempo:
             tempoBPM = msg.fValue;
+            pd.setTempo(tempoBPM);
             break;
 
         case MessageType::SetADSR:
@@ -371,6 +378,7 @@ void AudioEngine::applyMessages() {
             break;
 
         case MessageType::ResetSampleCounter:
+            pd.allNotesOff();
             currentBeat = 0.0;
             nextEventIndex = 0;
             // Clear voices
@@ -516,263 +524,67 @@ inline float generateSample(WaveformType wf, float phase) {
     }
 }*/
 
+// Sequencer + Pd. Notes are sent to the Pd patch of their profile; every
+// patch's [dac~] output is mixed by libpd and written to the JACK buffers.
 void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 {
-    // Zero buffers
     memset(outL, 0, frames * sizeof(float));
     memset(outR, 0, frames * sizeof(float));
 
-    // Apply queued parameter messages
+    // Take libpd for this block. If the main thread is busy with it, Pd is
+    // silent for this block and note messages are queued, not lost.
+    pd.beginBlock();
     applyMessages();
+    pd.sendParams();   // gains and song parameters that changed (tempo, play state, ...)
 
-    if (!isPlaying) {
-        sampleCounter += frames;
-        return;
-    }
+    pd.diag.playing = isPlaying;
+    pd.diag.frozen = freeze;
+    pd.diag.nextBeat = currentEv ? currentEv->beat : -1.0f;
 
-    const float sr = sampleRate;
-    // const float atkStep = (adsr.attack > 1e-6) ? (1.0f / (float)(adsr.attack  * sr)) : 1.0f;
-    // const float relStep = (adsr.release > 1e-6) ? (1.0f / (float)(adsr.release * sr)) : 1.0f;
-    // const float decStep = (adsr.decay   > 1e-6) ? (1.0f / (float)(adsr.decay   * sr)) : 1.0f;
+    const double samplesPerBeat = (60.0 / tempoBPM) * sampleRate;
 
+    for (uint32_t in = 0; in < frames; ++in) {
+        if (isPlaying) {
+            currentBeat = double(sampleCounter) / samplesPerBeat;
+            b = currentBeat;
 
-    // printf("steps: (%f, %f)\n", atkStep, decStep);
-
-    const double secondsPerBeat = 60.0 / tempoBPM;
-    const double samplesPerBeat = secondsPerBeat * sampleRate;
-    //printf("%ld\n", sampleCounter);
-    for (uint32_t in = 0; in < frames; ++in)
-    {
-        float s = 0.0f;
-
-        // --- Sequencer: map sampleCounter → beat and fire events when crossing beat positions ---
-        currentBeat = double(sampleCounter) / samplesPerBeat;
-        b = currentBeat;
-
-        // Trigger all events whose beat <= current beat (looping)
-        if (!freeze) {
-
-            // double lastBeat = currentBeat;
-            // currentBeat = beat;  // update for envelope or external code, if needed
-
-            // size_t count = activeEvents.size();
-
-            // If beat jumped backwards (tempo change) or we reset
-            // we restart scanning from index 0
-            if (currentBeat < lastBeat) {
-                nextEventIndex = 0;
-            }
-
-            if (countdown < 51) countdown--;
-
-            // Consume events while currentBeat passes their beat positions
-            while (currentEv &&
-                currentEv->beat <= currentBeat)
-            {
-              //printf("currentBeat: %f, currentEv: %f\n", currentBeat, currentEv->beat);
-                countdown--;
-
-                // Only trigger if we *passed* this beat within this audio block
-                if (currentEv->type == EV_NOTE_START || currentEv->type == EV_PERC) {
-                    //printf("note on: %d\n", currentEv->id);
-
-                    // NOTE ON
-                    size_t voiceIndex = MAX_VOICES;
-                    for (size_t v = 0; v < MAX_VOICES; ++v) {
-                        if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
-                            voiceIndex = v;
-                            break;
-                        }
-                    }
-                    if (voiceIndex == MAX_VOICES)
-                        voiceIndex = 0; // steal voice 0
-
-                    if (currentEv->type == EV_NOTE_START) {
-                      for (int i = 0; i < 3; i++) {
-                        voiceFreqs[voiceIndex][i]  = ref * currentEv->ratio.eval();
-                        voiceTimers[voiceIndex][i] = -1;
-                      }
-                    } else {
-                      for (int i = 0; i < 3; i++) {
-                        voiceFreqs[voiceIndex][i] = profilesPerc[currentEv->profile].settings[i].freq;
-                        voiceTimers[voiceIndex][i] = profilesPerc[currentEv->profile].settings[i].hold * sampleRate;
-                        voicePhases[voiceIndex][i] = 0.0f;
-                      }
-                    }
-                    voiceIDs[voiceIndex] = currentEv->id;
-                    for (int i = 0; i < 3; i++) {
-                        voiceEnvs[voiceIndex][i]   = 0.0f;
-                        voiceStates[voiceIndex][i] = 1;
-                    }
-                    voiceProfiles[voiceIndex] = currentEv->profile;
+            // Fire every event the playhead has reached
+            while (!freeze && currentEv && currentEv->beat <= currentBeat) {
+                if (currentEv->type == EV_NOTE_START) {
+                    if (pd.routes(currentEv->profile))
+                        pd.noteOn(currentEv->profile, currentEv->id,
+                                  ref * currentEv->ratio.eval(), 1.0f);
+                    else
+                        pd.diag.unroutedNotes++;   // profile has no Pd patch
+                } else if (currentEv->type == EV_NOTE_END) {
+                    pd.noteOff(currentEv->id);
                 }
-                else if (currentEv->type == EV_NOTE_END) {
-                    // NOTE OFF
-                    //printf("note off: %d\n", currentEv->id);
-                    for (size_t v = 0; v < MAX_VOICES; ++v) {
-                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
-                              voiceStates[v][2] != 0) &&
-                            currentEv->id == voiceIDs[v])
-                        {
-                          //printf("heylo\n");
-                            voiceStates[v][0] = 3;
-                            voiceStates[v][1] = 3;
-                            voiceStates[v][2] = 3;
-                            break;
-                        }
-                    }
-                }
-
+                pd.diag.events++;
                 currentEv = next_note(currentEv);
-
-                // Loop the sequence
-                // if (nextEventIndex >= count) {
-                //     nextEventIndex = 0;
-
-                //     // If we wrapped but the next event is in the future,
-                //     // we should stop scanning here.
-                //     if (activeEvents[0].beat > currentBeat)
-                //         break;
-                // }
             }
         }
 
-        // --- Per-voice synthesis (similar to old data_callback) ---
-        int activeCount = 0;
-        for (size_t v = 0; v < MAX_VOICES; ++v) {
-            // printf("voiceStates: %d, %d, %d\n", voiceStates[v][0], voiceStates[v][1], voiceStates[2]);
-            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0)  {
-              continue; // inactive
-            }
-            activeCount++;
+        // Pd keeps running while stopped, so release tails finish and
+        // patches being edited stay audible.
+        float l = 0.0f, r = 0.0f;
+        pd.renderFrame(l, r);
+        outL[in] = std::clamp(l, -1.0f, 1.0f);
+        outR[in] = std::clamp(r, -1.0f, 1.0f);
 
-            //printf("active voice: %d\n", v);
+        if (!isPlaying) continue;
+        if (!freeze) sampleCounter++;
 
-
-            for (int e = 0; e < 3; e++) {
-                // Envelope update OSC i
-                if (voiceTimers[v][e] == 0)
-                  voiceStates[v][e] = 3;
-                if (voiceStates[v][e] == 1) {
-                    // Attack
-                    float atkStep = (profiles[voiceProfiles[v]].settings[e].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].attack  * sr)) : 1.0f;
-                    voiceEnvs[v][e] += atkStep;
-                    if (voiceEnvs[v][e] >= 1.0f) {
-                        voiceEnvs[v][e] = 1.0f;
-                        voiceStates[v][e] = 2; // sustain/decay
-                    }
-                } else if (voiceStates[v][e] == 2) {
-                    // Decay toward sustain
-                    float decStep = (profiles[voiceProfiles[v]].settings[e].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].decay  * sr)) : 1.0f;
-                    if (voiceEnvs[v][e] > profiles[voiceProfiles[v]].settings[e].sustain) {
-                        voiceEnvs[v][e] -= decStep;
-                        if (voiceEnvs[v][e] <= profiles[voiceProfiles[v]].settings[e].sustain) {
-                            voiceEnvs[v][e] = profiles[voiceProfiles[v]].settings[e].sustain;
-                        }
-                    } else if (voiceTimers[v][e] != -1)
-                      voiceTimers[v][e]--;
-                } else if (voiceStates[v][e] == 3) {
-                    // Release
-                    float relStep = (profiles[voiceProfiles[v]].settings[e].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].release * sr)) : 1.0f;
-                    voiceEnvs[v][e] -= relStep;
-                    if (voiceEnvs[v][e] <= 0.0f) {
-                        voiceEnvs[v][e] = 0.0f;
-                        //printf("ya done\n");
-                        voiceStates[v][e] = 0; // off
-                    }
-                }
-            }
-
-            // Phase & sample
-            //const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->evaluate(b, t, 0, 0) - 4.0f);
-
-            for (int i = 0; i < 3; i++) {
-                const float freq = voiceFreqs[v][i];
-                float phase = voicePhases[v][i];
-
-                phase += freq / sr;
-                if (phase >= 1.0f) phase -= 1.0f;
-                voicePhases[v][i] = phase;
-              //printf("gain: %f\n", profiles[voiceProfiles[v]].settings[i].gain);
-                float voiceSample = generateSample(profiles[voiceProfiles[v]].settings[i].waveType, phase) * voiceEnvs[v][i] * profiles[voiceProfiles[v]].settings[i].gain;
-
-                s += voiceSample;
-                //fflush(stdout);
-            }
-            //printf("yos: %f\n", s);
-            fflush(stdout);
-        }
-
-        // Smooth divisor (like old "divisor" logic)
-        if (activeCount > 0) {
-            if (std::abs(divisorSmooth - (float)activeCount) > 1e-6f) {
-                divisorSmooth += ((float)activeCount - divisorSmooth) / 100.0f;
-            } else {
-                divisorSmooth = (float)activeCount;
-            }
-
-            s /= divisorSmooth;
-        } else {
-            divisorSmooth = 1.0f;
-        }
-
-        // Apply global gain
-        // s *= gain;
-
-        // Clamp
-        if (s > 1.0f) {
-          //printf("YO");
-          s = 1.0f;
-        }
-        if (s < -1.0f) {
-          //printf("YO");
-          s = -1.0f;
-        }
-
-        //fprintf(out, "%f\n", s);
-
-        outL[in] = s;
-        //printf("sout: %f\n", s);
-        outR[in] = s;
-        // toPrint[printIndex] = s;
-        // printIndex++;
-        // if (printIndex == 100) printIndex = 0;
-
-        // if (countdown == 0) {
-        //     printf("hey");
-        //     // Print to file
-        //     FILE* out = fopen("out.csv", "w+");
-        //     char str[16];
-        //     for (int i = 0; i < 99; i++) {
-        //         printIndex++;
-        //         if (printIndex == 100) printIndex = 0;
-        //         sprintf(str, "%f,", toPrint[printIndex]);
-        //         fputs(str, out);
-        //     }
-        //     sprintf(str, "%f", toPrint[++printIndex]);
-        //     fputs(str, out);
-        //     fclose(out);
-        // }
-
-        if (!freeze)
-            sampleCounter++;
+        // Loop: jump back, release everything, restart the event list
         if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
-          sampleCounter = loopStartSamples;
-//          printf("remove all voices\n");
-          for (size_t v = 0; v < MAX_VOICES; ++v) {
-            if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
-                voiceStates[v][2] != 0))
-            {
-              voiceStates[v][0] = 3;
-              voiceStates[v][1] = 3;
-              voiceStates[v][2] = 3;
-            }
-          }
-          currentEv = activeEvents.root;
-          while (currentEv && currentEv->left)
-            currentEv = currentEv->left;
+            sampleCounter = loopStartSamples;
+            pd.allNotesOff();
+            currentEv = activeEvents.get_first();
         }
     }
+
+    if (!isPlaying) sampleCounter += frames;
+    pd.diag.beat = (float)currentBeat;
+    pd.endBlock();
 }
 
 

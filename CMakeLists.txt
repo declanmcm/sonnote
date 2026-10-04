@@ -29,6 +29,12 @@ pkg_check_modules(SNDFILE REQUIRED sndfile)
 #  extern/imgui/backends
 #)
 
+find_path(LIBPD_INCLUDE_DIR z_libpd.h PATH_SUFFIXES pd libpd)
+find_library(LIBPD_LIBRARY NAMES pd libpd)
+if (NOT LIBPD_INCLUDE_DIR OR NOT LIBPD_LIBRARY)
+  message(FATAL_ERROR "libpd not found (on Ubuntu: sudo apt install libpd-dev)")
+endif()
+
 # ---------- SDL2 (config or pkg-config fallback) ----------
 # Try the official CMake package first (provides SDL2::SDL2)
 find_package(SDL2 QUIET CONFIG)
@@ -65,6 +71,7 @@ add_executable(app
   src/text_renderer.cpp
   src/parser.cpp
   src/utils.cpp
+  src/pd_host.cpp
 )
 
 target_include_directories(app PRIVATE
@@ -77,6 +84,7 @@ target_include_directories(app PRIVATE
 #  extern/miniaudio
   ${SDL2_INCLUDE_DIRS}
   ${FREETYPE_INCLUDE_DIRS}
+  ${LIBPD_INCLUDE_DIR}
 )
 
 target_link_libraries(app PRIVATE
@@ -90,6 +98,7 @@ target_link_libraries(app PRIVATE
   Freetype::Freetype
   ${JACK_LIBRARIES}
   ${SNDFILE_LIBRARIES}
+  ${LIBPD_LIBRARY}
 )
 
 # Some Linux toolchains need these explicitly

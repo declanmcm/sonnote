@@ -15,6 +15,7 @@
 #include <sndfile.h>
 #include <fftw3.h>
 #include "parser.hpp"
+#include "midi.hpp"
 #include "audio_engine.hpp"
 #include "utils.hpp"
 #include "ui.hpp"
@@ -130,7 +131,6 @@ std::vector<uint32_t> extractARange(char* in) {
       a = -1;
     } else {
       a = getInt(in, noVal);
-      printf("int gotten: %d, next char: %c\n", a, in[0]);
       if (noVal)
         break;
     }
@@ -431,6 +431,7 @@ float calc_beat(EventTree* times, float noteTime) {
         } else {
           beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
         }
+        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
     } else {
       if (currentTempoEv->isConstant()) {
         float thing = beats + (noteTime - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
@@ -1027,7 +1028,8 @@ static void writeVarLen(Stream& f, uint32_t value) {
 // --- Write binary song file ---
 bool save_song(const std::string& path,
                EventTree& beatEvents,
-               EventTree& timeEvents, Profile* profiles)
+               EventTree& timeEvents, Profile* profiles,
+               const Profile* pdPatches)   // note profiles, for their Pd patch names
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -1124,6 +1126,19 @@ bool save_song(const std::string& path,
             printf("sustain: %f\n", osc.sustain);
         }
     }
+
+    // Pd patch per note profile. Appended as its own tagged section so older
+    // files (without it) still load, and older builds ignore it.
+    f.write("PDPT", 4);
+    for (int i = 0; i < 10; i++) {
+        uint32_t len = (uint32_t)strnlen(pdPatches[i].pdPatch, sizeof pdPatches[i].pdPatch);
+        f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        f.write(pdPatches[i].pdPatch, len);
+    }
+    // Pd gain per note profile, in dB
+    f.write("PDGN", 4);
+    for (int i = 0; i < 10; i++)
+        f.write(reinterpret_cast<const char*>(&pdPatches[i].pdGainDb), sizeof(float));
 
     f.close();
     return true;
@@ -1273,6 +1288,7 @@ struct Canvas2D {
         }
         printf("val: %f\n", ratio_to_octave(toInsert->ratio));
         timeEvents.insert(toInsert);
+        timeEvents.setFinalEv();   // accum_beats needs to know which tempo event is last
     }
 
     void addCanvasRect(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float rx, float ry, float rw, float rh, float r, float g, float b) {
@@ -1819,15 +1835,14 @@ struct Canvas2D {
 
         // Draw foci and related harmonics, snap to focus
         while (currentBeatEv) {
-          printf("focusEv: %d/%d\n", currentBeatEv->ratio.num, currentBeatEv->ratio.den);
           // for each focus event
+          printf("currentFocus: %f, %d/%d\n", currentBeatEv->beat, currentBeatEv->ratio.num, currentBeatEv->ratio.den);
           if (prevEv && !(prevEv->ratio.num == 0 && prevEv->ratio.den == 0)) {
             // foci at 0 represent a break -> no drawing or snapping
 
             // Draw focus line from previous to current focus draw_events
             Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(prevEv->ratio) });
             Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(prevEv->ratio) });
-            printf("a: {%f, %f}, b: {%f, %f}\n", ap.x, ap.y, bp.x, bp.y);
             addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 1.0, 0.63, 0.353);
 
             if (snap_harmonics && snap_foci) {
@@ -1846,10 +1861,6 @@ struct Canvas2D {
               while (ratio_to_octave(current) < top.y) {
                 uint32_t hRange = std::pow(2, std::atoi(g_settings.harmRange.c_str()));
                 std::vector<uint32_t> altHRange = extractARange(g_settings.altHarmRange.data());
-                printf("Arange:\n");
-                for (int i = 0; i < (int)altHRange.size(); i++) {
-                  printf("%d, ", altHRange[i]);
-                }
                 float r = 0.73;
                 float g = 0.45882;
                 float b = 0.807;
@@ -1861,9 +1872,10 @@ struct Canvas2D {
                   else if (ratio_to_octave(currentAdded) < bottom.y)
                     continue;
                   Ratio diff = subtractR(currentAdded, prevEv->ratio);
-                  printf("currentAdded: %d/%d, prevEv: %d/%d\n", currentAdded.num, currentAdded.den, prevEv->ratio.num, prevEv->ratio.den);
+                  if (prevEv->ratio.eval() > currentAdded.eval())
+                    diff = subtractR(prevEv->ratio, currentAdded);
+                  //printf("currentAdded: %d/%d, prevEv: %d/%d\n", currentAdded.num, currentAdded.den, prevEv->ratio.num, prevEv->ratio.den);
                   if (diff.num != 0) {
-                    printf("in\n");
                     Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
                     int factor = std::log2(simplifyR(interval).den);
@@ -2294,7 +2306,6 @@ struct Canvas2D {
             Event* prev = nullptr;
             Event* prevPrev = nullptr;
             while (currentFocus) {
-              printf("yo\n");
                 if (currentFocus->beat > currentBeat && !insertEv) {
                     // This index is the next focus change after the click point
                     insert = fociLength;
@@ -2305,6 +2316,7 @@ struct Canvas2D {
                         focus_before = false;
                 } else if (!next_type(currentFocus, EV_FOCUS) && !insertEv) {
                     insert = fociLength + 1;
+                    focus_after = false;
                 }
                 if (!insertEv) {
                     prevPrev = prev;
@@ -2337,6 +2349,9 @@ struct Canvas2D {
 
             printf("npcsap: %d, cebnfc: %d, csap: %d, ceantc: %d, fb: %d, fa: %d\n", no_prev_or_closest_starts_after_prev, no_foci_or_after_foci_or_closest_ends_before_next, closest_starts_at_prev, closest_ends_at_next_type_change, focus_before, focus_after);
 
+            Ratio prevRat;
+            if (prev)
+              prevRat = prev->ratio;
             if (no_prev_or_closest_starts_after_prev) {
                 printf("A");
                 start->beat = closest->beat;
@@ -2356,7 +2371,7 @@ struct Canvas2D {
                     prev->ratio = closest->ratio;
                 }
             } else { // focus_before is true
-                if (prevPrev && !closest->string_expr.empty() && !prevPrev->string_expr.empty() && prevPrev->string_expr != closest->string_expr) {
+                if (prevPrev && !(closest->ratio.num == 0 && closest->ratio.den == 0) && !(prevPrev->ratio.num == 0 && prevPrev->ratio.den == 0) && !(prevPrev->ratio.num == closest->ratio.num && prevPrev->ratio.den == closest->ratio.den)) {
                     prev->ratio = closest->ratio;
                 } else {
                     printf("IT\n");
@@ -2369,7 +2384,7 @@ struct Canvas2D {
                 end->beat = closestOff->beat;
                 end->time = calc_time(&timeEvents, end->beat);
                 if (insert > 0 && prev) {
-                    end->ratio = prev->ratio;
+                    end->ratio = prevRat;
                 }
             } else if (closest_ends_at_next_type_change) {
                 printf("D");
@@ -2391,7 +2406,7 @@ struct Canvas2D {
                     } else {
                         currentFocus = prev;
                     }
-                    if (!currentFocus->string_expr.empty() && !insertEv->string_expr.empty() && insertEv->string_expr == currentFocus->string_expr) {
+                    if (!(currentFocus->ratio.num == 0 && currentFocus->ratio.den == 0) && !(insertEv->ratio.num == 0 && insertEv->ratio.den == 0) && !(insertEv->ratio.num == currentFocus->ratio.num && insertEv->ratio.den == currentFocus->ratio.den)) {
                         removeNext = true;
                     }
                 }
@@ -2674,6 +2689,26 @@ bool load_song(const std::string& path,
         }
     }
 
+    // Optional Pd patch section (absent in files saved before Pd support)
+    for (int i = 0; i < 10; i++) {
+      profiles[i].pdPatch[0] = '\0';
+      profiles[i].pdGainDb = 0.0f;
+    }
+    char tag[4];
+    if (f.read(tag, 4) && std::strncmp(tag, "PDPT", 4) == 0) {
+        for (int i = 0; i < 10; i++) {
+            uint32_t len = 0;
+            if (!f.read(reinterpret_cast<char*>(&len), sizeof(len))) break;
+            std::string name(len, '\0');
+            f.read(name.data(), len);
+            std::snprintf(profiles[i].pdPatch, sizeof profiles[i].pdPatch, "%s", name.c_str());
+        }
+        if (f.read(tag, 4) && std::strncmp(tag, "PDGN", 4) == 0) {
+            for (int i = 0; i < 10; i++)
+                f.read(reinterpret_cast<char*>(&profiles[i].pdGainDb), sizeof(float));
+        }
+    }
+
     f.close();
     return true;
 }
@@ -2721,6 +2756,7 @@ struct App {
     int         currentProfile = 0;
     float       bpm = 110.0f;
     std::string freqText[3];         // percussion freq text boxes
+    std::string pdPatchText;         // Pd patch name for the current note profile
 
     explicit App(AudioEngine& e) : engine(e) {}
     App(const App&) = delete;
@@ -2738,6 +2774,39 @@ struct App {
             freqText[k] = buf;
         }
         snapBlip = profile.settings[0].freq;
+        pdPatchText = profile.pdPatch;
+    }
+
+    // Stores the typed patch name in the current note profile and loads it.
+    void commitPdPatch() {
+        if (!noteMode) return;
+        std::snprintf(profile.pdPatch, sizeof profile.pdPatch, "%s", pdPatchText.c_str());
+        sendProfile();
+        engine.pd.setPatch(currentProfile, pdPatchText);
+    }
+
+    void commitPdGain() {
+        if (!noteMode) return;
+        sendProfile();
+        engine.pd.setGain(currentProfile, profile.pdGainDb);
+    }
+
+    void editPdPatch() {
+        commitPdPatch();
+        engine.pd.openEditor(currentProfile, pdPatchText);
+    }
+
+    void loadAllPdPatches() {
+        int loaded = 0, failed = 0;
+        for (int i = 0; i < 10; i++) {
+            Profile np = engine.getProfile(i, true);
+            std::string name = np.pdPatch;
+            engine.pd.setGain(i, np.pdGainDb);
+            bool ok = engine.pd.setPatch(i, name);
+            if (!name.empty()) (ok ? loaded : failed)++;
+        }
+        engine.pd.status = std::to_string(loaded) + " Pd patch(es) loaded" +
+                           (failed ? ", " + std::to_string(failed) + " missing" : "");
     }
 
     void exportWav() {
@@ -2752,19 +2821,32 @@ struct App {
     }
  
     void saveProject() {
-        Profile ps[10];
-        for (int i = 0; i < 10; i++) ps[i] = engine.getProfile(i, noteMode);
-        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, ps);
+        Profile ps[10], notePs[10];
+        for (int i = 0; i < 10; i++) {
+            ps[i] = engine.getProfile(i, noteMode);
+            notePs[i] = engine.getProfile(i, true);
+        }
+        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, ps, notePs);
     }
- 
+
     void loadProject() {
         Profile ps[10];
         load_song("session.son", &gBeatOctCanvas, ps, &gBeatOctCanvas.nextID);
         gBeatOctCanvas.beatEvents.inorder();
         gBeatOctCanvas.beatEvents.find_loop();
-        for (int i = 0; i < 10; i++) engine.setProfile(ps[i], i, noteMode);
+        for (int i = 0; i < 10; i++) {
+            // Patch names belong to note profiles even when loading in perc mode
+            if (!noteMode) {
+                Profile np = engine.getProfile(i, true);
+                std::snprintf(np.pdPatch, sizeof np.pdPatch, "%s", ps[i].pdPatch);
+                np.pdGainDb = ps[i].pdGainDb;
+                engine.setProfile(np, i, true);
+            }
+            engine.setProfile(ps[i], i, noteMode);
+        }
+        loadAllPdPatches();
         loadProfile(currentProfile);   // refresh the panel
-    } 
+    }
 };
 
 // One oscillator column. The three columns differ only in x and index.
@@ -2813,17 +2895,13 @@ static void buildUI(App& app) {
  
     // Bottom 75%: note window. Canvas2D draws inside its screen rect.
     // Added first so the control panel draws on top of it, as before.
-    app.noteWindow = content->add(panel({0.0f, CW_HEIGHT, 1.0f, 1 - CW_HEIGHT - SW_HEIGHT},
+    app.noteWindow = content->add(panel({0.0f, CW_HEIGHT, 1.0f, 1 - CW_HEIGHT},
                                         {0, 0, 0}, 5.0f, true, Kind::Canvas));
  
     // Top 25%: grey border panel, with the dark control window inset inside it
     Widget* border = content->add(panel({0.0f, 0.0f, 1.0f, CW_HEIGHT},
                                         {0.15f, 0.15f, 0.15f}, 2.0f, /*relative=*/true));
     Widget* cw = border->add(panel({0, 0, 1, 1}, {0.01f, 0.03f, 0.07f}, 3.0f, true));
-
-    Widget* sBorder = content->add(panel({0.0f, 1 - SW_HEIGHT, 1.0f, SW_HEIGHT},
-                                        {0.15f, 0.15f, 0.15f}, 2.0f, true));
-    Widget* sw = sBorder->add(panel({0, 0, 1, 1}, {0.001f, 0.003f, 0.007f}, 3.0f, true));
  
     // ---- Menu bar (added after `content` so it's on top) ----
     Widget* menuBar = root.add(panelFn([](const Rect& p) {
@@ -2837,7 +2915,10 @@ static void buildUI(App& app) {
     file->add(menuItem({0, 62, 150, 18}, "Load project", [&app](Widget&) { app.loadProject(); }));
     file->add(textBox({0, 102, 150, 18}, "Wav name:", &g_settings.wavName,
                       {}, false, {0.85f, 0.85f, 0.85f}));
- 
+    file->add(menuItem({0, 122, 150, 18}, "Export MIDI", [](Widget&) {
+    export_midi("export.mid", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents);
+}));
+
     // ---- Control panel, left column ----
     cw->add(slider({10, 10, 120, 15}, "BPM", &app.bpm, 20, 200, 1,
                    [&app](Widget&) { app.engine.setTempo(app.bpm); }))
@@ -2862,7 +2943,32 @@ static void buildUI(App& app) {
 
     cw->add(textBox({270, 25, 120, 15}, "Harm. Range: ",   &g_settings.harmRange));
     cw->add(textBox({270, 60, 120, 15}, "Alt. H. Range: ", &g_settings.altHarmRange));
- 
+
+    // Pd patch for the current note profile
+    auto notesOnly = [] { return noteMode; };
+    Widget* pdBox = cw->add(textBox({400, 25, 150, 15}, "Pd patch:", &app.pdPatchText));
+    pdBox->maxLen = sizeof(Profile::pdPatch) - 1;
+    pdBox->onCommit = [&app](Widget&) { app.commitPdPatch(); };
+    pdBox->visibleFn = notesOnly;
+    cw->add(button({400, 45, 150, 15}, "Edit in Pd", [&app](Widget&) { app.editPdPatch(); }))
+        ->visibleFn = notesOnly;
+    Widget* pdGain = cw->add(slider({560, 45, 150, 15}, "Pd gain", &app.profile.pdGainDb,
+                                    PdHost::MIN_DB, 12.0f, 1.0f,
+                                    [&app](Widget&) { app.commitPdGain(); }));
+    pdGain->labelFn = [&app] {
+        float db = app.profile.pdGainDb;
+        if (db <= PdHost::MIN_DB) return std::string("Pd gain: -inf dB");
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "Pd gain: %+.1f dB", db);
+        return std::string(buf);
+    };
+    pdGain->visibleFn = notesOnly;
+    Widget* pdStatus = cw->add(button({560, 25, 300, 15}, "", {}));   // read-only status line
+    pdStatus->fill = false;
+    pdStatus->textColor = {0.7f, 0.7f, 0.7f};
+    pdStatus->labelFn = [&app] { return app.engine.pd.status; };
+    pdStatus->visibleFn = notesOnly;
+
     // Oscillator columns
     //for (int k = 0; k < 3; k++) addOscColumn(*cw, app, k, 140.0f + 130.0f * k);
 }
@@ -3035,6 +3141,12 @@ int main(int, char**)
         if (tuner_triggered) {
             engine.toggleTuner();
             tuner_triggered = false;
+        }
+
+        {   // reload patches whose Pd editor window was closed
+            std::string before = engine.pd.status;
+            engine.pd.poll();
+            if (engine.pd.status != before) rerender = true;
         }
  
         if (windowActive && rerender) {

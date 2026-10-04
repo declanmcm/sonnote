@@ -68,6 +68,7 @@ struct Widget {
     // --- Behaviour ---
     std::function<void(Widget&)> onClick;   // Button
     std::function<void(Widget&)> onChange;  // Slider, TextBox
+    std::function<void(Widget&)> onCommit;  // TextBox: editing finished (Enter or focus lost)
 
     // --- Tree ---
     Widget* parent = nullptr;
@@ -179,8 +180,15 @@ public:
         for (auto& c : root.children) layoutNode(*c, root.screen);
     }
 
+    // Ends text editing, firing the box's onCommit.
+    void blur() {
+        Widget* w = focused;
+        focused = nullptr;
+        if (w && w->onCommit) w->onCommit(*w);
+    }
+
     void closeMenu() {
-        if (focused && focused->parent == openMenu) focused = nullptr;
+        if (focused && focused->parent == openMenu) blur();
         openMenu = nullptr;
     }
 
@@ -191,7 +199,7 @@ public:
             // While a dropdown is open, it gets first pick of every click.
             for (auto it = openMenu->children.rbegin(); it != openMenu->children.rend(); ++it) {
                 if ((*it)->visible() && (*it)->screen.contains(x, y)) {
-                    focused = nullptr;
+                    blur();
                     return activate(**it, x);
                 }
             }
@@ -200,7 +208,7 @@ public:
             return true;
         }
 
-        focused = nullptr;
+        blur();
         Widget* w = hitTest(root, x, y);
         return w ? activate(*w, x) : false;
     }
@@ -210,7 +218,7 @@ public:
         if (!focused || !focused->text) return false;
         if (key == '\r' || key == '\n') {           // Enter: finish editing
             if (focused->parent == openMenu) closeMenu();
-            focused = nullptr;
+            blur();
             return true;
         }
         std::string& t = *focused->text;
@@ -285,7 +293,6 @@ private:
         else                 s = {p.x + w.local.x, p.y + w.local.y, w.local.w, w.local.h};
         s.x += w.inset; s.y += w.inset;
         s.w -= 2 * w.inset; s.h -= 2 * w.inset;
-        printf("s: {%f, %f, %f, %f}\n", s.x, s.y, s.w, s.h);
         w.screen = s;
         for (auto& c : w.children) layoutNode(*c, w.screen);
     }
@@ -303,6 +310,7 @@ private:
 
     template <class Renderer>
     void drawNode(Renderer& r, Widget& w, float H) {
+        
         if (!w.visible()) return;
         const Rect& s = w.screen;
         const float y = H - (s.y + s.h);              // renderer is y-up
