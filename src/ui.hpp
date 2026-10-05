@@ -54,6 +54,7 @@ struct Widget {
     bool  fill = true;        // false = invisible container
     std::string label;
     std::function<std::string()> labelFn;   // dynamic label; overrides `label`
+    std::function<Color()>       colorFn;   // dynamic fill colour; overrides `color`
     std::function<bool()>        visibleFn; // empty = always visible
 
     // --- Slider: reads and writes *target directly, mapped to [lo, hi] ---
@@ -317,7 +318,7 @@ private:
         const glm::vec4 white(1.0f), black(0.0f, 0.0f, 0.0f, 1.0f);
         const glm::vec4 text(w.textColor.r, w.textColor.g, w.textColor.b, 1.0f);
 
-        Color c = w.color;
+        Color c = w.colorFn ? w.colorFn() : w.color;
         if (&w == focused)  c = {0.4f, 0.4f, 0.8f};
         if (&w == openMenu) c = {0.25f, 0.25f, 0.30f};
         if (w.fill) r.addRect(s.x, y, s.w, s.h, c.r, c.g, c.b);

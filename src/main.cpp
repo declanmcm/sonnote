@@ -33,8 +33,85 @@ double t;
 bool empty = true;
 float inputFreq = 0.0f;
 float ref = 440.0f;
-bool noteMode = true;
 float snapBlip = 0.0f;
+
+enum class TrackType : int32_t { Standard = 0, Audio = 1, Perc = 2 };
+
+struct Track {
+    std::string name;
+    TrackType   type  = TrackType::Standard;
+    ui::Color   color;
+    bool        mute  = false;
+    bool        solo  = false;
+    bool        armed = false;   // record enabled (audio tracks only)
+    float       gainDb = 0.0f;   // sent to the Pd patch as [r $0-gain]; PdHost::MIN_DB = silent
+    std::string pdPatch;         // resolved against PdHost::patchDir; "" = no patch
+    Profile     profile;         // built-in synth settings (perc tracks use freq/hold)
+};
+
+// Every track, in panel order. Notes and perc blips refer to their track by
+// index (Event::profile), which is also the track's Pd slot.
+std::vector<Track> g_tracks;
+int g_currentTrack = 0;
+
+static const ui::Color TRACK_PALETTE[] = {
+    {0.47f, 0.47f, 1.00f},   // blue (the old note colour)
+    {0.35f, 0.80f, 0.45f},   // green
+    {0.95f, 0.45f, 0.60f},   // pink
+    {0.30f, 0.80f, 0.85f},   // cyan
+    {0.75f, 0.50f, 0.95f},   // purple
+    {0.90f, 0.85f, 0.35f},   // yellow
+    {0.55f, 0.75f, 0.30f},   // olive
+    {0.95f, 0.55f, 0.90f},   // magenta
+    {0.60f, 0.65f, 0.75f},   // slate
+    {0.40f, 0.60f, 0.90f},   // steel blue
+};
+constexpr int TRACK_PALETTE_SIZE = sizeof(TRACK_PALETTE) / sizeof(TRACK_PALETTE[0]);
+
+static ui::Color trackColor(int i) {
+    if (i >= 0 && i < (int)g_tracks.size()) return g_tracks[i].color;
+    return TRACK_PALETTE[0];
+}
+
+static TrackType currentTrackType() {
+    if (g_currentTrack >= 0 && g_currentTrack < (int)g_tracks.size())
+        return g_tracks[g_currentTrack].type;
+    return TrackType::Standard;
+}
+
+// Hotkeys 1-9 and 0 target the first ten tracks. Returns -1 for other keys.
+static int hotkeyTrack(char key) {
+    if (key >= '1' && key <= '9') return key - '1';
+    if (key == '0') return 9;
+    return -1;
+}
+
+static const char* trackTypeName(TrackType t) {
+    switch (t) {
+        case TrackType::Audio: return "Audio";
+        case TrackType::Perc:  return "Perc";
+        default:               return "Standard";
+    }
+}
+
+// A fresh track. `index` picks its colour; `ofType` (how many tracks of this
+// type already exist) numbers its name and, for perc tracks, its pitch.
+static Track makeTrack(TrackType type, int index, int ofType) {
+    Track t;
+    t.type  = type;
+    t.name  = std::string(trackTypeName(type)) + " " + std::to_string(ofType + 1);
+    t.color = TRACK_PALETTE[index % TRACK_PALETTE_SIZE];
+
+    OSCSettings osc = {WaveformType::Sine, 0.2f, 0.2f, 0.7f, 0.025f, 0.16f};
+    if (type == TrackType::Perc) {
+        osc.freq = 3133.375f * std::log(1.00737564f * (ofType + 1));
+        osc.hold = 0.1f;
+    }
+    for (int j = 0; j < 3; j++) t.profile.settings[j] = osc;
+    t.profile.settings[1].gain = 0.0f;
+    t.profile.settings[2].gain = 0.0f;
+    return t;
+}
 
 const uint16_t audioBufferSize = 4096;
 float audioIn[audioBufferSize];
@@ -1028,8 +1105,8 @@ static void writeVarLen(Stream& f, uint32_t value) {
 // --- Write binary song file ---
 bool save_song(const std::string& path,
                EventTree& beatEvents,
-               EventTree& timeEvents, Profile* profiles,
-               const Profile* pdPatches)   // note profiles, for their Pd patch names
+               EventTree& timeEvents,
+               const std::vector<Track>& tracks)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -1108,11 +1185,11 @@ bool save_song(const std::string& path,
       current = next(current);
     }
 
-    uint32_t profileCount = 10;
+    uint32_t profileCount = (uint32_t)tracks.size();
     f.write(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
-    for (int i = 0; i < 10; i++) {
+    for (const Track& tr : tracks) {
         for (int j = 0; j < 3; j++) {
-            OSCSettings osc = profiles[i].settings[j];
+            const OSCSettings& osc = tr.profile.settings[j];
 
             // Write enum as fixed-width integer
             int32_t wave = static_cast<int32_t>(osc.waveType);
@@ -1123,22 +1200,40 @@ bool save_song(const std::string& path,
             f.write(reinterpret_cast<const char*>(&osc.sustain), sizeof(float));
             f.write(reinterpret_cast<const char*>(&osc.release), sizeof(float));
             f.write(reinterpret_cast<const char*>(&osc.gain),    sizeof(float));
-            printf("sustain: %f\n", osc.sustain);
         }
     }
 
-    // Pd patch per note profile. Appended as its own tagged section so older
+    // Pd patch per track. Appended as its own tagged section so older
     // files (without it) still load, and older builds ignore it.
     f.write("PDPT", 4);
-    for (int i = 0; i < 10; i++) {
-        uint32_t len = (uint32_t)strnlen(pdPatches[i].pdPatch, sizeof pdPatches[i].pdPatch);
+    for (const Track& tr : tracks) {
+        uint32_t len = (uint32_t)tr.pdPatch.size();
         f.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        f.write(pdPatches[i].pdPatch, len);
+        f.write(tr.pdPatch.data(), len);
     }
-    // Pd gain per note profile, in dB
+    // Gain per track, in dB
     f.write("PDGN", 4);
-    for (int i = 0; i < 10; i++)
-        f.write(reinterpret_cast<const char*>(&pdPatches[i].pdGainDb), sizeof(float));
+    for (const Track& tr : tracks)
+        f.write(reinterpret_cast<const char*>(&tr.gainDb), sizeof(float));
+
+    // Everything else about each track
+    f.write("TRKS", 4);
+    for (const Track& tr : tracks) {
+        int32_t type = static_cast<int32_t>(tr.type);
+        f.write(reinterpret_cast<const char*>(&type), sizeof(type));
+        uint32_t len = (uint32_t)tr.name.size();
+        f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        f.write(tr.name.data(), len);
+        f.write(reinterpret_cast<const char*>(&tr.color.r), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&tr.color.g), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&tr.color.b), sizeof(float));
+        uint8_t flags[3] = {tr.mute, tr.solo, tr.armed};
+        f.write(reinterpret_cast<const char*>(flags), sizeof flags);
+        for (int j = 0; j < 3; j++) {
+            f.write(reinterpret_cast<const char*>(&tr.profile.settings[j].freq), sizeof(float));
+            f.write(reinterpret_cast<const char*>(&tr.profile.settings[j].hold), sizeof(float));
+        }
+    }
 
     f.close();
     return true;
@@ -1257,6 +1352,7 @@ struct Canvas2D {
     std::vector<uint32_t> spareIDs;
     uint32_t nextID = 1;
     float split_start = -1.0f;
+    int heldProfile = -1;   // track of a note picked up with f / l, -1 = none
 
     std::vector<Event*> currentEvsAtCursor;
 
@@ -1732,7 +1828,7 @@ struct Canvas2D {
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
 
-        if (!noteMode)
+        if (currentTrackType() == TrackType::Perc)
           hoverW.y = freq_to_octave(snapBlip);
 
         if (empty)
@@ -1783,7 +1879,8 @@ struct Canvas2D {
                 //printf("VARLUE: %f\n", noteEv->function.evaluate(b, t, 0, 0));
                 Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, freq_to_octave(ratio_to_freq(noteEv->ratio))});
                 // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
-                addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, 0.47, 0.47, 1.0);
+                ui::Color nc = trackColor(noteEv->profile);
+                addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, nc.r, nc.g, nc.b);
                 if (std::abs(std::floor(noteEv->beat) - noteEv->beat) < 1e-6) {
                   // Draw rhythm line at note start
                   addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
@@ -1796,7 +1893,8 @@ struct Canvas2D {
               draw_rhythm_line(currentBeatEv, renderer, topLeft, bottomRight);
             } else if (currentBeatEv->type == EV_PERC) {
               Vec2 ap = worldToScreen(topLeft, { currentBeatEv->time, currentBeatEv->function.evaluate(b, t, 0, 0)});
-              addCanvasPercBlip(renderer, topLeft, bottomRight, ap.x, ap.y, 4, 4, 0.83, 0.275, 0.165);
+              ui::Color pc = trackColor(currentBeatEv->profile);
+              addCanvasPercBlip(renderer, topLeft, bottomRight, ap.x, ap.y, 4, 4, pc.r, pc.g, pc.b);
               if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
                 // Draw rhythm line at note start
                 addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
@@ -2030,6 +2128,7 @@ struct Canvas2D {
                         // Process note
                         Event* e1 = new Event(calc_beat(&timeEvents, hoverW.x) + noteStarts[i]->beat - firstSelectedTime, EV_NOTE_START, noteStarts[i]->ratio);
                         Event* e2 = new Event(calc_beat(&timeEvents, hoverW.x) + current->beat - firstSelectedTime, EV_NOTE_END);
+                        e1->profile = e2->profile = noteStarts[i]->profile;
                         if ((int)spareIDs.size() > 0) {
                           e1->id = spareIDs[(int)spareIDs.size() - 1];
                           spareIDs.pop_back();
@@ -2107,9 +2206,10 @@ struct Canvas2D {
           printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
 
           int number = numberContained(keys);
+          int target = number == -1 ? -1 : hotkeyTrack('0' + number);
 
-          if (number != -1) {
-            closest->profile = number;
+          if (target != -1 && target < (int)g_tracks.size() && g_tracks[target].type == TrackType::Standard) {
+            closest->profile = target;
           }
 
             if (containsKey(keys, 'q')) {
@@ -2238,6 +2338,8 @@ struct Canvas2D {
                   current = next_type(current, EV_FOCUS);
                 }
 
+                if (!containsKey(keys, 'd'))
+                  heldProfile = closest->profile;
                 if (containsKey(keys, 'l')) {
                   placing = true;
                   if (std::abs(hoverW.x - closest->time) < std::abs(hoverW.x - noteEnd->time)) {
@@ -2448,14 +2550,15 @@ struct Canvas2D {
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
             // printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
-            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, 0.47, 0.47, 1.0);
+            ui::Color nc = trackColor(heldProfile >= 0 ? heldProfile : g_currentTrack);
+            addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, nc.r, nc.g, nc.b);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
 
         // Light-red preview dot (when Snap is on and hovered)
         if ((snap_to_grid || snap_harmonics) && hovered) {
             Vec2 pos = {hoverW.x, ratio_to_octave(hoverR)};
-            if (!noteMode)
+            if (currentTrackType() == TrackType::Perc && !placing && !dragging)
               pos.y = hoverW.y;
             printf("pos: %f, %f\n", pos.x, pos.y);
             Vec2 sd = worldToScreen(topLeft, pos);
@@ -2476,7 +2579,10 @@ struct Canvas2D {
 
         // Input: left-click to place/finish
         if (hovered && click == 1) {
-          if (noteMode) {
+          // A note picked up with f / l is put back even if another kind of
+          // track has been selected since.
+          if (placing || dragging || currentTrackType() == TrackType::Standard) {
+            int noteTrack = heldProfile >= 0 ? heldProfile : g_currentTrack;
             if (!placing) {
                 // First click: start note (snap already applied above)
                 if (focusAtCursor.num != 99999999 && focusAtCursor.den != 99999999)
@@ -2485,6 +2591,8 @@ struct Canvas2D {
                   sprintf(anchorExpr, "%f", hoverW.y);
                   Event* e1 = new Event(currently_dragged.x, EV_NOTE_START, hoverR);
                   Event* e2 = new Event(currently_dragged.y, EV_NOTE_END);
+                  e1->profile = e2->profile = noteTrack;
+                  heldProfile = -1;
                   if ((int)spareIDs.size() > 0) {
                     e1->id = spareIDs[(int)spareIDs.size() - 1];
                     spareIDs.pop_back();
@@ -2524,10 +2632,11 @@ struct Canvas2D {
                     if (anchorBeat > snappedBeat) {
                         e1 = new Event(snappedBeat, EV_NOTE_START, anchorR);
                         e2 = new Event(anchorBeat, EV_NOTE_END);
-                    } else if (snappedBeat >= anchorBeat) {
+                    } else {
                         e1 = new Event(anchorBeat, EV_NOTE_START, anchorR);
                         e2 = new Event(snappedBeat, EV_NOTE_END);
                     }
+                    e1->profile = e2->profile = noteTrack;
                     if ((int)spareIDs.size() > 0) {
                         e1->id = spareIDs[(int)spareIDs.size() - 1];
                         spareIDs.pop_back();
@@ -2550,11 +2659,13 @@ struct Canvas2D {
                     empty = false;
                 }
                 placing = false;
+                heldProfile = -1;
             }
-          } else {
+          } else if (currentTrackType() == TrackType::Perc) {
             char expr[20];
             sprintf(expr, "%f", hoverW.y);
             Event* ev = new Event(snappedBeat, expr, EV_PERC);
+            ev->profile = g_currentTrack;
             ev->time = calc_time(&timeEvents, ev->beat);
             beatEvents.insert(ev);
             beatEvents.inorder();
@@ -2567,7 +2678,7 @@ struct Canvas2D {
 // --- Load binary song file ---
 bool load_song(const std::string& path,
                Canvas2D* canvas,
-               Profile* profiles, uint32_t* nextID)
+               std::vector<Track>& tracks, uint32_t* nextID)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -2666,22 +2777,23 @@ bool load_song(const std::string& path,
     uint32_t profileCount;
     f.read(reinterpret_cast<char*>(&profileCount), sizeof(profileCount));
 
-    if (profileCount != 10) {
-        // you can decide whether to error or clamp
+    if (!f || profileCount == 0 || profileCount > (uint32_t)MAX_TRACKS) {
         return false;
     }
 
-    for (int i = 0; i < 10; i++) {
+    std::vector<Track> loaded;
+    for (uint32_t i = 0; i < profileCount; i++)
+        loaded.push_back(makeTrack(TrackType::Standard, i, i));
+
+    for (Track& tr : loaded) {
         for (int j = 0; j < 3; j++) {
-            OSCSettings* osc = &(profiles[i].settings[j]);
+            OSCSettings* osc = &(tr.profile.settings[j]);
 
             int32_t wave;
             f.read(reinterpret_cast<char*>(&wave), sizeof(wave));
             osc->waveType = static_cast<WaveformType>(wave);
 
             f.read(reinterpret_cast<char*>(&osc->attack),  sizeof(float));
-            if (i == 0 && j == 0)
-                printf("read attack: %f\n", osc->attack);
             f.read(reinterpret_cast<char*>(&osc->decay),   sizeof(float));
             f.read(reinterpret_cast<char*>(&osc->sustain), sizeof(float));
             f.read(reinterpret_cast<char*>(&osc->release), sizeof(float));
@@ -2689,26 +2801,62 @@ bool load_song(const std::string& path,
         }
     }
 
-    // Optional Pd patch section (absent in files saved before Pd support)
-    for (int i = 0; i < 10; i++) {
-      profiles[i].pdPatch[0] = '\0';
-      profiles[i].pdGainDb = 0.0f;
-    }
+    // Optional tagged sections. Files saved before Pd support have none, and
+    // files saved before tracks have no TRKS.
+    bool hasTracks = false;
     char tag[4];
-    if (f.read(tag, 4) && std::strncmp(tag, "PDPT", 4) == 0) {
-        for (int i = 0; i < 10; i++) {
-            uint32_t len = 0;
-            if (!f.read(reinterpret_cast<char*>(&len), sizeof(len))) break;
-            std::string name(len, '\0');
-            f.read(name.data(), len);
-            std::snprintf(profiles[i].pdPatch, sizeof profiles[i].pdPatch, "%s", name.c_str());
-        }
-        if (f.read(tag, 4) && std::strncmp(tag, "PDGN", 4) == 0) {
-            for (int i = 0; i < 10; i++)
-                f.read(reinterpret_cast<char*>(&profiles[i].pdGainDb), sizeof(float));
+    while (f.read(tag, 4)) {
+        if (std::strncmp(tag, "PDPT", 4) == 0) {
+            for (Track& tr : loaded) {
+                uint32_t len = 0;
+                if (!f.read(reinterpret_cast<char*>(&len), sizeof(len))) break;
+                tr.pdPatch.assign(len, '\0');
+                f.read(tr.pdPatch.data(), len);
+            }
+        } else if (std::strncmp(tag, "PDGN", 4) == 0) {
+            for (Track& tr : loaded)
+                f.read(reinterpret_cast<char*>(&tr.gainDb), sizeof(float));
+        } else if (std::strncmp(tag, "TRKS", 4) == 0) {
+            for (Track& tr : loaded) {
+                int32_t type = 0;
+                uint32_t len = 0;
+                f.read(reinterpret_cast<char*>(&type), sizeof(type));
+                f.read(reinterpret_cast<char*>(&len), sizeof(len));
+                if (!f || len > 1024) return false;
+                tr.type = static_cast<TrackType>(std::clamp(type, 0, 2));
+                tr.name.assign(len, '\0');
+                f.read(tr.name.data(), len);
+                f.read(reinterpret_cast<char*>(&tr.color.r), sizeof(float));
+                f.read(reinterpret_cast<char*>(&tr.color.g), sizeof(float));
+                f.read(reinterpret_cast<char*>(&tr.color.b), sizeof(float));
+                uint8_t flags[3] = {};
+                f.read(reinterpret_cast<char*>(flags), sizeof flags);
+                tr.mute = flags[0]; tr.solo = flags[1]; tr.armed = flags[2];
+                for (int j = 0; j < 3; j++) {
+                    f.read(reinterpret_cast<char*>(&tr.profile.settings[j].freq), sizeof(float));
+                    f.read(reinterpret_cast<char*>(&tr.profile.settings[j].hold), sizeof(float));
+                }
+            }
+            hasTracks = true;
+        } else {
+            break;
         }
     }
 
+    if (!hasTracks && (int)loaded.size() < MAX_TRACKS) {
+        // Pre-track file: the profiles become standard tracks, and the perc
+        // blips (which had no profile of their own) move to a new perc track.
+        int percIndex = (int)loaded.size();
+        loaded.push_back(makeTrack(TrackType::Perc, percIndex, 0));
+        for (Event* e = canvas->beatEvents.get_first(); e; e = next(e))
+            if (e->type == EV_PERC) e->profile = percIndex;
+    }
+
+    // Events pointing at a track that doesn't exist go to the first one
+    for (Event* e = canvas->beatEvents.get_first(); e; e = next(e))
+        if (e->profile < 0 || e->profile >= (int)loaded.size()) e->profile = 0;
+
+    tracks = std::move(loaded);
     f.close();
     return true;
 }
@@ -2745,66 +2893,126 @@ static WaveformType nextWave(WaveformType w) {
     }
 }
 
+// Track panel geometry, in pixels
+constexpr float TRACK_PANEL_W  = 230.0f;
+constexpr float TRACK_ROW_H    = 46.0f;
+constexpr float TRACK_HEADER_H = 22.0f;
+constexpr float TRACK_FOOTER_H = 26.0f;
+
 // Everything the control panel edits lives here. Sliders hold pointers into
-// `profile`, so an App must not be moved or copied after buildUI().
+// `profile` and into g_tracks, so an App must not be moved or copied after
+// buildUI(), and the track rows are rebuilt (tracksChanged) whenever g_tracks
+// is resized or replaced.
 struct App {
     AudioEngine& engine;
     ui::UI       ui;
     ui::Widget*  noteWindow = nullptr;
+    ui::Widget*  trackList  = nullptr;   // holds one row per track
+    bool         tracksChanged = true;   // rebuild the track rows before the next draw
+    float        trackScroll = 0.0f;     // pixels of rows scrolled off the top
 
-    Profile     profile;
-    int         currentProfile = 0;
+    Profile     profile;                 // synth settings of the current track
     float       bpm = 110.0f;
-    std::string freqText[3];         // percussion freq text boxes
-    std::string pdPatchText;         // Pd patch name for the current note profile
+    std::string freqText[3];             // percussion freq text boxes
+    std::string pdPatchText;             // Pd patch name for the current track
 
     explicit App(AudioEngine& e) : engine(e) {}
     App(const App&) = delete;
     App& operator=(const App&) = delete;
 
-    void sendProfile() { engine.setProfile(profile, currentProfile, noteMode); }
+    Track& track() { return g_tracks[g_currentTrack]; }
 
-    // Pull a profile from the engine; every bound widget updates automatically.
-    void loadProfile(int index) {
-        currentProfile = index;
-        profile = engine.getProfile(index, noteMode);
+    void sendProfile() {
+        track().profile = profile;
+        engine.setProfile(profile, g_currentTrack);
+    }
+
+    // Makes `index` the current track; every bound widget updates automatically.
+    void selectTrack(int index) {
+        if (index < 0 || index >= (int)g_tracks.size()) return;
+        g_currentTrack = index;
+        profile = track().profile;
         for (int k = 0; k < 3; k++) {
             char buf[32];
             std::snprintf(buf, sizeof buf, "%.2f", profile.settings[k].freq);
             freqText[k] = buf;
         }
         snapBlip = profile.settings[0].freq;
-        pdPatchText = profile.pdPatch;
+        pdPatchText = track().pdPatch;
+        scrollToTrack(index);
     }
 
-    // Stores the typed patch name in the current note profile and loads it.
+    void addTrack(TrackType type) {
+        if ((int)g_tracks.size() >= MAX_TRACKS) return;
+        int ofType = (int)std::count_if(g_tracks.begin(), g_tracks.end(),
+                                        [type](const Track& t) { return t.type == type; });
+        int index = (int)g_tracks.size();
+        g_tracks.push_back(makeTrack(type, index, ofType));
+        engine.setProfile(g_tracks[index].profile, index);
+        applyTrackGains();
+        tracksChanged = true;
+        selectTrack(index);
+    }
+
+    // Mute and solo are applied through each track's Pd gain: while any track
+    // is soloed only soloed tracks are heard, and a muted track never is.
+    void applyTrackGains() {
+        bool anySolo = std::any_of(g_tracks.begin(), g_tracks.end(),
+                                   [](const Track& t) { return t.solo; });
+        for (int i = 0; i < (int)g_tracks.size(); i++) {
+            const Track& t = g_tracks[i];
+            bool audible = !t.mute && (!anySolo || t.solo);
+            engine.pd.setGain(i, audible ? t.gainDb : PdHost::MIN_DB);
+        }
+    }
+
+    // ---- Track list scrolling (only whole rows are shown) ----
+    int visibleRows() const {
+        return trackList ? (int)std::floor(trackList->screen.h / TRACK_ROW_H) : 0;
+    }
+
+    void scrollTracks(int rows) {
+        int maxFirst = std::max(0, (int)g_tracks.size() - visibleRows());
+        int first = std::clamp((int)std::lround(trackScroll / TRACK_ROW_H) + rows, 0, maxFirst);
+        trackScroll = first * TRACK_ROW_H;
+    }
+
+    void scrollToTrack(int index) {
+        int rows = visibleRows();
+        if (rows <= 0) return;   // not laid out yet
+        int first = (int)std::lround(trackScroll / TRACK_ROW_H);
+        if (index < first)              first = index;
+        else if (index >= first + rows) first = index - rows + 1;
+        trackScroll = first * TRACK_ROW_H;
+    }
+
+    // Stores the typed patch name in the current track and loads it.
     void commitPdPatch() {
-        if (!noteMode) return;
-        std::snprintf(profile.pdPatch, sizeof profile.pdPatch, "%s", pdPatchText.c_str());
-        sendProfile();
-        engine.pd.setPatch(currentProfile, pdPatchText);
-    }
-
-    void commitPdGain() {
-        if (!noteMode) return;
-        sendProfile();
-        engine.pd.setGain(currentProfile, profile.pdGainDb);
+        if (track().type != TrackType::Standard) return;
+        track().pdPatch = pdPatchText;
+        engine.pd.setPatch(g_currentTrack, pdPatchText);
     }
 
     void editPdPatch() {
         commitPdPatch();
-        engine.pd.openEditor(currentProfile, pdPatchText);
+        engine.pd.openEditor(g_currentTrack, pdPatchText);
     }
 
-    void loadAllPdPatches() {
+    // Pushes every track's settings to the engine, and unloads the Pd slots
+    // of tracks that no longer exist.
+    void syncEngine() {
         int loaded = 0, failed = 0;
-        for (int i = 0; i < 10; i++) {
-            Profile np = engine.getProfile(i, true);
-            std::string name = np.pdPatch;
-            engine.pd.setGain(i, np.pdGainDb);
-            bool ok = engine.pd.setPatch(i, name);
-            if (!name.empty()) (ok ? loaded : failed)++;
+        for (int i = 0; i < MAX_TRACKS; i++) {
+            if (i < (int)g_tracks.size()) {
+                const Track& t = g_tracks[i];
+                engine.setProfile(t.profile, i);
+                bool ok = engine.pd.setPatch(i, t.pdPatch);
+                if (!t.pdPatch.empty()) (ok ? loaded : failed)++;
+            } else {
+                engine.pd.setPatch(i, "");
+            }
         }
+        applyTrackGains();
         engine.pd.status = std::to_string(loaded) + " Pd patch(es) loaded" +
                            (failed ? ", " + std::to_string(failed) + " missing" : "");
     }
@@ -2819,33 +3027,20 @@ struct App {
             engine.exportWav(g_settings.wavName.data(), playhead_time, length);
         }
     }
- 
+
     void saveProject() {
-        Profile ps[10], notePs[10];
-        for (int i = 0; i < 10; i++) {
-            ps[i] = engine.getProfile(i, noteMode);
-            notePs[i] = engine.getProfile(i, true);
-        }
-        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, ps, notePs);
+        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks);
     }
 
     void loadProject() {
-        Profile ps[10];
-        load_song("session.son", &gBeatOctCanvas, ps, &gBeatOctCanvas.nextID);
+        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID);
+        g_tracks.reserve(MAX_TRACKS);
         gBeatOctCanvas.beatEvents.inorder();
         gBeatOctCanvas.beatEvents.find_loop();
-        for (int i = 0; i < 10; i++) {
-            // Patch names belong to note profiles even when loading in perc mode
-            if (!noteMode) {
-                Profile np = engine.getProfile(i, true);
-                std::snprintf(np.pdPatch, sizeof np.pdPatch, "%s", ps[i].pdPatch);
-                np.pdGainDb = ps[i].pdGainDb;
-                engine.setProfile(np, i, true);
-            }
-            engine.setProfile(ps[i], i, noteMode);
-        }
-        loadAllPdPatches();
-        loadProfile(currentProfile);   // refresh the panel
+        syncEngine();
+        tracksChanged = true;
+        trackScroll = 0.0f;
+        selectTrack(std::min(g_currentTrack, (int)g_tracks.size() - 1));   // refresh the panel
     }
 };
 
@@ -2854,7 +3049,7 @@ static void addOscColumn(ui::Widget& cw, App& app, int k, float x) {
     using namespace ui;
     OSCSettings& s = app.profile.settings[k];
     auto send     = [&app](Widget&) { app.sendProfile(); };
-    auto percOnly = [] { return !noteMode; };
+    auto percOnly = [] { return currentTrackType() == TrackType::Perc; };
     std::string name = "OSC" + std::to_string(k + 1);
 
     cw.add(button({x, 10, 120, 15}, "", [&app, k](Widget&) {
@@ -2881,24 +3076,137 @@ static void addOscColumn(ui::Widget& cw, App& app, int k, float x) {
     }, /*labelLeft=*/true, {0.8f, 0.7f, 0.3f}))->visibleFn = percOnly;
 }
 
+static std::string gainLabel(float db) {
+    if (db <= PdHost::MIN_DB) return "Gain: -inf dB";
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "Gain: %+.1f dB", db);
+    return buf;
+}
+
+// Small toggle button on a track row (mute / solo / record).
+static void addTrackToggle(ui::Widget& row, App& app, float x, const char* label,
+                           bool Track::*flag, ui::Color on, int i) {
+    using namespace ui;
+    Widget* w = row.add(button({x, 3, 19, 16}, label, [&app, flag, i](Widget&) {
+        g_tracks[i].*flag = !(g_tracks[i].*flag);
+        app.applyTrackGains();
+    }));
+    w->textColor = {1, 1, 1};
+    w->colorFn = [flag, on, i] {
+        return g_tracks[i].*flag ? on : Color{0.30f, 0.30f, 0.33f};
+    };
+}
+
+// (Re)creates one row per track. Called before drawing whenever the track
+// list changed, never from inside a widget callback (it frees the widgets).
+static void rebuildTrackRows(App& app) {
+    using namespace ui;
+    Widget* list = app.trackList;
+    list->children.clear();
+    app.tracksChanged = false;
+
+    const float rowW = TRACK_PANEL_W - 8.0f;
+    for (int i = 0; i < (int)g_tracks.size(); i++) {
+        auto select = [&app, i](Widget&) { app.selectTrack(i); };
+
+        // The row itself is a button, so clicking anywhere on it selects the track
+        Widget* row = list->add(button({}, "", select));
+        row->layoutFn = [&app, i](const Rect& p) {
+            return Rect{p.x + 4, p.y + i * TRACK_ROW_H - app.trackScroll + 2,
+                        p.w - 8, TRACK_ROW_H - 4};
+        };
+        row->visibleFn = [&app, list, i] {
+            float top = i * TRACK_ROW_H - app.trackScroll;
+            return top >= -0.5f && top + TRACK_ROW_H <= list->screen.h + 0.5f;
+        };
+        row->colorFn = [i] {
+            return i == g_currentTrack ? Color{0.25f, 0.25f, 0.30f} : Color{0.14f, 0.14f, 0.16f};
+        };
+
+        // Colour strip down the left edge
+        row->add(button({0, 0, 6, TRACK_ROW_H - 4}, "", select))
+            ->colorFn = [i] { return g_tracks[i].color; };
+
+        // "<hotkey>  <name>"
+        Widget* name = row->add(button({10, 3, rowW - 80, 16}, "", select));
+        name->fill = false;
+        name->textColor = {1, 1, 1};
+        name->labelFn = [i] {
+            std::string key = i < 9 ? std::to_string(i + 1) : i == 9 ? "0" : " ";
+            return key + "  " + g_tracks[i].name;
+        };
+
+        addTrackToggle(*row, app, rowW - 66, "M", &Track::mute, {0.85f, 0.55f, 0.15f}, i);
+        addTrackToggle(*row, app, rowW - 44, "S", &Track::solo, {0.25f, 0.55f, 0.85f}, i);
+        if (g_tracks[i].type == TrackType::Audio)
+            addTrackToggle(*row, app, rowW - 22, "R", &Track::armed, {0.85f, 0.15f, 0.15f}, i);
+
+        Widget* gain = row->add(slider({10, 23, rowW - 16, 15}, "Gain", &g_tracks[i].gainDb,
+                                       PdHost::MIN_DB, 12.0f, 1.0f,
+                                       [&app](Widget&) { app.applyTrackGains(); }));
+        gain->labelFn = [i] { return gainLabel(g_tracks[i].gainDb); };
+    }
+}
+
 static void buildUI(App& app) {
     using namespace ui;
     Widget& root = app.ui.root;
- 
+
     constexpr float MENU_BAR_H = 22.0f;
- 
+
     // Everything below the menu bar. An invisible container, so the old
     // 75% / 25% split now applies to the space left after the menu bar.
     Widget* content = root.add(panelFn([](const Rect& p) {
         return Rect{p.x, p.y + MENU_BAR_H, p.w, p.h - MENU_BAR_H};
     }, {}, /*fill=*/false));
- 
-    // Bottom 75%: note window. Canvas2D draws inside its screen rect.
+
+    // Area under the control panel: track panel on the left, note window on the right
+    auto below = [](const Rect& p) {
+        float top = p.y + p.h * CW_HEIGHT;
+        return Rect{p.x, top, p.w, p.y + p.h - top};
+    };
+
+    // Note window. Canvas2D draws inside its screen rect.
     // Added first so the control panel draws on top of it, as before.
-    app.noteWindow = content->add(panel({0.0f, CW_HEIGHT, 1.0f, 1 - CW_HEIGHT},
-                                        {0, 0, 0}, 5.0f, true, Kind::Canvas));
- 
-    // Top 25%: grey border panel, with the dark control window inset inside it
+    app.noteWindow = content->add(panelFn([below](const Rect& p) {
+        Rect r = below(p);
+        return Rect{r.x + TRACK_PANEL_W, r.y, r.w - TRACK_PANEL_W, r.h};
+    }, {0, 0, 0}));
+    app.noteWindow->kind  = Kind::Canvas;
+    app.noteWindow->inset = 5.0f;
+
+    // Track panel
+    Widget* tracks = content->add(panelFn([below](const Rect& p) {
+        Rect r = below(p);
+        return Rect{r.x, r.y, TRACK_PANEL_W, r.h};
+    }, {0.08f, 0.08f, 0.09f}));
+
+    Widget* title = tracks->add(button({8, 3, 100, 16}, "Tracks", {}));
+    title->fill = false;
+    title->textColor = {0.8f, 0.8f, 0.8f};
+
+    app.trackList = tracks->add(panelFn([](const Rect& p) {
+        return Rect{p.x, p.y + TRACK_HEADER_H, p.w, p.h - TRACK_HEADER_H - TRACK_FOOTER_H};
+    }, {}, /*fill=*/false));
+
+    const struct { const char* label; TrackType type; } adds[] = {
+        {"+ Standard", TrackType::Standard},
+        {"+ Audio",    TrackType::Audio},
+        {"+ Perc",     TrackType::Perc},
+    };
+    for (int k = 0; k < 3; k++) {
+        TrackType type = adds[k].type;
+        Widget* b = tracks->add(button({}, adds[k].label,
+                                       [&app, type](Widget&) { app.addTrack(type); },
+                                       {0.20f, 0.20f, 0.22f}));
+        b->textColor = {1, 1, 1};
+        b->layoutFn = [k](const Rect& p) {
+            float w = (p.w - 16) / 3;
+            return Rect{p.x + 4 + k * (w + 4), p.y + p.h - TRACK_FOOTER_H + 4, w, 18};
+        };
+    }
+
+    // Top: grey border panel, with the dark control window inset inside it
     Widget* border = content->add(panel({0.0f, 0.0f, 1.0f, CW_HEIGHT},
                                         {0.15f, 0.15f, 0.15f}, 2.0f, /*relative=*/true));
     Widget* cw = border->add(panel({0, 0, 1, 1}, {0.01f, 0.03f, 0.07f}, 3.0f, true));
@@ -2944,30 +3252,19 @@ static void buildUI(App& app) {
     cw->add(textBox({270, 25, 120, 15}, "Harm. Range: ",   &g_settings.harmRange));
     cw->add(textBox({270, 60, 120, 15}, "Alt. H. Range: ", &g_settings.altHarmRange));
 
-    // Pd patch for the current note profile
-    auto notesOnly = [] { return noteMode; };
+    // Pd patch for the current track (standard tracks only)
+    auto standardOnly = [] { return currentTrackType() == TrackType::Standard; };
     Widget* pdBox = cw->add(textBox({400, 25, 150, 15}, "Pd patch:", &app.pdPatchText));
-    pdBox->maxLen = sizeof(Profile::pdPatch) - 1;
+    pdBox->maxLen = 63;
     pdBox->onCommit = [&app](Widget&) { app.commitPdPatch(); };
-    pdBox->visibleFn = notesOnly;
+    pdBox->visibleFn = standardOnly;
     cw->add(button({400, 45, 150, 15}, "Edit in Pd", [&app](Widget&) { app.editPdPatch(); }))
-        ->visibleFn = notesOnly;
-    Widget* pdGain = cw->add(slider({560, 45, 150, 15}, "Pd gain", &app.profile.pdGainDb,
-                                    PdHost::MIN_DB, 12.0f, 1.0f,
-                                    [&app](Widget&) { app.commitPdGain(); }));
-    pdGain->labelFn = [&app] {
-        float db = app.profile.pdGainDb;
-        if (db <= PdHost::MIN_DB) return std::string("Pd gain: -inf dB");
-        char buf[32];
-        std::snprintf(buf, sizeof buf, "Pd gain: %+.1f dB", db);
-        return std::string(buf);
-    };
-    pdGain->visibleFn = notesOnly;
+        ->visibleFn = standardOnly;
     Widget* pdStatus = cw->add(button({560, 25, 300, 15}, "", {}));   // read-only status line
     pdStatus->fill = false;
     pdStatus->textColor = {0.7f, 0.7f, 0.7f};
     pdStatus->labelFn = [&app] { return app.engine.pd.status; };
-    pdStatus->visibleFn = notesOnly;
+    pdStatus->visibleFn = standardOnly;
 
     // Oscillator columns
     //for (int k = 0; k < 3; k++) addOscColumn(*cw, app, k, 140.0f + 130.0f * k);
@@ -3007,7 +3304,11 @@ int main(int, char**)
  
     App app(engine);
     buildUI(app);
-    app.loadProfile(0);
+    g_tracks.reserve(MAX_TRACKS);
+    for (int i = 0; i < 4; i++) g_tracks.push_back(makeTrack(TrackType::Standard, i, i));
+    g_tracks.push_back(makeTrack(TrackType::Perc, 4, 0));
+    app.syncEngine();
+    app.selectTrack(0);
  
     renderer.createSpectrogramPipeline();
  
@@ -3091,11 +3392,8 @@ int main(int, char**)
                 if (app.ui.keyDown(key)) break;
  
                 keys.push_back(key);
-                if (key >= '0' && key <= '9') {
-                    app.loadProfile(key - '0');
-                } else if (key == 'm') {
-                    noteMode = !noteMode;
-                    app.loadProfile(app.currentProfile);
+                if (hotkeyTrack(key) != -1) {
+                    app.selectTrack(hotkeyTrack(key));
                 } else if (key == 'n') {
                     engine.toggleFreeze();
                 }
@@ -3117,11 +3415,19 @@ int main(int, char**)
                 break;
             }
  
-            case SDL_MOUSEWHEEL:
+            case SDL_MOUSEWHEEL: {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                if (!app.ui.openMenu && app.trackList->screen.contains((float)mx, (float)my)) {
+                    int steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? e.wheel.y : -e.wheel.y;
+                    app.scrollTracks(steps);
+                    break;
+                }
                 dx = e.wheel.x * sens;
                 dy = e.wheel.y * sens;
                 if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { dx = -dx; dy = -dy; }
                 break;
+            }
             }
         }
  
@@ -3154,6 +3460,7 @@ int main(int, char**)
             int dw, dh;
             SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
  
+            if (app.tracksChanged) rebuildTrackRows(app);
             app.ui.layout((float)dw, (float)dh);
             app.ui.draw(renderer, (float)dh);
  

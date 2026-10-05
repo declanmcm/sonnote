@@ -105,7 +105,7 @@ public:
       vertices.insert(vertices.end(), {v0, v1, v2});
     }
 
-    void addPercBlip(float x, float y, float t, float l, float r, float b, float g) {
+    void addPercBlip(float x, float y, float t, float l, float r, float g, float b) {
       float xn = normaliseX(x);
       float yn = normaliseY(y);
       float yu = normaliseY(y + (t / 2));
@@ -118,7 +118,7 @@ public:
       vertices.insert(vertices.end(), {v0, v1, v2});
     }
 
-    void addPartialXPercBlip(float x, float y, float t, float l, float s, float r, float b, float g) {
+    void addPartialXPercBlip(float x, float y, float t, float l, float s, float r, float g, float b) {
       float xn = normaliseX(x);
       float yu = normaliseY(y + (t / 2));
       float yd = normaliseY(y - (t / 2));

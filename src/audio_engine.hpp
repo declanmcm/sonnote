@@ -496,14 +496,14 @@ struct OSCSettings  {
     float hold;
 };
 
+// Built-in synth settings for one track. The track's Pd patch and gain live
+// on the Track itself (see main.cpp).
 struct Profile {
     OSCSettings settings[3];
-    // Pd patch for this profile (file name, resolved against PdHost::patchDir).
-    // Empty = use the built-in oscillators. Only used by note profiles.
-    char pdPatch[64] = "";
-    // Gain sent to the patch as [r $0-gain], in dB (PdHost::MIN_DB = silent).
-    float pdGainDb = 0.0f;
 };
+
+// One Pd slot and one synth profile per track.
+constexpr int MAX_TRACKS = PdHost::SLOTS;
 
 // =========================================================
 // =============== LOCK-FREE MESSAGE QUEUE =================
@@ -576,12 +576,11 @@ public:
     void setTempo(float bpm);
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
-    void setProfile(Profile& p, int n, bool noteMode);
+    void setProfile(const Profile& p, int n);
     void toggleTuner();
-    Profile getProfile(int n, bool noteMode);
+    Profile getProfile(int n);
 
-    Profile profiles[10];
-    Profile profilesPerc[10];
+    Profile profiles[MAX_TRACKS];
 
     // Embedded Pure Data. Main thread: pd.setPatch / pd.openEditor / pd.poll.
     PdHost pd;

@@ -102,7 +102,7 @@ bool AudioEngine::start() {
     jack->engine = this;
 
     OSCSettings startingProfile = {WaveformType::Sine, 0.2f, 0.2f, 0.7f, 0.025f, 0.16f};
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < MAX_TRACKS; i++) {
         profiles[i].settings[0] = startingProfile;
         profiles[i].settings[1] = startingProfile;
         profiles[i].settings[2] = startingProfile;
@@ -111,22 +111,6 @@ bool AudioEngine::start() {
         profiles[i].settings[0].freq = 0.0f;
         profiles[i].settings[1].freq = 0.0f;
         profiles[i].settings[2].freq = 0.0f;
-    }
-
-    for (int i = 0; i < 10; i++) {
-        profilesPerc[i].settings[0] = startingProfile;
-        profilesPerc[i].settings[1] = startingProfile;
-        profilesPerc[i].settings[2] = startingProfile;
-        profilesPerc[i].settings[1].gain = 0.0f;
-        profilesPerc[i].settings[2].gain = 0.0f;
-        float freq = 3133.375 * std::log(1.00737564 * (i + 1));
-        printf("freq: %f\n", freq);
-        profilesPerc[i].settings[0].freq = freq;
-        profilesPerc[i].settings[1].freq = freq;
-        profilesPerc[i].settings[2].freq = freq;
-        profilesPerc[i].settings[0].hold = 0.1f;
-        profilesPerc[i].settings[1].hold = 0.1f;
-        profilesPerc[i].settings[2].hold = 0.1f;
     }
 
     const char* clientName = "AudioEngine";
@@ -274,19 +258,13 @@ void AudioEngine::setADSR(const ADSRParams& a) {
     messageQueue.push(m);
 }
 
-void AudioEngine::setProfile(Profile& p, int n, bool noteMode) {
-  if (noteMode)
+void AudioEngine::setProfile(const Profile& p, int n) {
+  if (n >= 0 && n < MAX_TRACKS)
     profiles[n] = p;
-  else
-    profilesPerc[n] = p;
 }
 
-Profile AudioEngine::getProfile(int n, bool noteMode) {
-  if (noteMode) {
-    return profiles[n];
-  } else {
-    return profilesPerc[n];
-  }
+Profile AudioEngine::getProfile(int n) {
+  return (n >= 0 && n < MAX_TRACKS) ? profiles[n] : Profile{};
 }
 
 void AudioEngine::toggleFreeze() {
@@ -524,7 +502,7 @@ inline float generateSample(WaveformType wf, float phase) {
     }
 }*/
 
-// Sequencer + Pd. Notes are sent to the Pd patch of their profile; every
+// Sequencer + Pd. Notes are sent to the Pd patch of their track; every
 // patch's [dac~] output is mixed by libpd and written to the JACK buffers.
 void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 {
@@ -555,7 +533,7 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                         pd.noteOn(currentEv->profile, currentEv->id,
                                   ref * currentEv->ratio.eval(), 1.0f);
                     else
-                        pd.diag.unroutedNotes++;   // profile has no Pd patch
+                        pd.diag.unroutedNotes++;   // track has no Pd patch
                 } else if (currentEv->type == EV_NOTE_END) {
                     pd.noteOff(currentEv->id);
                 }
