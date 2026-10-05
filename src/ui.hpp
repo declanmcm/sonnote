@@ -68,6 +68,7 @@ struct Widget {
 
     // --- Behaviour ---
     std::function<void(Widget&)> onClick;   // Button
+    std::function<void(Widget&)> onDoubleClick;  // Button: second click of a double-click
     std::function<void(Widget&)> onChange;  // Slider, TextBox
     std::function<void(Widget&)> onCommit;  // TextBox: editing finished (Enter or focus lost)
 
@@ -195,13 +196,14 @@ public:
 
     // x, y in window pixels, y-down. Returns true if the UI used the click,
     // so the caller shouldn't also pass it to the canvas.
-    bool mouseDown(float x, float y) {
+    // `clicks` is 2 for the second click of a double-click.
+    bool mouseDown(float x, float y, int clicks = 1) {
         if (openMenu) {
             // While a dropdown is open, it gets first pick of every click.
             for (auto it = openMenu->children.rbegin(); it != openMenu->children.rend(); ++it) {
                 if ((*it)->visible() && (*it)->screen.contains(x, y)) {
                     blur();
-                    return activate(**it, x);
+                    return activate(**it, x, clicks);
                 }
             }
             // Clicked anywhere else: just close the menu and swallow the click.
@@ -211,7 +213,7 @@ public:
 
         blur();
         Widget* w = hitTest(root, x, y);
-        return w ? activate(*w, x) : false;
+        return w ? activate(*w, x, clicks) : false;
     }
 
     // Returns true if the key went into a focused text box.
@@ -265,14 +267,15 @@ public:
     }
 
 private:
-    bool activate(Widget& w, float x) {
+    bool activate(Widget& w, float x, int clicks) {
         switch (w.kind) {
             case Kind::Menu:
                 openMenu = &w;
                 return true;
             case Kind::Button:
                 if (openMenu) closeMenu();          // picking an item closes the menu
-                if (w.onClick) w.onClick(w);
+                if (clicks >= 2 && w.onDoubleClick) w.onDoubleClick(w);
+                else if (w.onClick) w.onClick(w);
                 return true;
             case Kind::Slider:
                 w.setNormalized((x - w.screen.x) / w.screen.w);
@@ -315,7 +318,7 @@ private:
         if (!w.visible()) return;
         const Rect& s = w.screen;
         const float y = H - (s.y + s.h);              // renderer is y-up
-        const glm::vec4 white(1.0f), black(0.0f, 0.0f, 0.0f, 1.0f);
+        const glm::vec4 white(1.0f);
         const glm::vec4 text(w.textColor.r, w.textColor.g, w.textColor.b, 1.0f);
 
         Color c = w.colorFn ? w.colorFn() : w.color;
@@ -336,7 +339,7 @@ private:
                 w.drawnLabel = w.currentLabel();
                 if (w.labelLeft) r.addText(w.drawnLabel.data(), s.x - 50, y + 2, 15.0f, white);
                 else             r.addText(w.drawnLabel.data(), s.x + 2, y + 19, 15.0f, white);
-                if (w.text) r.addText(w.text->data(), s.x + 2, y + 2, 15.0f, black);
+                if (w.text) r.addText(w.text->data(), s.x + 2, y + 2, 15.0f, text);
                 break;
             default:
                 break;

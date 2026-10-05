@@ -33,7 +33,6 @@ double t;
 bool empty = true;
 float inputFreq = 0.0f;
 float ref = 440.0f;
-float snapBlip = 0.0f;
 
 enum class TrackType : int32_t { Standard = 0, Audio = 1, Perc = 2 };
 
@@ -95,7 +94,7 @@ static const char* trackTypeName(TrackType t) {
 }
 
 // A fresh track. `index` picks its colour; `ofType` (how many tracks of this
-// type already exist) numbers its name and, for perc tracks, its pitch.
+// type already exist) numbers its name.
 static Track makeTrack(TrackType type, int index, int ofType) {
     Track t;
     t.type  = type;
@@ -103,14 +102,30 @@ static Track makeTrack(TrackType type, int index, int ofType) {
     t.color = TRACK_PALETTE[index % TRACK_PALETTE_SIZE];
 
     OSCSettings osc = {WaveformType::Sine, 0.2f, 0.2f, 0.7f, 0.025f, 0.16f};
-    if (type == TrackType::Perc) {
-        osc.freq = 3133.375f * std::log(1.00737564f * (ofType + 1));
-        osc.hold = 0.1f;
-    }
     for (int j = 0; j < 3; j++) t.profile.settings[j] = osc;
     t.profile.settings[1].gain = 0.0f;
     t.profile.settings[2].gain = 0.0f;
     return t;
+}
+
+// Default Pd patch names for perc tracks: "perc-1", "perc-2", ... Each perc
+// track gets its own file, so each has its own sound and gain.
+static std::string percPatchName(int n) { return "perc-" + std::to_string(n); }
+
+// Lowest-numbered default perc patch that no track uses yet.
+static std::string freePercPatchName(const std::vector<Track>& tracks) {
+    for (int n = 1;; n++) {
+        std::string name = percPatchName(n);
+        bool used = std::any_of(tracks.begin(), tracks.end(),
+                                [&](const Track& t) { return t.pdPatch == name; });
+        if (!used) return name;
+    }
+}
+
+// Starter sound for a perc patch name: "perc-1" is a kick, "perc-2" a snare, ...
+static int percVariant(const std::string& name) {
+    if (name.rfind("perc-", 0) == 0) return std::max(0, std::atoi(name.c_str() + 5) - 1);
+    return 0;
 }
 
 const uint16_t audioBufferSize = 4096;
@@ -1367,8 +1382,8 @@ struct Canvas2D {
 
     Vec2 select1{0,0};
     Vec2 select2{0,0};
-    Event* select1closest;
-    Event* select2closest;
+    Event* select1closest = nullptr;
+    Event* select2closest = nullptr;
     bool selectFirst = true;
 
     Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
@@ -1426,6 +1441,32 @@ struct Canvas2D {
         return;
 
       renderer.addPercBlip(xp, yp, t, l, r, g, b);
+    }
+
+    // Drops references to events that were removed from beatEvents.
+    void forgetEvents(const std::vector<Event*>& removed) {
+      auto gone = [&](Event* e) { return e && std::find(removed.begin(), removed.end(), e) != removed.end(); };
+      if (gone(originEv)) originEv = nullptr;
+      if (gone(select1closest)) select1closest = nullptr;
+      if (gone(select2closest)) select2closest = nullptr;
+      for (Event* e = beatEvents.get_first(); e; e = next(e))
+        if (gone(e->origin)) e->origin = nullptr;
+    }
+
+    // Perc tracks are drawn in fixed lanes spread over the window's height, in
+    // track order (the first perc track is the top, "highest" lane), so every
+    // perc track is always on screen whatever the zoom or scroll. Returns the
+    // lane's screen y, or the middle of the window for a non-perc track.
+    float percLaneY(Vec2 topLeft, Vec2 bottomRight, int track) const {
+        int count = 0, lane = -1;
+        for (int i = 0; i < (int)g_tracks.size(); i++) {
+            if (g_tracks[i].type != TrackType::Perc) continue;
+            if (i == track) lane = count;
+            count++;
+        }
+        float h = topLeft.y - bottomRight.y;
+        if (lane < 0) return bottomRight.y + h / 2.0f;
+        return topLeft.y - (lane + 0.5f) * h / count;
     }
 
     // Transform: world -> screen
@@ -1686,7 +1727,8 @@ struct Canvas2D {
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
         } else if (current->type == EV_PERC) {
-          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          float laneY = percLaneY(topLeft, bottomRight, current->profile);
+          simultaneous.push_back(screenToWorld(topLeft, {0.0f, laneY}).y);
         }
         current = prev(current);
       }
@@ -1703,7 +1745,8 @@ struct Canvas2D {
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
         } else if (current->type == EV_PERC) {
-          simultaneous.push_back(current->function.evaluate(b, t, 0, 0));
+          float laneY = percLaneY(topLeft, bottomRight, current->profile);
+          simultaneous.push_back(screenToWorld(topLeft, {0.0f, laneY}).y);
         }
         current = next(current);
       }
@@ -1829,7 +1872,16 @@ struct Canvas2D {
         hoverW.x = snappedTime;
 
         if (currentTrackType() == TrackType::Perc)
-          hoverW.y = freq_to_octave(snapBlip);
+          hoverW.y = screenToWorld(topLeft, {0.0f, percLaneY(topLeft, bottomRight, g_currentTrack)}).y;
+
+        // Faint guide line along each perc lane
+        for (int i = 0; i < (int)g_tracks.size(); i++) {
+          if (g_tracks[i].type != TrackType::Perc) continue;
+          ui::Color c = g_tracks[i].color;
+          float laneY = percLaneY(topLeft, bottomRight, i);
+          addCanvasRect(renderer, topLeft, bottomRight, topLeft.x, laneY, bottomRight.x - topLeft.x, 1,
+                        c.r * 0.3f, c.g * 0.3f, c.b * 0.3f);
+        }
 
         if (empty)
           hoverR = {1, 1};
@@ -1892,7 +1944,8 @@ struct Canvas2D {
             } else if (currentBeatEv->type == EV_BEAT) {
               draw_rhythm_line(currentBeatEv, renderer, topLeft, bottomRight);
             } else if (currentBeatEv->type == EV_PERC) {
-              Vec2 ap = worldToScreen(topLeft, { currentBeatEv->time, currentBeatEv->function.evaluate(b, t, 0, 0)});
+              Vec2 ap = worldToScreen(topLeft, { currentBeatEv->time, 0.0f });
+              ap.y = percLaneY(topLeft, bottomRight, currentBeatEv->profile);
               ui::Color pc = trackColor(currentBeatEv->profile);
               addCanvasPercBlip(renderer, topLeft, bottomRight, ap.x, ap.y, 4, 4, pc.r, pc.g, pc.b);
               if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
@@ -2662,10 +2715,18 @@ struct Canvas2D {
                 heldProfile = -1;
             }
           } else if (currentTrackType() == TrackType::Perc) {
-            char expr[20];
-            sprintf(expr, "%f", hoverW.y);
-            Event* ev = new Event(snappedBeat, expr, EV_PERC);
+            // The blip's height is its track's lane; the stored value is only
+            // used by MIDI export (as an octave, 4 = C4).
+            Event* ev = new Event(snappedBeat, "4", EV_PERC);
             ev->profile = g_currentTrack;
+            // Unique id, so the blip can be removed without touching other
+            // id-0 events (beats, foci) at the same beat
+            if ((int)spareIDs.size() > 0) {
+              ev->id = spareIDs.back();
+              spareIDs.pop_back();
+            } else {
+              ev->id = nextID++;
+            }
             ev->time = calc_time(&timeEvents, ev->beat);
             beatEvents.insert(ev);
             beatEvents.inorder();
@@ -2848,13 +2909,17 @@ bool load_song(const std::string& path,
         // blips (which had no profile of their own) move to a new perc track.
         int percIndex = (int)loaded.size();
         loaded.push_back(makeTrack(TrackType::Perc, percIndex, 0));
+        loaded.back().pdPatch = percPatchName(1);
         for (Event* e = canvas->beatEvents.get_first(); e; e = next(e))
             if (e->type == EV_PERC) e->profile = percIndex;
     }
 
-    // Events pointing at a track that doesn't exist go to the first one
-    for (Event* e = canvas->beatEvents.get_first(); e; e = next(e))
+    // Events pointing at a track that doesn't exist go to the first one, and
+    // perc blips from older files get ids of their own
+    for (Event* e = canvas->beatEvents.get_first(); e; e = next(e)) {
         if (e->profile < 0 || e->profile >= (int)loaded.size()) e->profile = 0;
+        if (e->type == EV_PERC && e->id == 0) e->id = (*nextID)++;
+    }
 
     tracks = std::move(loaded);
     f.close();
@@ -2910,6 +2975,11 @@ struct App {
     ui::Widget*  trackList  = nullptr;   // holds one row per track
     bool         tracksChanged = true;   // rebuild the track rows before the next draw
     float        trackScroll = 0.0f;     // pixels of rows scrolled off the top
+    std::vector<ui::Widget*> nameBoxes;  // per row: text box used while renaming
+    int          renaming = -1;          // track whose name is being edited
+    std::string  nameText;               // the name being typed
+    int          deleteArmed = -1;       // track whose delete button was clicked once
+    int          deleteArmedBefore = -1; // deleteArmed as it was before the current click
 
     Profile     profile;                 // synth settings of the current track
     float       bpm = 110.0f;
@@ -2937,7 +3007,6 @@ struct App {
             std::snprintf(buf, sizeof buf, "%.2f", profile.settings[k].freq);
             freqText[k] = buf;
         }
-        snapBlip = profile.settings[0].freq;
         pdPatchText = track().pdPatch;
         scrollToTrack(index);
     }
@@ -2947,11 +3016,94 @@ struct App {
         int ofType = (int)std::count_if(g_tracks.begin(), g_tracks.end(),
                                         [type](const Track& t) { return t.type == type; });
         int index = (int)g_tracks.size();
-        g_tracks.push_back(makeTrack(type, index, ofType));
-        engine.setProfile(g_tracks[index].profile, index);
+        Track t = makeTrack(type, index, ofType);
+        if (type == TrackType::Perc) t.pdPatch = freePercPatchName(g_tracks);
+        g_tracks.push_back(t);
+        engine.setProfile(t.profile, index);
+        loadPatch(index);
         applyTrackGains();
         tracksChanged = true;
         selectTrack(index);
+    }
+
+    // Swaps two tracks: their rows, their notes and blips, and their Pd slots.
+    void swapTracks(int a, int b) {
+        if (a == b) return;
+        std::swap(g_tracks[a], g_tracks[b]);
+        auto remap = [a, b](int& t) { if (t == a) t = b; else if (t == b) t = a; };
+        for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next(e))
+            remap(e->profile);
+        remap(g_currentTrack);
+        remap(gBeatOctCanvas.heldProfile);
+        engine.pd.swapSlots(a, b);
+        engine.setProfile(g_tracks[a].profile, a);
+        engine.setProfile(g_tracks[b].profile, b);
+        tracksChanged = true;
+    }
+
+    // Moves the current track up (-1) or down (+1) the list.
+    void moveTrack(int dir) {
+        int a = g_currentTrack, b = a + dir;
+        if (b < 0 || b >= (int)g_tracks.size()) return;
+        swapTracks(a, b);
+        applyTrackGains();
+        selectTrack(b);
+    }
+
+    // Deletes a track along with its notes and blips. The last track stays.
+    void deleteTrack(int i) {
+        int n = (int)g_tracks.size();
+        if (n <= 1 || i < 0 || i >= n) return;
+        Canvas2D& c = gBeatOctCanvas;
+
+        std::vector<Event*> removed;
+        for (Event* e = c.beatEvents.get_first(); e; e = next(e)) {
+            if (e->profile != i) continue;
+            if (e->type == EV_PERC) {
+                removed.push_back(e);
+            } else if (e->type == EV_NOTE_START) {
+                removed.push_back(e);
+                Event* end = next(e);
+                while (end && !(end->type == EV_NOTE_END && end->id == e->id)) end = next(end);
+                if (end) removed.push_back(end);
+            }
+        }
+        for (Event* e : removed) c.beatEvents.remove(e->beat, e->id);
+        c.forgetEvents(removed);
+        if (c.heldProfile == i) {   // a note of this track was picked up with f / l
+            c.heldProfile = -1;
+            c.placing = c.dragging = false;
+        }
+
+        int select = g_currentTrack > i ? g_currentTrack - 1 : g_currentTrack;
+        for (int k = i; k < n - 1; k++) swapTracks(k, k + 1);   // move it to the end...
+        g_tracks.pop_back();                                     // ...and drop it
+        engine.pd.setPatch(n - 1, "");
+        applyTrackGains();
+        tracksChanged = true;
+        selectTrack(std::min(select, n - 2));
+    }
+
+    void startRename(int i) {
+        if (i < 0 || i >= (int)nameBoxes.size()) return;
+        renaming = i;
+        nameText = g_tracks[i].name;
+        ui.focused = nameBoxes[i];
+    }
+
+    void finishRename() {
+        if (renaming >= 0 && renaming < (int)g_tracks.size() && !nameText.empty())
+            g_tracks[renaming].name = nameText;
+        renaming = -1;
+    }
+
+    // Loads track i's Pd patch, first writing the starter perc patch for a
+    // perc track whose file doesn't exist yet.
+    bool loadPatch(int i) {
+        const Track& t = g_tracks[i];
+        if (t.type == TrackType::Perc && !t.pdPatch.empty())
+            engine.pd.ensurePercPatch(t.pdPatch, percVariant(t.pdPatch));
+        return engine.pd.setPatch(i, t.pdPatch);
     }
 
     // Mute and solo are applied through each track's Pd gain: while any track
@@ -2988,9 +3140,9 @@ struct App {
 
     // Stores the typed patch name in the current track and loads it.
     void commitPdPatch() {
-        if (track().type != TrackType::Standard) return;
+        if (track().type == TrackType::Audio) return;
         track().pdPatch = pdPatchText;
-        engine.pd.setPatch(g_currentTrack, pdPatchText);
+        loadPatch(g_currentTrack);
     }
 
     void editPdPatch() {
@@ -3006,7 +3158,7 @@ struct App {
             if (i < (int)g_tracks.size()) {
                 const Track& t = g_tracks[i];
                 engine.setProfile(t.profile, i);
-                bool ok = engine.pd.setPatch(i, t.pdPatch);
+                bool ok = loadPatch(i);
                 if (!t.pdPatch.empty()) (ok ? loaded : failed)++;
             } else {
                 engine.pd.setPatch(i, "");
@@ -3035,6 +3187,8 @@ struct App {
     void loadProject() {
         load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID);
         g_tracks.reserve(MAX_TRACKS);
+        for (Track& t : g_tracks)   // perc tracks always start with a patch
+            if (t.type == TrackType::Perc && t.pdPatch.empty()) t.pdPatch = freePercPatchName(g_tracks);
         gBeatOctCanvas.beatEvents.inorder();
         gBeatOctCanvas.beatEvents.find_loop();
         syncEngine();
@@ -3071,7 +3225,6 @@ static void addOscColumn(ui::Widget& cw, App& app, int k, float x) {
     cw.add(textBox({x + 50, 150, 70, 15}, "Freq:", &app.freqText[k], [&app, k](Widget&) {
         if (app.freqText[k].empty()) return;
         app.profile.settings[k].freq = (float)std::atof(app.freqText[k].c_str());
-        if (k == 0) snapBlip = app.profile.settings[0].freq;
         app.sendProfile();
     }, /*labelLeft=*/true, {0.8f, 0.7f, 0.3f}))->visibleFn = percOnly;
 }
@@ -3102,7 +3255,12 @@ static void addTrackToggle(ui::Widget& row, App& app, float x, const char* label
 static void rebuildTrackRows(App& app) {
     using namespace ui;
     Widget* list = app.trackList;
+    if (app.renaming >= 0) {   // the box being typed into is about to go
+        app.ui.focused = nullptr;
+        app.renaming = -1;
+    }
     list->children.clear();
+    app.nameBoxes.clear();
     app.tracksChanged = false;
 
     const float rowW = TRACK_PANEL_W - 8.0f;
@@ -3127,19 +3285,41 @@ static void rebuildTrackRows(App& app) {
         row->add(button({0, 0, 6, TRACK_ROW_H - 4}, "", select))
             ->colorFn = [i] { return g_tracks[i].color; };
 
-        // "<hotkey>  <name>"
-        Widget* name = row->add(button({10, 3, rowW - 80, 16}, "", select));
+        // "<hotkey>  <name>". Double-click to rename.
+        Widget* name = row->add(button({10, 3, rowW - 100, 16}, "", select));
         name->fill = false;
         name->textColor = {1, 1, 1};
-        name->labelFn = [i] {
+        name->labelFn = [&app, i] {
+            if (app.deleteArmed == i) return std::string("Delete? Click x again");
             std::string key = i < 9 ? std::to_string(i + 1) : i == 9 ? "0" : " ";
             return key + "  " + g_tracks[i].name;
         };
+        name->visibleFn = [&app, i] { return app.renaming != i; };
+        name->onDoubleClick = [&app, i](Widget&) { app.startRename(i); };
+        row->onDoubleClick = name->onDoubleClick;
 
-        addTrackToggle(*row, app, rowW - 66, "M", &Track::mute, {0.85f, 0.55f, 0.15f}, i);
-        addTrackToggle(*row, app, rowW - 44, "S", &Track::solo, {0.25f, 0.55f, 0.85f}, i);
+        Widget* box = row->add(textBox({10, 3, rowW - 100, 16}, "", &app.nameText));
+        box->maxLen = 16;
+        box->textColor = {1, 1, 1};
+        box->colorFn = [] { return Color{0.14f, 0.14f, 0.16f}; };
+        box->visibleFn = [&app, i] { return app.renaming == i; };
+        box->onCommit = [&app](Widget&) { app.finishRename(); };
+        app.nameBoxes.push_back(box);
+
+        addTrackToggle(*row, app, rowW - 88, "M", &Track::mute, {0.85f, 0.55f, 0.15f}, i);
+        addTrackToggle(*row, app, rowW - 66, "S", &Track::solo, {0.25f, 0.55f, 0.85f}, i);
         if (g_tracks[i].type == TrackType::Audio)
-            addTrackToggle(*row, app, rowW - 22, "R", &Track::armed, {0.85f, 0.15f, 0.15f}, i);
+            addTrackToggle(*row, app, rowW - 44, "R", &Track::armed, {0.85f, 0.15f, 0.15f}, i);
+
+        // Delete: the first click arms it, a second click deletes
+        Widget* del = row->add(button({rowW - 22, 3, 19, 16}, "x", [&app, i](Widget&) {
+            if (app.deleteArmedBefore == i) app.deleteTrack(i);
+            else app.deleteArmed = i;
+        }));
+        del->textColor = {1, 1, 1};
+        del->colorFn = [&app, i] {
+            return app.deleteArmed == i ? Color{0.85f, 0.15f, 0.15f} : Color{0.30f, 0.30f, 0.33f};
+        };
 
         Widget* gain = row->add(slider({10, 23, rowW - 16, 15}, "Gain", &g_tracks[i].gainDb,
                                        PdHost::MIN_DB, 12.0f, 1.0f,
@@ -3252,8 +3432,8 @@ static void buildUI(App& app) {
     cw->add(textBox({270, 25, 120, 15}, "Harm. Range: ",   &g_settings.harmRange));
     cw->add(textBox({270, 60, 120, 15}, "Alt. H. Range: ", &g_settings.altHarmRange));
 
-    // Pd patch for the current track (standard tracks only)
-    auto standardOnly = [] { return currentTrackType() == TrackType::Standard; };
+    // Pd patch for the current track (not audio tracks)
+    auto standardOnly = [] { return currentTrackType() != TrackType::Audio; };
     Widget* pdBox = cw->add(textBox({400, 25, 150, 15}, "Pd patch:", &app.pdPatchText));
     pdBox->maxLen = 63;
     pdBox->onCommit = [&app](Widget&) { app.commitPdPatch(); };
@@ -3305,8 +3485,8 @@ int main(int, char**)
     App app(engine);
     buildUI(app);
     g_tracks.reserve(MAX_TRACKS);
-    for (int i = 0; i < 4; i++) g_tracks.push_back(makeTrack(TrackType::Standard, i, i));
-    g_tracks.push_back(makeTrack(TrackType::Perc, 4, 0));
+    for (int i = 0; i < 4; i++) app.addTrack(TrackType::Standard);
+    app.addTrack(TrackType::Perc);
     app.syncEngine();
     app.selectTrack(0);
  
@@ -3367,7 +3547,11 @@ int main(int, char**)
  
             case SDL_MOUSEBUTTONDOWN:
                if (e.button.button == SDL_BUTTON_LEFT) {
-                 if (!app.ui.mouseDown((float)e.button.x, (float)e.button.y))
+                 // Any click disarms a track's delete button; clicking it again
+                 // right away (see rebuildTrackRows) deletes the track.
+                 app.deleteArmedBefore = app.deleteArmed;
+                 app.deleteArmed = -1;
+                 if (!app.ui.mouseDown((float)e.button.x, (float)e.button.y, e.button.clicks))
                    click = 1;
                } else if (e.button.button == SDL_BUTTON_RIGHT) {
                  if (app.ui.openMenu) app.ui.closeMenu();
@@ -3380,16 +3564,29 @@ int main(int, char**)
                 break;
  
             case SDL_KEYDOWN: {
-                char key = e.key.keysym.sym;
+                SDL_Keycode sym = e.key.keysym.sym;
+                char key = sym;
                 if (key == SDLK_ESCAPE) {
-                  if (app.ui.openMenu) app.ui.closeMenu();
+                  if (app.ui.focused) app.ui.blur();
+                  else if (app.ui.openMenu) app.ui.closeMenu();
                   else running = false;
                   break;
                 }
-                if (e.key.keysym.sym == SDLK_LCTRL) { ctrl = true; break; }
- 
+                if (sym == SDLK_LCTRL) { ctrl = true; break; }
+
+                // Up / Down move the current track. (Arrow keycodes don't fit
+                // in a char, so keep them away from the text boxes and keys.)
+                if (sym == SDLK_UP || sym == SDLK_DOWN || sym == SDLK_LEFT || sym == SDLK_RIGHT) {
+                  app.deleteArmed = -1;
+                  if (!app.ui.focused && (sym == SDLK_UP || sym == SDLK_DOWN))
+                    app.moveTrack(sym == SDLK_UP ? -1 : 1);
+                  break;
+                }
+
                 // Typing into a text box shouldn't also trigger shortcuts
-                if (app.ui.keyDown(key)) break;
+                char typed = key;
+                if ((e.key.keysym.mod & KMOD_SHIFT) && typed >= 'a' && typed <= 'z') typed -= 'a' - 'A';
+                if (app.ui.keyDown(typed)) break;
  
                 keys.push_back(key);
                 if (hotkeyTrack(key) != -1) {

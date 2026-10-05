@@ -502,8 +502,17 @@ inline float generateSample(WaveformType wf, float phase) {
     }
 }*/
 
-// Sequencer + Pd. Notes are sent to the Pd patch of their track; every
-// patch's [dac~] output is mixed by libpd and written to the JACK buffers.
+// Next event the sequencer acts on: note starts/ends and perc blips.
+static Event* next_playable(Event* ev) {
+    if (ev) ev = next(ev);
+    while (ev && ev->type != EV_NOTE_START && ev->type != EV_NOTE_END && ev->type != EV_PERC)
+        ev = next(ev);
+    return ev;
+}
+
+// Sequencer + Pd. Notes and perc blips are sent to the Pd patch of their
+// track; every patch's [dac~] output is mixed by libpd and written to the
+// JACK buffers.
 void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 {
     memset(outL, 0, frames * sizeof(float));
@@ -536,9 +545,15 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                         pd.diag.unroutedNotes++;   // track has no Pd patch
                 } else if (currentEv->type == EV_NOTE_END) {
                     pd.noteOff(currentEv->id);
+                } else if (currentEv->type == EV_PERC) {
+                    // Starting (or looping back) mid-song skips past every
+                    // earlier event at once; only play hits that are due now.
+                    double lateSamples = (currentBeat - currentEv->beat) * samplesPerBeat;
+                    if (lateSamples <= frames)
+                        pd.hit(currentEv->profile, 1.0f);
                 }
                 pd.diag.events++;
-                currentEv = next_note(currentEv);
+                currentEv = next_playable(currentEv);
             }
         }
 
