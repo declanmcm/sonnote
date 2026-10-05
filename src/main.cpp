@@ -2209,16 +2209,37 @@ struct Canvas2D {
             }
         }
 
+        // Closest note (note keys) and, on a perc track, the current track's
+        // blip at the hovered beat (perc keys). Kept apart because the note
+        // keys below assume a note: a ratio, a matching NOTE_END, ...
         Event* closest = nullptr;
-        if ((int)currentEvsAtCursor.size() > 0) {
-            float dist = 999999999999.0f;
-            b = currentBeat;
-            for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
-                if (std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y) < dist) {
-                    dist = std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y);
-                    closest = currentEvsAtCursor[i];
-                }
+        Event* closestBlip = nullptr;
+        if (currentTrackType() == TrackType::Perc) {
+          Event* e = beatEvents.get_first();
+          if (e && e->type != EV_PERC)
+            e = next_type(e, EV_PERC);
+          while (e) {
+            if (e->profile == g_currentTrack && std::abs(e->beat - snappedBeat) < 1e-6) {
+              closestBlip = e;
+              break;
             }
+            e = next_type(e, EV_PERC);
+          }
+        } else if ((int)currentEvsAtCursor.size() > 0) {
+          float dist = 999999999999.0f;
+          b = currentBeat;
+          for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
+              if (std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y) < dist) {
+                  dist = std::abs(ratio_to_octave(currentEvsAtCursor[i]->ratio) - hoverW.y);
+                  closest = currentEvsAtCursor[i];
+              }
+          }
+        }
+
+        // d over a blip deletes it
+        if (hovered && closestBlip && containsKey(keys, 'd')) {
+          beatEvents.remove(closestBlip->beat, closestBlip->id);
+          closestBlip = nullptr;
         }
 
         if (containsKey(keys, 'e')) {
@@ -2252,8 +2273,7 @@ struct Canvas2D {
           renderer.addText(originText, topLeft.x + 3, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
         }
 
-        if (hovered && (int)keys.size() != 0 && (int)currentEvsAtCursor.size() > 0) {
-          // We can safely assume closest exists since there are more than zero currentEvs
+        if (hovered && (int)keys.size() != 0 && closest) {
           char closestString[20];
           strcpy(closestString, closest->string_expr.c_str());
           printf("closest: %f, %d, %s\n", closest->beat, closest->id, closestString);
@@ -2370,7 +2390,7 @@ struct Canvas2D {
                 // Delete any foci that were on this note
                 Event* current = beatEvents.get_first();
                 Event* previous = nullptr;
-                if (current->type != EV_FOCUS)
+                if (current && current->type != EV_FOCUS)
                   current = next_type(current, EV_FOCUS);
                 bool deleted = false;
                 while (current) {
@@ -2717,19 +2737,21 @@ struct Canvas2D {
           } else if (currentTrackType() == TrackType::Perc) {
             // The blip's height is its track's lane; the stored value is only
             // used by MIDI export (as an octave, 4 = C4).
-            Event* ev = new Event(snappedBeat, "4", EV_PERC);
-            ev->profile = g_currentTrack;
-            // Unique id, so the blip can be removed without touching other
-            // id-0 events (beats, foci) at the same beat
-            if ((int)spareIDs.size() > 0) {
-              ev->id = spareIDs.back();
-              spareIDs.pop_back();
-            } else {
-              ev->id = nextID++;
+            {
+              Event* ev = new Event(snappedBeat, "4", EV_PERC);
+              ev->profile = g_currentTrack;
+              // Unique id, so the blip can be removed without touching other
+              // id-0 events (beats, foci) at the same beat
+              if ((int)spareIDs.size() > 0) {
+                ev->id = spareIDs.back();
+                spareIDs.pop_back();
+              } else {
+                ev->id = nextID++;
+              }
+              ev->time = calc_time(&timeEvents, ev->beat);
+              beatEvents.insert(ev);
+              beatEvents.inorder();
             }
-            ev->time = calc_time(&timeEvents, ev->beat);
-            beatEvents.insert(ev);
-            beatEvents.inorder();
           }
         }
     }
