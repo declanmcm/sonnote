@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <map>
+#include <deque>
 #include <memory>
 #include <iostream>
 #include <sndfile.h>
@@ -76,6 +77,22 @@ static TrackType currentTrackType() {
     if (g_currentTrack >= 0 && g_currentTrack < (int)g_tracks.size())
         return g_tracks[g_currentTrack].type;
     return TrackType::Standard;
+}
+
+// Indices of all tracks of one type, in panel order.
+static std::vector<int> tracksOfType(TrackType type) {
+    std::vector<int> out;
+    for (int i = 0; i < (int)g_tracks.size(); i++)
+        if (g_tracks[i].type == type) out.push_back(i);
+    return out;
+}
+
+// Track that new notes go on: the current track if it's a standard one,
+// otherwise the first standard track. -1 if there are none.
+static int noteTargetTrack() {
+    if (currentTrackType() == TrackType::Standard) return g_currentTrack;
+    std::vector<int> standard = tracksOfType(TrackType::Standard);
+    return standard.empty() ? -1 : standard[0];
 }
 
 // Hotkeys 1-9 and 0 target the first ten tracks. Returns -1 for other keys.
@@ -488,7 +505,9 @@ Event* prev_type(Event* ev, int type) {
 
 Event* findBeatEv(Event* root, float v) {
   Event* current = root;
-  if (current->type != EV_BEAT)
+  while (current && current->left)   // start from the first event, not the root
+    current = current->left;
+  if (current && current->type != EV_BEAT)
     current = next_type(current, EV_BEAT);
   while (current) {
     if (std::abs(current->beat - v) < 1e-6)
@@ -1443,6 +1462,49 @@ struct Canvas2D {
       renderer.addPercBlip(xp, yp, t, l, r, g, b);
     }
 
+    // Inserts divisions - 1 rhythm splits (EV_BEAT) evenly between beats a
+    // and b. Each split stores its position within the beat as num/den, built
+    // from the splits (if any) at the two ends, so nested splits get the
+    // right notches.
+    void insertSplit(float a, float b, int divisions) {
+      if (divisions < 2 || std::abs(b - a) < 1e-6) return;
+      float start = std::min(a, b), end = std::max(a, b);
+      float inc = (end - start) / divisions;
+      Event* ev1 = findBeatEv(beatEvents.root, start);   // splits at the ends
+      Event* ev2 = findBeatEv(beatEvents.root, end);
+      int offset = std::floor(end) - std::floor(start);
+      int startNum = 0, startDen = 1, endNum = 0, endDen = 1;
+      if (ev1) { startNum = ev1->num; startDen = ev1->den; }
+      if (ev2) { endNum = ev2->num; endDen = ev2->den; }
+      endNum += endDen * offset;
+      int diffDen = std::lcm(startDen, endDen);
+      int diffNum = (diffDen / endDen) * endNum - (diffDen / startDen) * startNum;
+      // Splitting exactly one whole beat: draw like a plain subdivision
+      bool wholeBeat = std::abs(std::floor(end) - end) < 1e-6 && std::abs(std::floor(start) - start) < 1e-6 &&
+                       std::abs((end - start) - 1.0f) < 1e-6;
+
+      // Counted, not accumulated, so float error can't add a split at `end`
+      for (int n = 1; n < divisions; n++) {
+        Event* toInsert = new Event(start + n * inc, EV_BEAT);
+        toInsert->id = nextID++;   // unique, so it can be removed on its own
+        toInsert->beatL = wholeBeat ? 0 : start;
+        toInsert->beatR = wholeBeat ? 0 : end;
+        int unsimpNum = diffNum * n;
+        int unsimpDen = diffDen * divisions;
+        int lcm = std::lcm(startDen, unsimpDen);
+        unsimpNum = (lcm / unsimpDen) * unsimpNum + (lcm / startDen) * startNum;
+        unsimpDen = lcm;
+        while (unsimpNum - unsimpDen > 0)
+          unsimpNum -= unsimpDen;
+        int g = std::gcd(unsimpNum, unsimpDen);
+        toInsert->num = g ? unsimpNum / g : unsimpNum;
+        toInsert->den = g ? unsimpDen / g : unsimpDen;
+        toInsert->primeFactors = getPrimeFactors(toInsert->den);
+        toInsert->time = calc_time(&timeEvents, toInsert->beat);
+        beatEvents.insert(toInsert);
+      }
+    }
+
     // Drops references to events that were removed from beatEvents.
     void forgetEvents(const std::vector<Event*>& removed) {
       auto gone = [&](Event* e) { return e && std::find(removed.begin(), removed.end(), e) != removed.end(); };
@@ -1453,20 +1515,99 @@ struct Canvas2D {
         if (gone(e->origin)) e->origin = nullptr;
     }
 
-    // Perc tracks are drawn in fixed lanes spread over the window's height, in
-    // track order (the first perc track is the top, "highest" lane), so every
-    // perc track is always on screen whatever the zoom or scroll. Returns the
-    // lane's screen y, or the middle of the window for a non-perc track.
-    float percLaneY(Vec2 topLeft, Vec2 bottomRight, int track) const {
-        int count = 0, lane = -1;
-        for (int i = 0; i < (int)g_tracks.size(); i++) {
-            if (g_tracks[i].type != TrackType::Perc) continue;
-            if (i == track) lane = count;
-            count++;
+    // ---- Sub-panels ----
+    // The bottom of the note window holds two strips that share the notes'
+    // time axis: perc lanes (one per perc track, in track order) and below
+    // them audio lanes (one per audio track, where clips will go). Sizes are
+    // in pixels; each strip scrolls when it has more lanes than fit.
+    enum class Region { None, Notes, Perc, Audio };
+
+    struct SubPanel {
+        float top = 0, bottom = 0;     // screen y (y-up)
+        float laneH = 0;
+        float* scroll = nullptr;       // pixels scrolled past the first lane
+        std::vector<int> lanes;        // track index per lane
+
+        float height() const { return top - bottom; }
+        float laneTop(int k) const { return top + *scroll - k * laneH; }
+        float maxScroll() const { return std::max(0.0f, lanes.size() * laneH - height()); }
+        // Lane under screen y, snapped to the nearest lane; -1 if there are none
+        int laneAt(float y) const {
+            if (lanes.empty()) return -1;
+            int k = (int)std::floor((top + *scroll - y) / laneH);
+            return std::clamp(k, 0, (int)lanes.size() - 1);
         }
-        float h = topLeft.y - bottomRight.y;
-        if (lane < 0) return bottomRight.y + h / 2.0f;
-        return topLeft.y - (lane + 0.5f) * h / count;
+    };
+
+    static constexpr float PERC_LANE_H  = 34.0f;   // fits a 30px rhythm line
+    static constexpr float AUDIO_LANE_H = 34.0f;
+    static constexpr float SUB_DIVIDER  = 2.0f;
+
+    float percPanelH  = 3 * PERC_LANE_H;
+    float audioPanelH = 2 * AUDIO_LANE_H;
+    float percScroll  = 0.0f;
+    float audioScroll = 0.0f;
+    float noteWindowH = 0.0f;           // from the last draw, for clamping
+    Region hoverRegion = Region::None;  // where the cursor was on the last draw
+    std::deque<std::string> laneLabels; // the renderer keeps char*s until the frame is drawn
+
+    // Each strip is at least one lane tall and at most 40% of the window.
+    void clampSubPanels() {
+        float maxH = noteWindowH * 0.4f;
+        percPanelH  = std::clamp(percPanelH,  PERC_LANE_H,  std::max(PERC_LANE_H,  maxH));
+        audioPanelH = std::clamp(audioPanelH, AUDIO_LANE_H, std::max(AUDIO_LANE_H, maxH));
+    }
+
+    // Up/Down arrows: grow (+1) or shrink (-1) the strip under the cursor by
+    // one lane (the perc strip when the cursor isn't over the audio strip).
+    void resizeSubPanel(int dir) {
+        if (hoverRegion == Region::Audio) audioPanelH += dir * AUDIO_LANE_H;
+        else                              percPanelH  += dir * PERC_LANE_H;
+        clampSubPanels();
+    }
+
+    // A rect clipped to the vertical extent of a panel (and the window's x).
+    static void panelRect(VulkanRenderer& r, const SubPanel& p, float x1, float x2,
+                          float x, float y, float w, float h, ui::Color c) {
+        float l = std::max(x, x1), rr = std::min(x + w, x2);
+        float bt = std::max(y, p.bottom), tp = std::min(y + h, p.top);
+        if (rr > l && tp > bt) r.addRect(l, bt, rr - l, tp - bt, c.r, c.g, c.b);
+    }
+
+    // Background, lanes, beat lines and playhead of one strip.
+    void drawSubPanel(VulkanRenderer& r, const SubPanel& p, float x1, float x2,
+                      const std::vector<std::pair<float, bool>>& beatXs,
+                      float playheadX, float loopX, const char* emptyText) {
+        const ui::Color bg = {0.17f, 0.17f, 0.19f};
+        panelRect(r, p, x1, x2, x1, p.bottom, x2 - x1, p.height(), bg);
+
+        for (int k = 0; k < (int)p.lanes.size(); k++) {
+            float top = p.laneTop(k), bottom = top - p.laneH;
+            if (bottom >= p.top || top <= p.bottom) continue;
+            if (k % 2) panelRect(r, p, x1, x2, x1, bottom, x2 - x1, p.laneH, {0.20f, 0.20f, 0.22f});
+            panelRect(r, p, x1, x2, x1, bottom, x2 - x1, 1, {0.12f, 0.12f, 0.13f});   // separator
+            const Track& t = g_tracks[p.lanes[k]];
+            panelRect(r, p, x1, x2, x1, bottom, 4, p.laneH, t.color);                // colour tab
+        }
+
+        for (auto [x, whole] : beatXs) {
+            ui::Color c = whole ? ui::Color{0.36f, 0.36f, 0.45f} : ui::Color{0.26f, 0.26f, 0.31f};
+            panelRect(r, p, x1, x2, x, p.bottom, 1, p.height(), c);
+        }
+        panelRect(r, p, x1, x2, loopX, p.bottom, 1, p.height(), {0.235f, 0.235f, 0.235f});
+        panelRect(r, p, x1, x2, playheadX, p.bottom, 1, p.height(), {0.784f, 0.08f, 0.08f});
+
+        // Track names, only on lanes that are fully visible (text isn't clipped)
+        const glm::vec4 white(0.85f, 0.85f, 0.85f, 1.0f);
+        for (int k = 0; k < (int)p.lanes.size(); k++) {
+            float top = p.laneTop(k), bottom = top - p.laneH;
+            if (bottom < p.bottom - 0.5f || top > p.top + 0.5f) continue;
+            laneLabels.push_back(g_tracks[p.lanes[k]].name);
+            r.addText(laneLabels.back().c_str(), x1 + 8, bottom + 3, 13.0f, white);
+        }
+        if (p.lanes.empty() && p.height() >= 16) {
+            r.addText(emptyText, x1 + 8, p.top - 16, 13.0f, glm::vec4(0.5f, 0.5f, 0.5f, 1.0f));
+        }
     }
 
     // Transform: world -> screen
@@ -1726,9 +1867,6 @@ struct Canvas2D {
             if (evi)
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
-        } else if (current->type == EV_PERC) {
-          float laneY = percLaneY(topLeft, bottomRight, current->profile);
-          simultaneous.push_back(screenToWorld(topLeft, {0.0f, laneY}).y);
         }
         current = prev(current);
       }
@@ -1744,9 +1882,6 @@ struct Canvas2D {
             if (evi)
               simultaneous.push_back(ratio_to_octave(evi->ratio));
           }
-        } else if (current->type == EV_PERC) {
-          float laneY = percLaneY(topLeft, bottomRight, current->profile);
-          simultaneous.push_back(screenToWorld(topLeft, {0.0f, laneY}).y);
         }
         current = next(current);
       }
@@ -1800,12 +1935,45 @@ struct Canvas2D {
     }
 
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
+        // ---- Layout: notes on top, then the perc strip, then the audio strip ----
+        noteWindowH = nw.y2 - nw.y1;
+        clampSubPanels();
+        SubPanel audio, perc;
+        audio.bottom = nw.y1;
+        audio.top    = nw.y1 + audioPanelH;
+        audio.laneH  = AUDIO_LANE_H;
+        audio.scroll = &audioScroll;
+        audio.lanes  = tracksOfType(TrackType::Audio);
+        perc.bottom  = audio.top + SUB_DIVIDER;
+        perc.top     = perc.bottom + percPanelH;
+        perc.laneH   = PERC_LANE_H;
+        perc.scroll  = &percScroll;
+        perc.lanes   = tracksOfType(TrackType::Perc);
+        float notesBottom = perc.top + SUB_DIVIDER;
+        laneLabels.clear();   // the previous frame has been drawn
+
+        // Everything below the sub-panels is the notes area: drawing is clipped to it
         Vec2 topLeft  = { nw.x1, nw.y2};
-        Vec2 bottomRight = { nw.x2, nw.y1 };
+        Vec2 bottomRight = { nw.x2, notesBottom };
 
         printf("\nraw hover: %f, %f\n", hover.x, hover.y);
 
         bool hovered = hover.x > 1e-06 && hover.y > 1e-06;
+        hoverRegion = !hovered                 ? Region::None
+                    : hover.y >= perc.top      ? Region::Notes
+                    : hover.y >= audio.top     ? Region::Perc
+                    :                            Region::Audio;
+        bool inNotes = hoverRegion == Region::Notes;
+
+        // Mouse wheel over a strip scrolls its lanes rather than the notes
+        SubPanel* hoveredPanel = hoverRegion == Region::Perc  ? &perc
+                               : hoverRegion == Region::Audio ? &audio : nullptr;
+        if (hoveredPanel && dy != 0 && !containsKey(keys, '~')) {
+            *hoveredPanel->scroll -= dy;
+            dy = 0;
+        }
+        percScroll  = std::clamp(percScroll,  0.0f, perc.maxScroll());
+        audioScroll = std::clamp(audioScroll, 0.0f, audio.maxScroll());
 
         // --- Panning with RMB drag ---
         if ((hovered && dx != 0) || (dy != 0)) {
@@ -1823,7 +1991,7 @@ struct Canvas2D {
         if (hovered && click == 2 && std::abs(prevHover.x) > 1e-6) {
             Vec2 d = { hover.x - prevHover.x, hover.y - prevHover.y};
             x0 -= d.x / sx;
-            y0 -= d.y / sy;
+            if (inNotes) y0 -= d.y / sy;   // the strips only pan in time
         }
 
         prevHover = hover;
@@ -1850,6 +2018,12 @@ struct Canvas2D {
         s0 = worldToScreen(topLeft, { loop_end, wA.y });
         addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, gridCol[0], gridCol[1], gridCol[2]);
 
+        // First end of a split being made with s
+        if (split_start >= 0.0f) {
+          s0 = worldToScreen(topLeft, { calc_time(&timeEvents, split_start), wA.y });
+          addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, 0.8, 0.7, 0.3);
+        }
+
         Vec2 w = screenToWorld(topLeft, hover);
         float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
         float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
@@ -1870,18 +2044,6 @@ struct Canvas2D {
         Vec2 unsnappedHoverW = screenToWorld(topLeft, hover);
         hoverW = unsnappedHoverW;
         hoverW.x = snappedTime;
-
-        if (currentTrackType() == TrackType::Perc)
-          hoverW.y = screenToWorld(topLeft, {0.0f, percLaneY(topLeft, bottomRight, g_currentTrack)}).y;
-
-        // Faint guide line along each perc lane
-        for (int i = 0; i < (int)g_tracks.size(); i++) {
-          if (g_tracks[i].type != TrackType::Perc) continue;
-          ui::Color c = g_tracks[i].color;
-          float laneY = percLaneY(topLeft, bottomRight, i);
-          addCanvasRect(renderer, topLeft, bottomRight, topLeft.x, laneY, bottomRight.x - topLeft.x, 1,
-                        c.r * 0.3f, c.g * 0.3f, c.b * 0.3f);
-        }
 
         if (empty)
           hoverR = {1, 1};
@@ -1943,16 +2105,7 @@ struct Canvas2D {
                 }
             } else if (currentBeatEv->type == EV_BEAT) {
               draw_rhythm_line(currentBeatEv, renderer, topLeft, bottomRight);
-            } else if (currentBeatEv->type == EV_PERC) {
-              Vec2 ap = worldToScreen(topLeft, { currentBeatEv->time, 0.0f });
-              ap.y = percLaneY(topLeft, bottomRight, currentBeatEv->profile);
-              ui::Color pc = trackColor(currentBeatEv->profile);
-              addCanvasPercBlip(renderer, topLeft, bottomRight, ap.x, ap.y, 4, 4, pc.r, pc.g, pc.b);
-              if (std::abs(std::floor(currentBeatEv->beat) - currentBeatEv->beat) < 1e-6) {
-                // Draw rhythm line at note start
-                addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
-              }
-            }
+            }   // perc blips are drawn in the perc strip (drawSubPanels)
             if (prevEv) {
               // Catch up with regular beat lines
               for (int i = std::floor(prevEv->beat); i < std::ceil(currentBeatEv->beat) + 1; i++) {
@@ -2160,6 +2313,22 @@ struct Canvas2D {
             }
             if (containsKey(keys, 'h'))
                 snap_foci = !snap_foci;
+            if (containsKey(keys, 's')) {
+              // First press marks one end, second press splits the span
+              // between the two into `split` equal divisions
+              if (split_start < 0.0f)
+                split_start = snappedBeat;
+              else {
+                insertSplit(split_start, snappedBeat, std::atoi(split));
+                split_start = -1.0f;
+              }
+            }
+            if (containsKey(keys, 'x')) {
+              // Remove the rhythm split under the cursor
+              Event* beatEv = findBeatEv(beatEvents.root, snappedBeat);
+              if (beatEv)
+                beatEvents.remove(beatEv->beat, beatEv->id);
+            }
             if (containsKey(keys, ' '))
                 play_triggered_from_space = true;
             if (containsKey(keys, 'v')) {
@@ -2209,23 +2378,26 @@ struct Canvas2D {
             }
         }
 
-        // Closest note (note keys) and, on a perc track, the current track's
-        // blip at the hovered beat (perc keys). Kept apart because the note
-        // keys below assume a note: a ratio, a matching NOTE_END, ...
+        // Closest note (note keys) when over the notes, and the blip at the
+        // hovered beat in the hovered lane when over the perc strip. Kept
+        // apart because the note keys below assume a note: a ratio, a
+        // matching NOTE_END, ...
         Event* closest = nullptr;
         Event* closestBlip = nullptr;
-        if (currentTrackType() == TrackType::Perc) {
+        int hoverPercTrack = -1;   // perc track of the lane under the cursor
+        if (hoverRegion == Region::Perc && perc.laneAt(hover.y) >= 0) {
+          hoverPercTrack = perc.lanes[perc.laneAt(hover.y)];
           Event* e = beatEvents.get_first();
           if (e && e->type != EV_PERC)
             e = next_type(e, EV_PERC);
           while (e) {
-            if (e->profile == g_currentTrack && std::abs(e->beat - snappedBeat) < 1e-6) {
+            if (e->profile == hoverPercTrack && std::abs(e->beat - snappedBeat) < 1e-6) {
               closestBlip = e;
               break;
             }
             e = next_type(e, EV_PERC);
           }
-        } else if ((int)currentEvsAtCursor.size() > 0) {
+        } else if (inNotes && (int)currentEvsAtCursor.size() > 0) {
           float dist = 999999999999.0f;
           b = currentBeat;
           for (int i = 0; i < (int)currentEvsAtCursor.size(); i++) {
@@ -2306,79 +2478,6 @@ struct Canvas2D {
               closest->ratio = simplifyR(multiplyR(jump, closest->ratio));
             }
 
-            if (containsKey(keys, 's')) {
-              if (std::abs(split_start + 1) < 1e-6)
-                split_start = snappedBeat;
-              else {
-                printf("START");
-                // Insert divisions between split_start and snappedBeat
-                if (std::abs(snappedBeat - split_start) > 1e-6) { // If split_start has been defined
-                  float start = split_start; // between split_start
-                  float end = snappedBeat; // and snappedBeat
-                  if (snappedBeat < split_start) { // Or vice versa
-                    start = snappedBeat;
-                    end = split_start;
-                  }
-                  float inc = (end - start) / std::atof(split); // Split into split divisions
-                  float i = start + inc; // The first division will be at start + inc
-                  int num = 1;
-                  int den = std::atoi(split);
-                  Event* ev1 = findBeatEv(beatEvents.root, start); // Find events at start
-                  Event* ev2 = findBeatEv(beatEvents.root, end); // and end
-                  int offset = std::floor(end) - std::floor(start);
-                  int startNum, startDen, endNum, endDen;
-                  startNum = endNum = 0;
-                  startDen = endDen = 1;
-                  if (ev1) {
-                    startNum = ev1->num;
-                    startDen = ev1->den;
-                  }
-                  if (ev2) {
-                    endNum = ev2->num;
-                    endDen = ev2->den;
-                  }
-                  printf("dens: %d, %d, lcm: %d\n", startDen, endDen, std::lcm(startDen, endDen));
-                  endNum += endDen * offset;
-                  int diffDen = std::lcm(startDen, endDen);
-                  int diffNum = (diffDen / endDen) * endNum - (diffDen / startDen) * startNum;
-                  while (i < end) {
-                    printf("insertBEAT_EV: %f, end: %f\n", i, end);
-                    Event* toInsert = new Event(i, EV_BEAT);
-                    if (std::abs(std::floor(end) - end) < 1e-6 && std::abs(std::floor(start) - start) < 1e-6 && std::abs(snappedBeat - split_start) - 1.0f < 1e-6) {
-                      toInsert->beatL = 0;
-                      toInsert->beatR = 0;
-                    } else {
-                      toInsert->beatL = start;
-                      toInsert->beatR = end;
-                    }
-                    int unsimpNum = diffNum * num;
-                    int unsimpDen = diffDen * den;
-                    // Add to startNum, startDen;
-                    int lcm = std::lcm(startDen, unsimpDen);
-                    unsimpNum = (lcm / unsimpDen) * unsimpNum + (lcm / startDen) * startNum;
-                    unsimpDen = lcm;
-                    while (unsimpNum - unsimpDen > 0)
-                      unsimpNum -= unsimpDen;
-                    printf("unsimpNum: %d, unsimpDen: %d, GCD: %d\n", unsimpNum, unsimpDen, std::gcd(unsimpNum, unsimpDen));
-                    int gcd = std::gcd(unsimpNum, unsimpDen);
-                    if (gcd == 0) {
-                      toInsert->num = unsimpNum;
-                      toInsert->den = unsimpDen;
-                    } else {
-                      toInsert->num = unsimpNum / std::gcd(unsimpNum, unsimpDen);
-                      toInsert->den = unsimpDen / std::gcd(unsimpNum, unsimpDen);
-                    }
-                    toInsert->primeFactors = getPrimeFactors(toInsert->den);
-                    toInsert->time = calc_time(&timeEvents, toInsert->beat);
-                    beatEvents.insert(toInsert);
-                    i += inc;
-                    num++;
-                  }
-                }
-                split_start = -1.0f;
-              }
-            }
-
             if (containsKey(keys, 'd') || containsKey(keys, 'f') || \
                   containsKey(keys, 'l')) {
                 // Delete the note because it will be replaced
@@ -2450,7 +2549,7 @@ struct Canvas2D {
         // Tempo changes are stored in units of seconds
         // Have to constantly convert world x coordinate into beats for hover snap, should be a relatively simple calculation
 
-        if (hovered && click == 2 && !placing && (int)currentEvsAtCursor.size() > 0) {
+        if (inNotes && click == 2 && !placing && (int)currentEvsAtCursor.size() > 0) {
             float dist = 999999999999.0f;
             b = currentBeat;
             Event* closest;
@@ -2623,16 +2722,14 @@ struct Canvas2D {
             Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
             Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
             // printf("preview: (%f, %f, %f, %f)\n", rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y);
-            ui::Color nc = trackColor(heldProfile >= 0 ? heldProfile : g_currentTrack);
+            ui::Color nc = trackColor(heldProfile >= 0 ? heldProfile : noteTargetTrack());
             addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, 2, nc.r, nc.g, nc.b);
             // dl->AddRect(rmin, rmax, IM_COL32(80,80,200,180), 6.0f, 0, 2.0f);
         }
 
         // Light-red preview dot (when Snap is on and hovered)
-        if ((snap_to_grid || snap_harmonics) && hovered) {
+        if ((snap_to_grid || snap_harmonics) && inNotes) {
             Vec2 pos = {hoverW.x, ratio_to_octave(hoverR)};
-            if (currentTrackType() == TrackType::Perc && !placing && !dragging)
-              pos.y = hoverW.y;
             printf("pos: %f, %f\n", pos.x, pos.y);
             Vec2 sd = worldToScreen(topLeft, pos);
             renderer.addCircle(sd.x, sd.y, 5.0f, 0.8f, 0.2f, 0.2f);
@@ -2654,8 +2751,8 @@ struct Canvas2D {
         if (hovered && click == 1) {
           // A note picked up with f / l is put back even if another kind of
           // track has been selected since.
-          if (placing || dragging || currentTrackType() == TrackType::Standard) {
-            int noteTrack = heldProfile >= 0 ? heldProfile : g_currentTrack;
+          int noteTrack = heldProfile >= 0 ? heldProfile : noteTargetTrack();
+          if (inNotes && (placing || dragging || noteTrack >= 0)) {
             if (!placing) {
                 // First click: start note (snap already applied above)
                 if (focusAtCursor.num != 99999999 && focusAtCursor.den != 99999999)
@@ -2734,12 +2831,12 @@ struct Canvas2D {
                 placing = false;
                 heldProfile = -1;
             }
-          } else if (currentTrackType() == TrackType::Perc) {
+          } else if (hoverPercTrack >= 0 && !placing && !dragging && !closestBlip) {
             // The blip's height is its track's lane; the stored value is only
             // used by MIDI export (as an octave, 4 = C4).
             {
               Event* ev = new Event(snappedBeat, "4", EV_PERC);
-              ev->profile = g_currentTrack;
+              ev->profile = hoverPercTrack;
               // Unique id, so the blip can be removed without touching other
               // id-0 events (beats, foci) at the same beat
               if ((int)spareIDs.size() > 0) {
@@ -2753,6 +2850,105 @@ struct Canvas2D {
               beatEvents.inorder();
             }
           }
+        }
+
+        drawSubPanels(renderer, perc, audio, nw.x1, nw.x2, topLeft);
+
+        // Hover marker in the perc strip: where a click puts a blip
+        if (hoverPercTrack >= 0 && !placing && !dragging) {
+          int k = perc.laneAt(hover.y);
+          float cy = perc.laneTop(k) - PERC_LANE_H / 2;
+          float cx = worldToScreen(topLeft, {snappedTime, 0.0f}).x;
+          if (cy > perc.bottom && cy < perc.top && cx >= nw.x1 && cx <= nw.x2)
+            renderer.addCircle(cx, cy, 4.0f, 0.8f, 0.2f, 0.2f);
+        }
+    }
+
+    // Draws the perc and audio strips: lanes, the rhythm splits (EV_BEAT
+    // events and whole beats) so placement lines up with the notes, the
+    // playhead, and the perc blips.
+    void drawSubPanels(VulkanRenderer& renderer, const SubPanel& perc, const SubPanel& audio,
+                       float x1, float x2, Vec2 topLeft) {
+        // Divider bars between notes / perc / audio
+        renderer.addRect(x1, perc.top, x2 - x1, SUB_DIVIDER, 0.35f, 0.35f, 0.38f);
+        renderer.addRect(x1, audio.top, x2 - x1, SUB_DIVIDER, 0.35f, 0.35f, 0.38f);
+
+        // Beat lines in the visible time range: (x, is a whole beat)
+        std::vector<std::pair<float, bool>> beatXs;
+        float t0 = std::max(0.0f, screenToWorld(topLeft, {x1, 0.0f}).x);
+        float t1 = screenToWorld(topLeft, {x2, 0.0f}).x;
+        if (t1 > t0) {
+          int b0 = (int)std::floor(calc_beat(&timeEvents, t0));
+          int b1 = (int)std::ceil(calc_beat(&timeEvents, t1));
+          for (int i = std::max(b0, 0); i <= b1 && i - b0 < 2000; i++)
+            beatXs.push_back({worldToScreen(topLeft, {calc_time(&timeEvents, (float)i), 0.0f}).x, true});
+        }
+        Event* e = beatEvents.get_first();
+        if (e && e->type != EV_BEAT) e = next_type(e, EV_BEAT);
+        for (; e; e = next_type(e, EV_BEAT)) {
+          float x = worldToScreen(topLeft, {e->time, 0.0f}).x;
+          if (x >= x1 && x <= x2) beatXs.push_back({x, false});
+        }
+
+        float playheadX = worldToScreen(topLeft, {playhead_time, 0.0f}).x;
+        float loopX     = worldToScreen(topLeft, {loop_end, 0.0f}).x;
+        drawPercPanel(renderer, perc, x1, x2, topLeft, beatXs, playheadX, loopX);
+        drawSubPanel(renderer, audio, x1, x2, beatXs, playheadX, loopX, "No audio tracks");
+    }
+
+    // The perc strip: a small canvas like the notes area (a little lighter),
+    // with a thin line per perc track carrying its blips and the same rhythm
+    // lines (with notches) the notes area draws.
+    void drawPercPanel(VulkanRenderer& renderer, const SubPanel& perc, float x1, float x2, Vec2 topLeft,
+                       const std::vector<std::pair<float, bool>>& beatXs, float playheadX, float loopX) {
+        panelRect(renderer, perc, x1, x2, x1, perc.bottom, x2 - x1, perc.height(), {0.06f, 0.06f, 0.07f});
+
+        // Clip bounds for the canvas helpers (y-up: "top left" has the larger y)
+        Vec2 ptl = {x1, perc.top}, pbr = {x2, perc.bottom};
+        const ui::Color rhythm = {0.47f, 0.47f, 0.63f};
+
+        for (int k = 0; k < (int)perc.lanes.size(); k++) {
+          float cy = perc.laneTop(k) - PERC_LANE_H / 2;
+          if (cy - PERC_LANE_H / 2 >= perc.top || cy + PERC_LANE_H / 2 <= perc.bottom) continue;
+
+          ui::Color c = trackColor(perc.lanes[k]);
+          panelRect(renderer, perc, x1, x2, x1, cy, x2 - x1, 1, {c.r * 0.45f, c.g * 0.45f, c.b * 0.45f});
+
+          // Whole beats: plain rhythm lines
+          for (auto [x, whole] : beatXs)
+            if (whole) addCanvasRect(renderer, ptl, pbr, x, cy - 15, 1, 30, rhythm.r, rhythm.g, rhythm.b);
+          // Splits: rhythm lines with their notches
+          Event* e = beatEvents.get_first();
+          if (e && e->type != EV_BEAT) e = next_type(e, EV_BEAT);
+          for (; e; e = next_type(e, EV_BEAT)) {
+            float x = worldToScreen(topLeft, {e->time, 0.0f}).x;
+            if (x >= x1 && x <= x2)
+              drawRhythmLine(e, {x, cy}, {e->beatL, e->beatR}, renderer, ptl, pbr);
+          }
+        }
+
+        panelRect(renderer, perc, x1, x2, loopX, perc.bottom, 1, perc.height(), {0.235f, 0.235f, 0.235f});
+        panelRect(renderer, perc, x1, x2, playheadX, perc.bottom, 1, perc.height(), {0.784f, 0.08f, 0.08f});
+        if (split_start >= 0.0f) {
+          float sx0 = worldToScreen(topLeft, {calc_time(&timeEvents, split_start), 0.0f}).x;
+          panelRect(renderer, perc, x1, x2, sx0, perc.bottom, 1, perc.height(), {0.8f, 0.7f, 0.3f});
+        }
+        if (perc.lanes.empty() && perc.height() >= 16)
+          renderer.addText("No perc tracks", x1 + 8, perc.top - 16, 13.0f, glm::vec4(0.5f, 0.5f, 0.5f, 1.0f));
+
+        // Blips, on their track's line
+        const float blipH = 10.0f, blipW = 8.0f;
+        Event* e = beatEvents.get_first();
+        if (e && e->type != EV_PERC) e = next_type(e, EV_PERC);
+        for (; e; e = next_type(e, EV_PERC)) {
+          auto lane = std::find(perc.lanes.begin(), perc.lanes.end(), e->profile);
+          if (lane == perc.lanes.end()) continue;
+          float cy = perc.laneTop((int)(lane - perc.lanes.begin())) - PERC_LANE_H / 2;
+          float x = worldToScreen(topLeft, {e->time, 0.0f}).x;
+          if (cy - blipH / 2 < perc.bottom || cy + blipH / 2 > perc.top) continue;
+          if (x < x1 || x + blipW > x2) continue;
+          ui::Color c = trackColor(e->profile);
+          renderer.addPercBlip(x, cy, blipH, blipW, c.r, c.g, c.b);
         }
     }
 };
@@ -2937,10 +3133,10 @@ bool load_song(const std::string& path,
     }
 
     // Events pointing at a track that doesn't exist go to the first one, and
-    // perc blips from older files get ids of their own
+    // perc blips and rhythm splits from older files get ids of their own
     for (Event* e = canvas->beatEvents.get_first(); e; e = next(e)) {
         if (e->profile < 0 || e->profile >= (int)loaded.size()) e->profile = 0;
-        if (e->type == EV_PERC && e->id == 0) e->id = (*nextID)++;
+        if ((e->type == EV_PERC || e->type == EV_BEAT) && e->id == 0) e->id = (*nextID)++;
     }
 
     tracks = std::move(loaded);
@@ -3596,12 +3792,17 @@ int main(int, char**)
                 }
                 if (sym == SDLK_LCTRL) { ctrl = true; break; }
 
-                // Up / Down move the current track. (Arrow keycodes don't fit
-                // in a char, so keep them away from the text boxes and keys.)
+                // Up / Down grow / shrink the perc or audio strip under the
+                // cursor; with Shift they move the current track instead.
+                // (Arrow keycodes don't fit in a char, so keep them away from
+                // the text boxes and keys.)
                 if (sym == SDLK_UP || sym == SDLK_DOWN || sym == SDLK_LEFT || sym == SDLK_RIGHT) {
                   app.deleteArmed = -1;
-                  if (!app.ui.focused && (sym == SDLK_UP || sym == SDLK_DOWN))
-                    app.moveTrack(sym == SDLK_UP ? -1 : 1);
+                  if (!app.ui.focused && (sym == SDLK_UP || sym == SDLK_DOWN)) {
+                    int dir = sym == SDLK_UP ? 1 : -1;
+                    if (e.key.keysym.mod & KMOD_SHIFT) app.moveTrack(-dir);
+                    else gBeatOctCanvas.resizeSubPanel(dir);
+                  }
                   break;
                 }
 
