@@ -11,6 +11,8 @@
 #include <string>
 #include <map>
 #include <deque>
+#include <filesystem>
+#include <mutex>
 #include <memory>
 #include <iostream>
 #include <sndfile.h>
@@ -1140,7 +1142,8 @@ static void writeVarLen(Stream& f, uint32_t value) {
 bool save_song(const std::string& path,
                EventTree& beatEvents,
                EventTree& timeEvents,
-               const std::vector<Track>& tracks)
+               const std::vector<Track>& tracks,
+               const std::vector<std::vector<Clip>>& clips)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -1269,8 +1272,41 @@ bool save_song(const std::string& path,
         }
     }
 
+    // Audio clips per track: the file each was recorded to and where it
+    // starts playing. Their positions are the EV_AUDIO_* events above.
+    f.write("CLIP", 4);
+    for (size_t i = 0; i < tracks.size(); i++) {
+        uint32_t count = i < clips.size() ? (uint32_t)clips[i].size() : 0;
+        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (uint32_t k = 0; k < count; k++) {
+            const Clip& c = clips[i][k];
+            uint32_t len = (uint32_t)c.file.size();
+            f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            f.write(c.file.data(), len);
+            f.write(reinterpret_cast<const char*>(&c.startSample), sizeof(c.startSample));
+        }
+    }
+
     f.close();
     return true;
+}
+
+// Reads a clip's audio from its .wav, as mono at `sampleRate` (linear
+// resampling if the file has another rate). Empty if the file can't be read.
+static std::vector<float> loadClipAudio(const std::string& path, float sampleRate) {
+    AudioData a;
+    try { a = loadWavMono(path); } catch (const std::exception&) { return {}; }
+    if (a.sampleRate <= 0 || std::abs(a.sampleRate - sampleRate) < 0.5f) return a.mono;
+    double ratio = (double)a.sampleRate / sampleRate;
+    std::vector<float> out((size_t)(a.mono.size() / ratio));
+    for (size_t i = 0; i < out.size(); i++) {
+        double src = i * ratio;
+        size_t i0 = (size_t)src;
+        size_t i1 = std::min(i0 + 1, a.mono.size() - 1);
+        float t = (float)(src - i0);
+        out[i] = a.mono[i0] * (1 - t) + a.mono[i1] * t;
+    }
+    return out;
 }
 
 float parseDivisor(char* n) {
@@ -1505,9 +1541,108 @@ struct Canvas2D {
       }
     }
 
+    // ---- Audio clips ----
+    AudioEngine* engine = nullptr;   // for the engine's samples-per-beat
+
+    // A clip on the timeline: its EV_AUDIO_START / EV_AUDIO_END pair
+    struct ClipSpan { Event* start = nullptr; Event* end = nullptr; };
+
+    std::vector<ClipSpan> clipSpans() {
+      std::vector<ClipSpan> spans;
+      for (Event* e = beatEvents.get_first(); e; e = next(e)) {
+        if (e->type == EV_AUDIO_START) {
+          spans.push_back({e, nullptr});
+        } else if (e->type == EV_AUDIO_END) {
+          for (ClipSpan& sp : spans)
+            if (!sp.end && sp.start->profile == e->profile && sp.start->id == e->id) { sp.end = e; break; }
+        }
+      }
+      spans.erase(std::remove_if(spans.begin(), spans.end(), [](const ClipSpan& sp) { return !sp.end; }),
+                  spans.end());
+      return spans;
+    }
+
+    static Clip* clipOf(const Event* e) {
+      if (!e || e->profile < 0 || e->profile >= (int)g_clips.size()) return nullptr;
+      auto& clips = g_clips[e->profile];
+      return e->id < clips.size() ? &clips[e->id] : nullptr;
+    }
+
+    // A clip being trimmed (l) or moved (m); it follows the cursor until a
+    // click commits it or Esc cancels.
+    enum ClipEditMode { CLIP_NONE, CLIP_TRIM_START, CLIP_TRIM_END, CLIP_MOVE };
+    struct ClipEdit {
+      ClipEditMode mode = CLIP_NONE;
+      ClipSpan span;
+      float grab = 0.0f;   // move: cursor beat minus clip start beat when grabbed
+    } clipEdit;
+
+    // Recording indicator, set by the main loop
+    bool recording = false;
+    float recordStartTime = 0.0f;
+
+    bool cancelEdit() {
+      if (clipEdit.mode == CLIP_NONE) return false;
+      clipEdit = {};
+      return true;
+    }
+
+    // Where the clip being edited would go with the cursor at `beat`: {start, end}
+    std::pair<float, float> clipEditExtent(float beat) const {
+      const ClipSpan& sp = clipEdit.span;
+      float s0 = sp.start->beat, e0 = sp.end->beat;
+      const float minLen = 1.0f / 32.0f;
+      const Clip* c = clipOf(sp.start);
+      double spb = engine ? engine->samplesPerBeat() : 0.0;
+      switch (clipEdit.mode) {
+        case CLIP_TRIM_START: {
+          // Can't start before the clip's first sample
+          float earliest = (c && spb > 0) ? s0 - (float)(c->startSample / spb) : s0;
+          return {std::clamp(beat, std::min(earliest, e0 - minLen), e0 - minLen), e0};
+        }
+        case CLIP_TRIM_END: {
+          // Can't end after the clip's last sample
+          float latest = (c && spb > 0) ? s0 + (float)((c->samples.size() - c->startSample) / spb) : e0;
+          return {s0, std::clamp(beat, s0 + minLen, std::max(latest, s0 + minLen))};
+        }
+        case CLIP_MOVE: {
+          float start = std::max(0.0f, beat - clipEdit.grab);
+          return {start, start + (e0 - s0)};
+        }
+        default:
+          return {s0, e0};
+      }
+    }
+
+    // Replaces an event with a copy at another beat (the tree is ordered by beat).
+    Event* moveEvent(Event* ev, float beat) {
+      Event* moved = new Event(beat, ev->type);
+      moved->id = ev->id;
+      moved->profile = ev->profile;
+      moved->time = calc_time(&timeEvents, beat);
+      beatEvents.remove_event(ev);
+      beatEvents.insert(moved);
+      return moved;
+    }
+
+    void commitClipEdit(float beat) {
+      auto [start, end] = clipEditExtent(beat);
+      ClipSpan sp = clipEdit.span;
+      if (clipEdit.mode == CLIP_TRIM_START && engine) {
+        if (Clip* c = clipOf(sp.start)) {
+          int64_t ss = (int64_t)c->startSample + std::llround((start - sp.start->beat) * engine->samplesPerBeat());
+          c->startSample = (uint64_t)std::max<int64_t>(0, ss);
+        }
+      }
+      if (std::abs(start - sp.start->beat) > 1e-6) moveEvent(sp.start, start);
+      if (std::abs(end - sp.end->beat) > 1e-6)     moveEvent(sp.end, end);
+      clipEdit = {};
+    }
+
     // Drops references to events that were removed from beatEvents.
     void forgetEvents(const std::vector<Event*>& removed) {
       auto gone = [&](Event* e) { return e && std::find(removed.begin(), removed.end(), e) != removed.end(); };
+      if (gone(clipEdit.span.start) || gone(clipEdit.span.end)) clipEdit = {};
       if (gone(originEv)) originEv = nullptr;
       if (gone(select1closest)) select1closest = nullptr;
       if (gone(select2closest)) select2closest = nullptr;
@@ -2327,7 +2462,7 @@ struct Canvas2D {
               // Remove the rhythm split under the cursor
               Event* beatEv = findBeatEv(beatEvents.root, snappedBeat);
               if (beatEv)
-                beatEvents.remove(beatEv->beat, beatEv->id);
+                beatEvents.remove_event(beatEv);
             }
             if (containsKey(keys, ' '))
                 play_triggered_from_space = true;
@@ -2410,8 +2545,38 @@ struct Canvas2D {
 
         // d over a blip deletes it
         if (hovered && closestBlip && containsKey(keys, 'd')) {
-          beatEvents.remove(closestBlip->beat, closestBlip->id);
+          beatEvents.remove_event(closestBlip);
           closestBlip = nullptr;
+        }
+
+        // Clip under the cursor in the audio strip: l trims its nearer edge,
+        // m moves it, d deletes it
+        std::vector<ClipSpan> spans = clipSpans();
+        ClipSpan hoverClip;
+        if (hoverRegion == Region::Audio && clipEdit.mode == CLIP_NONE) {
+          int k = audio.laneAt(hover.y);
+          bool inLane = k >= 0 && hover.y <= audio.laneTop(k) && hover.y > audio.laneTop(k) - AUDIO_LANE_H;
+          for (const ClipSpan& sp : spans) {
+            if (inLane && sp.start->profile == audio.lanes[k] &&
+                unsnappedHoverW.x >= sp.start->time && unsnappedHoverW.x <= sp.end->time) {
+              hoverClip = sp;
+              break;
+            }
+          }
+        }
+        if (hoverClip.start) {
+          if (containsKey(keys, 'l')) {
+            bool nearStart = std::abs(unsnappedHoverW.x - hoverClip.start->time) <
+                             std::abs(unsnappedHoverW.x - hoverClip.end->time);
+            clipEdit = {nearStart ? CLIP_TRIM_START : CLIP_TRIM_END, hoverClip, 0.0f};
+          } else if (containsKey(keys, 'm')) {
+            clipEdit = {CLIP_MOVE, hoverClip, snappedBeat - hoverClip.start->beat};
+          } else if (containsKey(keys, 'd')) {
+            beatEvents.remove_event(hoverClip.start);
+            beatEvents.remove_event(hoverClip.end);
+            spans = clipSpans();
+            hoverClip = {};
+          }
         }
 
         if (containsKey(keys, 'e')) {
@@ -2499,7 +2664,7 @@ struct Canvas2D {
                     if (previous && !(previous->ratio.num == 0 && previous->ratio.den == 0)) {
                       current->ratio = {0, 0};
                     } else {
-                      beatEvents.remove(current->beat, current->id);
+                      beatEvents.remove_event(current);
                       deleted = true;
                     }
                   }
@@ -2534,9 +2699,9 @@ struct Canvas2D {
                   currently_dragged.y = noteEnd->beat;
                   dragging = true;
                 }
-                beatEvents.remove(closest->beat, closest->id);
-                beatEvents.remove(noteEnd->beat, noteEnd->id);
-                //beatEvents.remove(current->beat, current->id);
+                beatEvents.remove_event(closest);
+                beatEvents.remove_event(noteEnd);
+                //beatEvents.remove_event(current);
                 beatEvents.inorder();
             }
         }
@@ -2690,9 +2855,9 @@ struct Canvas2D {
             // printf("start: (%f, %f), end: (%f, %f)\n", start.time, start.octave, end.time, end.octave));
             if (!focus_exists) {
                 if (removePrevious)
-                    beatEvents.remove(prev->beat, 0);
+                    beatEvents.remove_event(prev);
                 if (removeNext)
-                    beatEvents.remove(insertEv->beat, 0);
+                    beatEvents.remove_event(insertEv);
 
                 if (no_prev_or_closest_starts_after_prev && no_foci_or_after_foci_or_closest_ends_before_next) {
                     printf("foci start: %s, end: %s\n", start->string_expr.c_str(), end->string_expr.c_str());
@@ -2745,6 +2910,13 @@ struct Canvas2D {
                 addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.35, 0.63, 1.0);
                 addCanvasRect(renderer, topLeft, bottomRight, rmin.x, rmin.y, rmax.x - rmin.x, rmax.y - rmin.y, 0.12, 0.24, 0.39);
             }
+        }
+
+        // A click finishes trimming / moving a clip (and does nothing else)
+        if (hovered && click == 1 && clipEdit.mode != CLIP_NONE) {
+          commitClipEdit(snappedBeat);
+          spans = clipSpans();
+          click = 0;
         }
 
         // Input: left-click to place/finish
@@ -2853,6 +3025,7 @@ struct Canvas2D {
         }
 
         drawSubPanels(renderer, perc, audio, nw.x1, nw.x2, topLeft);
+        drawClips(renderer, audio, nw.x1, nw.x2, topLeft, spans, hoverClip, snappedBeat);
 
         // Hover marker in the perc strip: where a click puts a blip
         if (hoverPercTrack >= 0 && !placing && !dragging) {
@@ -2861,6 +3034,87 @@ struct Canvas2D {
           float cx = worldToScreen(topLeft, {snappedTime, 0.0f}).x;
           if (cy > perc.bottom && cy < perc.top && cx >= nw.x1 && cx <= nw.x2)
             renderer.addCircle(cx, cy, 4.0f, 0.8f, 0.2f, 0.2f);
+        }
+    }
+
+    // Clips in the audio strip: a box in the track's colour with a low-res
+    // waveform (the peak per screen column), plus the take being recorded
+    // and the preview of a clip being trimmed or moved.
+    void drawClips(VulkanRenderer& renderer, const SubPanel& audio, float x1, float x2, Vec2 topLeft,
+                   const std::vector<ClipSpan>& spans, const ClipSpan& hoverClip, float snappedBeat) {
+        double spb = engine ? engine->samplesPerBeat() : 0.0;
+        auto laneOf = [&](int track) {
+          auto it = std::find(audio.lanes.begin(), audio.lanes.end(), track);
+          return it == audio.lanes.end() ? -1 : (int)(it - audio.lanes.begin());
+        };
+        auto outline = [&](float xa, float xb, float yb, float yt, ui::Color c) {
+          panelRect(renderer, audio, x1, x2, xa, yb, xb - xa, 1, c);
+          panelRect(renderer, audio, x1, x2, xa, yt - 1, xb - xa, 1, c);
+          panelRect(renderer, audio, x1, x2, xa, yb, 1, yt - yb, c);
+          panelRect(renderer, audio, x1, x2, xb - 1, yb, 1, yt - yb, c);
+        };
+
+        for (const ClipSpan& sp : spans) {
+          int k = laneOf(sp.start->profile);
+          if (k < 0) continue;
+          float yt = audio.laneTop(k) - 3, yb = audio.laneTop(k) - AUDIO_LANE_H + 3;
+          float xs = worldToScreen(topLeft, {sp.start->time, 0.0f}).x;
+          float xe = worldToScreen(topLeft, {sp.end->time, 0.0f}).x;
+          if (xe < x1 || xs > x2) continue;
+          ui::Color c = trackColor(sp.start->profile);
+          panelRect(renderer, audio, x1, x2, xs, yb, xe - xs, yt - yb, {c.r * 0.35f, c.g * 0.35f, c.b * 0.35f});
+
+          // Waveform: for each 2px column, the loudest peak block it covers
+          const Clip* clip = clipOf(sp.start);
+          if (clip && !clip->peaks.empty() && spb > 0) {
+            float mid = (yt + yb) / 2, half = (yt - yb) / 2 - 1;
+            ui::Color wc = {c.r * 0.9f, c.g * 0.9f, c.b * 0.9f};
+            auto sampleAt = [&](float px) {
+              float beat = calc_beat(&timeEvents, screenToWorld(topLeft, {px, 0.0f}).x);
+              return (double)clip->startSample + (beat - sp.start->beat) * spb;
+            };
+            for (float px = std::max(xs, x1); px < std::min(xe, x2); px += 2) {
+              double a = sampleAt(px), b = sampleAt(px + 2);
+              long p0 = std::max(0L, (long)(a / Clip::PEAK_BLOCK));
+              long p1 = std::min((long)clip->peaks.size() - 1, (long)(b / Clip::PEAK_BLOCK));
+              float peak = 0.0f;
+              for (long i = p0; i <= p1; i++) peak = std::max(peak, clip->peaks[i]);
+              float h = std::min(peak, 1.0f) * half;
+              if (h >= 0.5f) panelRect(renderer, audio, x1, x2, px, mid - h, 1, 2 * h, wc);
+            }
+          }
+
+          bool hovered = sp.start == hoverClip.start;
+          outline(xs, xe, yb, yt, hovered ? ui::Color{0.9f, 0.9f, 0.9f} : ui::Color{c.r * 0.7f, c.g * 0.7f, c.b * 0.7f});
+
+          // File name, when the lane is fully visible and the box is wide enough
+          if (clip && xe - xs > 60 && yb - 3 >= audio.bottom - 0.5f && yt + 3 <= audio.top + 0.5f && xs >= x1) {
+            laneLabels.push_back(std::filesystem::path(clip->file).stem().string());
+            renderer.addText(laneLabels.back().c_str(), xs + 4, yt - 13, 12.0f, glm::vec4(0.9f, 0.9f, 0.9f, 1.0f));
+          }
+        }
+
+        // Clip being trimmed or moved: its new extent, in yellow
+        if (clipEdit.mode != CLIP_NONE) {
+          int k = laneOf(clipEdit.span.start->profile);
+          if (k >= 0) {
+            auto [sb, eb] = clipEditExtent(snappedBeat);
+            float xs = worldToScreen(topLeft, {calc_time(&timeEvents, sb), 0.0f}).x;
+            float xe = worldToScreen(topLeft, {calc_time(&timeEvents, eb), 0.0f}).x;
+            outline(xs, xe, audio.laneTop(k) - AUDIO_LANE_H + 2, audio.laneTop(k) - 2, {0.95f, 0.85f, 0.3f});
+          }
+        }
+
+        // Take being recorded: armed lanes are tinted red from where playback started
+        if (recording) {
+          float xs = std::max(x1, worldToScreen(topLeft, {recordStartTime, 0.0f}).x);
+          for (int k = 0; k < (int)audio.lanes.size(); k++) {
+            if (!g_tracks[audio.lanes[k]].armed || xs >= x2) continue;
+            float yt = audio.laneTop(k) - 3, yb = audio.laneTop(k) - AUDIO_LANE_H + 3;
+            panelRect(renderer, audio, x1, x2, xs, yb, x2 - xs, yt - yb, {0.35f, 0.08f, 0.08f});
+            if (yb - 3 >= audio.bottom - 0.5f && yt + 3 <= audio.top + 0.5f)
+              renderer.addText("Recording", xs + 4, yt - 13, 12.0f, glm::vec4(1.0f, 0.6f, 0.6f, 1.0f));
+          }
         }
     }
 
@@ -2957,7 +3211,8 @@ struct Canvas2D {
 // --- Load binary song file ---
 bool load_song(const std::string& path,
                Canvas2D* canvas,
-               std::vector<Track>& tracks, uint32_t* nextID)
+               std::vector<Track>& tracks, uint32_t* nextID,
+               std::vector<std::vector<Clip>>& clipsOut, float sampleRate)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -3117,6 +3372,24 @@ bool load_song(const std::string& path,
                 }
             }
             hasTracks = true;
+        } else if (std::strncmp(tag, "CLIP", 4) == 0) {
+            clipsOut.assign(MAX_TRACKS, {});
+            for (size_t i = 0; i < loaded.size(); i++) {
+                uint32_t count = 0;
+                if (!f.read(reinterpret_cast<char*>(&count), sizeof(count)) || count > 100000) return false;
+                for (uint32_t k = 0; k < count; k++) {
+                    Clip c;
+                    uint32_t len = 0;
+                    f.read(reinterpret_cast<char*>(&len), sizeof(len));
+                    if (!f || len > 4096) return false;
+                    c.file.assign(len, '\0');
+                    f.read(c.file.data(), len);
+                    f.read(reinterpret_cast<char*>(&c.startSample), sizeof(c.startSample));
+                    c.samples = loadClipAudio(c.file, sampleRate);   // missing file: silent clip
+                    c.computePeaks();
+                    clipsOut[i].push_back(std::move(c));
+                }
+            }
         } else {
             break;
         }
@@ -3140,6 +3413,7 @@ bool load_song(const std::string& path,
     }
 
     tracks = std::move(loaded);
+    clipsOut.resize(MAX_TRACKS);
     f.close();
     return true;
 }
@@ -3254,6 +3528,10 @@ struct App {
         remap(g_currentTrack);
         remap(gBeatOctCanvas.heldProfile);
         engine.pd.swapSlots(a, b);
+        {
+            std::lock_guard<std::mutex> lock(g_clipsMutex);
+            std::swap(g_clips[a], g_clips[b]);
+        }
         engine.setProfile(g_tracks[a].profile, a);
         engine.setProfile(g_tracks[b].profile, b);
         tracksChanged = true;
@@ -3277,7 +3555,7 @@ struct App {
         std::vector<Event*> removed;
         for (Event* e = c.beatEvents.get_first(); e; e = next(e)) {
             if (e->profile != i) continue;
-            if (e->type == EV_PERC) {
+            if (e->type == EV_PERC || e->type == EV_AUDIO_START || e->type == EV_AUDIO_END) {
                 removed.push_back(e);
             } else if (e->type == EV_NOTE_START) {
                 removed.push_back(e);
@@ -3286,7 +3564,7 @@ struct App {
                 if (end) removed.push_back(end);
             }
         }
-        for (Event* e : removed) c.beatEvents.remove(e->beat, e->id);
+        for (Event* e : removed) c.beatEvents.remove_event(e);
         c.forgetEvents(removed);
         if (c.heldProfile == i) {   // a note of this track was picked up with f / l
             c.heldProfile = -1;
@@ -3297,6 +3575,10 @@ struct App {
         for (int k = i; k < n - 1; k++) swapTracks(k, k + 1);   // move it to the end...
         g_tracks.pop_back();                                     // ...and drop it
         engine.pd.setPatch(n - 1, "");
+        {
+            std::lock_guard<std::mutex> lock(g_clipsMutex);
+            g_clips[n - 1].clear();
+        }
         applyTrackGains();
         tracksChanged = true;
         selectTrack(std::min(select, n - 2));
@@ -3315,12 +3597,14 @@ struct App {
         renaming = -1;
     }
 
-    // Loads track i's Pd patch, first writing the starter perc patch for a
-    // perc track whose file doesn't exist yet.
+    // Loads track i's Pd patch, first writing the starter perc / audio patch
+    // for a perc / audio track whose file doesn't exist yet.
     bool loadPatch(int i) {
         const Track& t = g_tracks[i];
         if (t.type == TrackType::Perc && !t.pdPatch.empty())
             engine.pd.ensurePercPatch(t.pdPatch, percVariant(t.pdPatch));
+        if (t.type == TrackType::Audio && !t.pdPatch.empty())
+            engine.pd.ensureAudioPatch(t.pdPatch);   // starter: tabreceive~ -> dac~
         return engine.pd.setPatch(i, t.pdPatch);
     }
 
@@ -3333,6 +3617,7 @@ struct App {
             const Track& t = g_tracks[i];
             bool audible = !t.mute && (!anySolo || t.solo);
             engine.pd.setGain(i, audible ? t.gainDb : PdHost::MIN_DB);
+            engine.setTrackGain(i, audible ? t.gainDb : PdHost::MIN_DB);
         }
     }
 
@@ -3358,7 +3643,6 @@ struct App {
 
     // Stores the typed patch name in the current track and loads it.
     void commitPdPatch() {
-        if (track().type == TrackType::Audio) return;
         track().pdPatch = pdPatchText;
         loadPatch(g_currentTrack);
     }
@@ -3387,23 +3671,219 @@ struct App {
                            (failed ? ", " + std::to_string(failed) + " missing" : "");
     }
 
+    bool playing = false;   // transport state, shared with the main loop
+
+    // Renders from the playhead to the last note / blip / clip, offline,
+    // through the same engine path as playback.
     void exportWav() {
-        float length = 0.0f;
-        for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next_note(e))
-            length = e->time;
-        if (length > 0.0f) {
-            engine.setEvents(&gBeatOctCanvas.beatEvents);
-            SDL_Delay(50);
-            engine.exportWav(g_settings.wavName.data(), playhead_time, length);
+        if (playing) {
+            engine.setPlayState(false);
+            stopRecording();
+            playing = false;
+        }
+        float endBeat = 0.0f;
+        for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next(e))
+            if (e->type == EV_NOTE_END || e->type == EV_PERC || e->type == EV_AUDIO_END)
+                endBeat = std::max(endBeat, e->beat);
+        float startBeat = calc_beat(&gBeatOctCanvas.timeEvents, playhead_time);
+        if (endBeat <= startBeat) {
+            engine.pd.status = "Nothing to export after the playhead";
+            return;
+        }
+        bool ok = engine.exportWav(g_settings.wavName.c_str(), &gBeatOctCanvas.beatEvents, startBeat, endBeat);
+        engine.pd.status = ok ? "Exported " + g_settings.wavName : "Couldn't write " + g_settings.wavName;
+    }
+
+    // ---- Recording into armed audio tracks ----
+    bool recording = false;        // capturing (playback running)
+    bool finishingTake = false;    // stopped; waiting for the audio thread to let go
+    std::vector<float> take;       // the input captured so far
+    std::vector<int> takeTracks;   // armed audio tracks when playback started
+
+    // Called as playback starts.
+    void startRecordingIfArmed() {
+        takeTracks.clear();
+        for (int i = 0; i < (int)g_tracks.size(); i++)
+            if (g_tracks[i].type == TrackType::Audio && g_tracks[i].armed) takeTracks.push_back(i);
+        if (takeTracks.empty()) return;
+        take.clear();
+        engine.drainRecording(take);   // anything left over from before
+        take.clear();
+        engine.setRecording(true);
+        recording = true;
+        gBeatOctCanvas.recording = true;
+        gBeatOctCanvas.recordStartTime = playhead_time;
+    }
+
+    // Called as playback stops.
+    void stopRecording() {
+        if (!recording) return;
+        engine.setRecording(false);
+        recording = false;
+        finishingTake = true;
+    }
+
+    // Call every main-loop pass: collects the input, and once the audio
+    // thread has stopped capturing, turns the take into clips. Returns true
+    // when a take was finished (redraw).
+    bool pollRecording() {
+        if (!recording && !finishingTake) return false;
+        engine.drainRecording(take);
+        if (!finishingTake || engine.recordingActive()) return false;
+        engine.drainRecording(take);
+        finishingTake = false;
+        gBeatOctCanvas.recording = false;
+        finishTake();
+        return true;
+    }
+
+    // Turns the finished take into clips. Each pass round the loop is a take
+    // of its own; every armed track gets each take saved as
+    // recordings/<track>-N.wav and laid down in order, overwriting whatever
+    // it overlaps (earlier passes and earlier clips), like tape.
+    void finishTake() {
+        if (take.empty()) return;
+        std::vector<uint64_t> ends = engine.recordPassEnds();
+        ends.push_back(take.size());
+        float startBeat = (float)engine.recordStartBeat();   // every pass starts here
+        double spb = engine.samplesPerBeat();
+
+        // A pass is worth keeping unless a later pass covers all of it
+        struct Pass { size_t from, to; };
+        std::vector<Pass> passes;
+        size_t from = 0;
+        for (uint64_t e : ends) {
+            size_t to = std::min<size_t>(e, take.size());
+            if (to > from) passes.push_back({from, to});
+            from = to;
+        }
+        std::vector<Pass> kept;
+        for (size_t k = 0; k < passes.size(); k++) {
+            size_t len = passes[k].to - passes[k].from;
+            bool covered = false;
+            for (size_t j = k + 1; j < passes.size(); j++)
+                if (passes[j].to - passes[j].from >= len) covered = true;
+            if (!covered) kept.push_back(passes[k]);
+        }
+
+        std::string saved;
+        for (int t : takeTracks) {
+            if (t >= (int)g_tracks.size() || g_tracks[t].type != TrackType::Audio) continue;
+            for (const Pass& p : kept) {
+                Clip clip;
+                clip.samples.assign(take.begin() + p.from, take.begin() + p.to);
+                clip.file = nextTakeFile(g_tracks[t].name);
+                writeMonoWav(clip.file, clip.samples);
+                clip.computePeaks();
+                float endBeat = startBeat + (float)(clip.samples.size() / spb);
+                saved = clip.file;
+                layDownClip(t, std::move(clip), startBeat, endBeat);
+            }
+        }
+        if (!saved.empty())
+            engine.pd.status = "Recorded " + saved + " (" + std::to_string(take.size() / (int)engine.sampleRate) + " s)";
+        take.clear();
+    }
+
+    // recordings/<track name>-N.wav for the lowest N not on disk yet
+    static std::string nextTakeFile(const std::string& trackName) {
+        std::string base;
+        for (char ch : trackName)
+            base += (std::isalnum((unsigned char)ch) || ch == '-' || ch == '_') ? ch : '_';
+        if (base.empty()) base = "track";
+        std::error_code ec;
+        std::filesystem::create_directories("recordings", ec);
+        for (int n = 1;; n++) {
+            std::string file = "recordings/" + base + "-" + std::to_string(n) + ".wav";
+            if (!std::filesystem::exists(file)) return file;
         }
     }
 
+    void writeMonoWav(const std::string& file, const std::vector<float>& samples) {
+        SF_INFO info{};
+        info.samplerate = (int)engine.sampleRate;
+        info.channels = 1;
+        info.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+        if (SNDFILE* snd = sf_open(file.c_str(), SFM_WRITE, &info)) {
+            sf_writef_float(snd, samples.data(), (sf_count_t)samples.size());
+            sf_close(snd);
+        } else {
+            std::fprintf(stderr, "Couldn't write %s\n", file.c_str());
+        }
+    }
+
+    // Adds a clip on track t over [startBeat, endBeat], cutting away whatever
+    // part of the track's other clips it covers: clips inside it are removed,
+    // ones overlapping an edge are trimmed, and one spanning it is split.
+    void layDownClip(int t, Clip clip, float startBeat, float endBeat) {
+        Canvas2D& c = gBeatOctCanvas;
+        const double spb = engine.samplesPerBeat();
+        const float eps = 1e-6f;
+
+        for (const Canvas2D::ClipSpan& sp : c.clipSpans()) {
+            if (sp.start->profile != t) continue;
+            float s0 = sp.start->beat, e0 = sp.end->beat;
+            if (e0 <= startBeat + eps || s0 >= endBeat - eps) continue;   // no overlap
+
+            bool keepsHead = s0 < startBeat - eps;   // part before the new clip survives
+            bool keepsTail = e0 > endBeat + eps;     // part after it survives
+            Clip* old = Canvas2D::clipOf(sp.start);
+
+            if (keepsTail) {
+                // The tail plays from further into the old audio
+                uint64_t tailStart = old ? old->startSample + (uint64_t)std::llround((endBeat - s0) * spb) : 0;
+                if (keepsHead) {
+                    // Split: the tail becomes a clip of its own
+                    Clip tail = old ? *old : Clip{};
+                    tail.startSample = tailStart;
+                    uint32_t index = addClip(t, std::move(tail));
+                    addClipEvent(t, index, endBeat, EV_AUDIO_START);
+                    addClipEvent(t, index, e0, EV_AUDIO_END);
+                } else {
+                    if (old) old->startSample = tailStart;
+                    c.moveEvent(sp.start, endBeat);
+                }
+            }
+            if (keepsHead) {
+                c.moveEvent(sp.end, startBeat);
+            } else if (!keepsTail) {
+                c.beatEvents.remove_event(sp.start);   // entirely covered
+                c.beatEvents.remove_event(sp.end);
+            }
+        }
+
+        uint32_t index = addClip(t, std::move(clip));
+        addClipEvent(t, index, startBeat, EV_AUDIO_START);
+        addClipEvent(t, index, endBeat, EV_AUDIO_END);
+    }
+
+    uint32_t addClip(int t, Clip clip) {
+        std::lock_guard<std::mutex> lock(g_clipsMutex);
+        g_clips[t].push_back(std::move(clip));
+        return (uint32_t)g_clips[t].size() - 1;
+    }
+
+    void addClipEvent(int t, uint32_t index, float beat, int type) {
+        Canvas2D& c = gBeatOctCanvas;
+        Event* ev = new Event(beat, type);
+        ev->id = index;
+        ev->profile = t;
+        ev->time = calc_time(&c.timeEvents, beat);
+        c.beatEvents.insert(ev);
+    }
+
     void saveProject() {
-        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks);
+        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks, g_clips);
     }
 
     void loadProject() {
-        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID);
+        std::vector<std::vector<Clip>> clips(MAX_TRACKS);
+        gBeatOctCanvas.clipEdit = {};
+        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate);
+        {
+            std::lock_guard<std::mutex> lock(g_clipsMutex);
+            g_clips = std::move(clips);
+        }
         g_tracks.reserve(MAX_TRACKS);
         for (Track& t : g_tracks)   // perc tracks always start with a patch
             if (t.type == TrackType::Perc && t.pdPatch.empty()) t.pdPatch = freePercPatchName(g_tracks);
@@ -3651,7 +4131,7 @@ static void buildUI(App& app) {
     cw->add(textBox({270, 60, 120, 15}, "Alt. H. Range: ", &g_settings.altHarmRange));
 
     // Pd patch for the current track (not audio tracks)
-    auto standardOnly = [] { return currentTrackType() != TrackType::Audio; };
+    auto standardOnly = [] { return true; };   // every kind of track can have a patch
     Widget* pdBox = cw->add(textBox({400, 25, 150, 15}, "Pd patch:", &app.pdPatchText));
     pdBox->maxLen = 63;
     pdBox->onCommit = [&app](Widget&) { app.commitPdPatch(); };
@@ -3700,6 +4180,7 @@ int main(int, char**)
     engine.setTempo(120.0f);
     engine.setADSR({0.2f, 0.2f, 0.7f, 0.025f});   // same values the old buttons produced
  
+    gBeatOctCanvas.engine = &engine;
     App app(engine);
     buildUI(app);
     g_tracks.reserve(MAX_TRACKS);
@@ -3711,7 +4192,6 @@ int main(int, char**)
     renderer.createSpectrogramPipeline();
  
     bool running = true;
-    bool playing = false;
     bool rerender = true;
     bool ctrl = false;
     int click = 0;
@@ -3786,6 +4266,7 @@ int main(int, char**)
                 char key = sym;
                 if (key == SDLK_ESCAPE) {
                   if (app.ui.focused) app.ui.blur();
+                  else if (gBeatOctCanvas.cancelEdit()) {}   // stop trimming / moving a clip
                   else if (app.ui.openMenu) app.ui.closeMenu();
                   else running = false;
                   break;
@@ -3853,21 +4334,25 @@ int main(int, char**)
  
         if (play_triggered_from_space) {
             play_triggered_from_space = false;
-            if (!playing) {
+            if (!app.playing) {
                 engine.setEvents(&(gBeatOctCanvas.beatEvents));
                 engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time),
                                           calc_beat(&gBeatOctCanvas.timeEvents, loop_end));
+                app.startRecordingIfArmed();
                 engine.setPlayState(true);
             } else {
                 engine.setPlayState(false);
+                app.stopRecording();
             }
-            playing = !playing;
+            app.playing = !app.playing;
         }
  
         if (tuner_triggered) {
             engine.toggleTuner();
             tuner_triggered = false;
         }
+
+        if (app.pollRecording()) rerender = true;
 
         {   // reload patches whose Pd editor window was closed
             std::string before = engine.pd.status;

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <functional>
 #include <array>
+#include <mutex>
+#include <string>
 //#include "exprtk.hpp"
 #include "parser.hpp"
 #include "utils.hpp"
@@ -68,6 +70,9 @@ extern bool newAudioOut;
 #define EV_BEAT 3
 #define EV_FOCUS 4
 #define EV_PERC 5
+// Audio clip extents. id = the clip's index in g_clips[profile], profile = track.
+#define EV_AUDIO_START 6
+#define EV_AUDIO_END 7
 
 // Using AVL tree
 struct Event {
@@ -180,6 +185,14 @@ public:
 
     void remove(float key, int id) {
         root = remove(root, key, id);
+        reparent_tree();
+        ordered = false;
+    }
+
+    // Removes exactly this event. Unlike remove(), it doesn't rely on
+    // (beat, id) being unique (clip events reuse ids across tracks).
+    void remove_event(Event* ev) {
+        root = removeEv(root, ev);
         reparent_tree();
         ordered = false;
     }
@@ -400,6 +413,40 @@ private:
             return node;
     }
 
+    Event* removeEv(Event* node, Event* target) {
+        if (!node) return nullptr;
+
+        if (target->beat < node->beat)
+            node->left = removeEv(node->left, target);
+        else if (target->beat > node->beat)
+            node->right = removeEv(node->right, target);
+        else if (node == target) {
+            if (node->left && node->right) {
+                Event* left = node->left;
+                Event* right = node->right;
+                node = minValueNode(node->right);
+                node->right = removeEv(right, node);
+                node->left = left;
+            } else if (node->left) {
+                node = node->left;
+            } else if (node->right) {
+                node = node->right;
+            } else {
+                node = nullptr;
+            }
+        } else {
+            // Same beat, different event: it may be on either side
+            node->left = removeEv(node->left, target);
+            node->right = removeEv(node->right, target);
+        }
+
+        if (node) {
+            updateHeight(node);
+            return rebalance(node);
+        }
+        return node;
+    }
+
     Event* minValueNode(Event* node) {
         while (node->left)
             node = node->left;
@@ -505,6 +552,35 @@ struct Profile {
 // One Pd slot and one synth profile per track.
 constexpr int MAX_TRACKS = PdHost::SLOTS;
 
+// A recorded piece of audio on an audio track. Its position on the timeline
+// is given by an EV_AUDIO_START / EV_AUDIO_END pair (id = index of the clip
+// in g_clips[track]); startSample is the first sample that plays, so
+// trimming the clip's start moves it forward.
+struct Clip {
+    std::string file;            // the .wav it was saved to / loaded from
+    std::vector<float> samples;  // mono, at the engine's sample rate
+    uint64_t startSample = 0;
+
+    // Low-res waveform for drawing: the peak of each PEAK_BLOCK samples
+    static constexpr int PEAK_BLOCK = 256;
+    std::vector<float> peaks;
+    void computePeaks() {
+        peaks.assign((samples.size() + PEAK_BLOCK - 1) / PEAK_BLOCK, 0.0f);
+        for (size_t i = 0; i < samples.size(); i++) {
+            float a = samples[i] < 0 ? -samples[i] : samples[i];
+            if (a > peaks[i / PEAK_BLOCK]) peaks[i / PEAK_BLOCK] = a;
+        }
+    }
+};
+
+// Clips per track: g_clips[track][clip]. Lists only grow (an id must keep
+// pointing at the same clip), and always has MAX_TRACKS entries.
+// Hold g_clipsMutex while changing the lists themselves (not needed for a
+// clip's startSample); the audio thread only try-locks it, skipping clip
+// playback for a block rather than waiting.
+extern std::vector<std::vector<Clip>> g_clips;
+extern std::mutex g_clipsMutex;
+
 // =========================================================
 // =============== LOCK-FREE MESSAGE QUEUE =================
 // =========================================================
@@ -577,6 +653,25 @@ public:
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
     void setProfile(const Profile& p, int n);
+    void setTrackGain(int track, float db);   // clip playback gain (PdHost::MIN_DB = silent)
+
+    // ---- Recording ----
+    // While on and playing, the input is captured from the moment playback
+    // starts, through any loop wraps. The main thread collects it with
+    // drainRecording(); after turning it off, wait for recordingActive() to go
+    // false before taking the last samples. recordPassEnds() gives, for each
+    // loop wrap, how many samples had been captured by then (each pass after
+    // a wrap starts again at the loop start, which is where recording began).
+    void setRecording(bool on) { recRequested = on; }
+    bool recordingActive() const { return recActive; }
+    size_t drainRecording(std::vector<float>& out);
+    double recordStartBeat() const { return recStartBeat; }
+    std::vector<uint64_t> recordPassEnds() const {
+        std::vector<uint64_t> out;
+        for (int i = 0; i < recPassCount; i++) out.push_back(recPassEnds[i]);
+        return out;
+    }
+    double samplesPerBeat() const { return (60.0 / tempoBPM) * sampleRate; }
     void toggleTuner();
     Profile getProfile(int n);
 
@@ -595,8 +690,16 @@ public:
     // Reset playback position
     void resetSampleCounter(float playhead_beat, float loop_end);
 
-    // Export WAV file using libsndfile
-    bool exportWav(const char* path, float playhead_time, float durationSeconds);
+    // Renders the song offline, as fast as possible, through the same
+    // processAudio() as playback (Pd patches, perc, clips), from startBeat to
+    // endBeat plus tailSeconds for releases. JACK outputs silence meanwhile.
+    // Call with playback stopped.
+    bool exportWav(const char* path, EventTree* events, float startBeat, float endBeat,
+                   float tailSeconds = 2.0f);
+
+    // Held by whoever runs processAudio(): the JACK callback try-locks it
+    // (outputting silence if it can't), exportWav() holds it throughout.
+    std::mutex processMutex;
 
 private:
     // =================================
@@ -642,6 +745,29 @@ private:
     int voiceTimers[64][3];
     std::array<uint8_t, MAX_VOICES> voiceProfiles{};
 
+    // ---- Clip playback (audio thread) ----
+    std::array<std::atomic<float>, MAX_TRACKS> trackGain;   // linear
+    struct ClipVoice {
+        bool     active = false;
+        int      track = 0;
+        uint32_t clip = 0;
+        int64_t  startSc = 0;   // sampleCounter at which the clip's startSample plays
+    };
+    std::array<ClipVoice, 64> clipVoices{};
+    void startClip(int track, uint32_t clip, double beat, double samplesPerBeat);
+    void stopClip(int track, uint32_t clip);
+    void stopAllClips();
+
+    // ---- Recording: audio thread -> ring buffer -> main thread ----
+    static constexpr size_t REC_RING = 1 << 21;   // ~43 s at 48 kHz between drains
+    std::vector<float> recRing;
+    std::atomic<size_t> recWrite{0}, recRead{0};
+    std::atomic<bool>   recRequested{false}, recActive{false};
+    std::atomic<double> recStartBeat{0.0};
+    uint64_t recCaptured = 0;                          // audio thread: samples captured this take
+    std::array<std::atomic<uint64_t>, 256> recPassEnds{};
+    std::atomic<int> recPassCount{0};
+
     float divisorSmooth = 1.0f;  // for dividing by voice count smoothly
 
     // =================================
@@ -652,7 +778,7 @@ private:
     // =================================
     // Real-time DSP entry point
     // =================================
-    void processAudio(float* outL, float* outR, uint32_t frames);
+    void processAudio(float* outL, float* outR, const float* in, uint32_t frames);
 
     // Called in JACK RT thread to apply pending messages
     void applyMessages();

@@ -26,9 +26,14 @@ Event* currentEv;
 // =============== AUDIO ENGINE CONSTRUCTOR =============
 // ======================================================
 
+std::vector<std::vector<Clip>> g_clips(MAX_TRACKS);
+std::mutex g_clipsMutex;
+
 AudioEngine::AudioEngine() {
     // Lock memory to avoid page faults in audio thread
     mlockall(MCL_CURRENT | MCL_FUTURE);
+    for (auto& g : trackGain) g = 1.0f;
+    recRing.assign(REC_RING, 0.0f);
 }
 
 AudioEngine::~AudioEngine() {
@@ -52,8 +57,17 @@ int jackProcess(jack_nframes_t nframes, void* arg)
 
     float* outL = (float*)jack_port_get_buffer(js->outL, nframes);
     float* outR = (float*)jack_port_get_buffer(js->outR, nframes);
-    if (engine->tunerEnabled) {
-      float* in = (float*)jack_port_get_buffer(js->in, nframes);
+
+    // An offline export is running processAudio() itself: stay silent
+    std::unique_lock<std::mutex> processLock(engine->processMutex, std::try_to_lock);
+    if (!processLock.owns_lock()) {
+        memset(outL, 0, nframes * sizeof(float));
+        memset(outR, 0, nframes * sizeof(float));
+        return 0;
+    }
+    const float* input = js->in ? (const float*)jack_port_get_buffer(js->in, nframes) : nullptr;
+    if (engine->tunerEnabled && input) {
+      const float* in = input;
       memcpy(audioIn + audioi, in, sizeof(float) * (audioi + nframes <= audioBufferSize ? nframes : audioBufferSize - audioi));
       if (audioi + nframes >= audioBufferSize) {
         newAudioIn = true;
@@ -86,7 +100,7 @@ int jackProcess(jack_nframes_t nframes, void* arg)
       printf("none\n");
     }*/
 
-    engine->processAudio(outL, outR, nframes);
+    engine->processAudio(outL, outR, input, nframes);
 
     return 0;
 }
@@ -180,6 +194,13 @@ bool AudioEngine::start() {
     // Free the list
     if (ports) free(ports);
 
+    // Record from the first physical capture port
+    ports = jack_get_ports(jack->client, nullptr, JACK_DEFAULT_AUDIO_TYPE,
+                           JackPortIsOutput | JackPortIsPhysical);
+    if (jack->in && ports && ports[0])
+        jack_connect(jack->client, ports[0], jack_port_name(jack->in));
+    if (ports) free(ports);
+
     return true;
 }
 
@@ -267,6 +288,36 @@ Profile AudioEngine::getProfile(int n) {
   return (n >= 0 && n < MAX_TRACKS) ? profiles[n] : Profile{};
 }
 
+void AudioEngine::setTrackGain(int track, float db) {
+    if (track >= 0 && track < MAX_TRACKS) trackGain[track] = PdHost::dbToGain(db);
+}
+
+size_t AudioEngine::drainRecording(std::vector<float>& out) {
+    size_t r = recRead.load(std::memory_order_relaxed);
+    size_t w = recWrite.load(std::memory_order_acquire);
+    size_t n = 0;
+    for (; r != w; r = (r + 1) % REC_RING, n++) out.push_back(recRing[r]);
+    recRead.store(r, std::memory_order_release);
+    return n;
+}
+
+void AudioEngine::startClip(int track, uint32_t clip, double beat, double spb) {
+    for (auto& v : clipVoices) {
+        if (v.active) continue;
+        v = {true, track, clip, (int64_t)std::llround(beat * spb)};
+        return;
+    }
+}
+
+void AudioEngine::stopClip(int track, uint32_t clip) {
+    for (auto& v : clipVoices)
+        if (v.active && v.track == track && v.clip == clip) v.active = false;
+}
+
+void AudioEngine::stopAllClips() {
+    for (auto& v : clipVoices) v.active = false;
+}
+
 void AudioEngine::toggleFreeze() {
     freeze = !freeze;
 }
@@ -321,7 +372,7 @@ void AudioEngine::applyMessages() {
         case MessageType::SetPlayState:
             isPlaying = msg.bValue;
             pd.setPlaying(isPlaying);
-            if (!isPlaying) pd.allNotesOff();
+            if (!isPlaying) { pd.allNotesOff(); stopAllClips(); }
             std::fflush(stdout);
             break;
 
@@ -357,6 +408,7 @@ void AudioEngine::applyMessages() {
 
         case MessageType::ResetSampleCounter:
             pd.allNotesOff();
+            stopAllClips();
             currentBeat = 0.0;
             nextEventIndex = 0;
             // Clear voices
@@ -502,10 +554,11 @@ inline float generateSample(WaveformType wf, float phase) {
     }
 }*/
 
-// Next event the sequencer acts on: note starts/ends and perc blips.
+// Next event the sequencer acts on: note starts/ends, perc blips, clip starts/ends.
 static Event* next_playable(Event* ev) {
     if (ev) ev = next(ev);
-    while (ev && ev->type != EV_NOTE_START && ev->type != EV_NOTE_END && ev->type != EV_PERC)
+    while (ev && ev->type != EV_NOTE_START && ev->type != EV_NOTE_END && ev->type != EV_PERC &&
+           ev->type != EV_AUDIO_START && ev->type != EV_AUDIO_END)
         ev = next(ev);
     return ev;
 }
@@ -513,7 +566,7 @@ static Event* next_playable(Event* ev) {
 // Sequencer + Pd. Notes and perc blips are sent to the Pd patch of their
 // track; every patch's [dac~] output is mixed by libpd and written to the
 // JACK buffers.
-void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
+void AudioEngine::processAudio(float* outL, float* outR, const float* input, uint32_t frames)
 {
     memset(outL, 0, frames * sizeof(float));
     memset(outR, 0, frames * sizeof(float));
@@ -529,6 +582,19 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
     pd.diag.nextBeat = currentEv ? currentEv->beat : -1.0f;
 
     const double samplesPerBeat = (60.0 / tempoBPM) * sampleRate;
+
+    // Recording starts with the first block of playback after it's requested
+    if (recRequested && isPlaying && !recActive) {
+        recStartBeat = double(sampleCounter) / samplesPerBeat;
+        recCaptured = 0;
+        recPassCount = 0;
+        recActive = true;
+    } else if (recActive && (!recRequested || !isPlaying)) {
+        recActive = false;
+    }
+
+    // Clip lists are only read while the main thread isn't changing them
+    std::unique_lock<std::mutex> clipLock(g_clipsMutex, std::try_to_lock);
 
     for (uint32_t in = 0; in < frames; ++in) {
         if (isPlaying) {
@@ -551,6 +617,11 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
                     double lateSamples = (currentBeat - currentEv->beat) * samplesPerBeat;
                     if (lateSamples <= frames)
                         pd.hit(currentEv->profile, 1.0f);
+                } else if (currentEv->type == EV_AUDIO_START) {
+                    // Started late (mid-clip) it still plays from the right place
+                    startClip(currentEv->profile, currentEv->id, currentEv->beat, samplesPerBeat);
+                } else if (currentEv->type == EV_AUDIO_END) {
+                    stopClip(currentEv->profile, currentEv->id);
                 }
                 pd.diag.events++;
                 currentEv = next_playable(currentEv);
@@ -561,16 +632,56 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
         // patches being edited stay audible.
         float l = 0.0f, r = 0.0f;
         pd.renderFrame(l, r);
+
+        // Clips, positioned by the sample counter so they stay in time
+        if (isPlaying && clipLock.owns_lock()) {
+            for (const ClipVoice& v : clipVoices) {
+                if (!v.active || v.track < 0 || v.track >= (int)g_clips.size()) continue;
+                const auto& clips = g_clips[v.track];
+                if (v.clip >= clips.size()) continue;
+                const Clip& c = clips[v.clip];
+                int64_t pos = (int64_t)sampleCounter - v.startSc + (int64_t)c.startSample;
+                if (pos < 0 || pos >= (int64_t)c.samples.size()) continue;
+                float smp = c.samples[(size_t)pos] * trackGain[v.track].load(std::memory_order_relaxed);
+                if (pd.routes(v.track)) {
+                    pd.addInput(v.track, smp);   // through the track's patch
+                } else {
+                    l += smp;
+                    r += smp;
+                }
+            }
+        }
+
         outL[in] = std::clamp(l, -1.0f, 1.0f);
         outR[in] = std::clamp(r, -1.0f, 1.0f);
 
         if (!isPlaying) continue;
+
+        // Capture the input while recording
+        if (recActive && input) {
+            size_t w = recWrite.load(std::memory_order_relaxed);
+            size_t next = (w + 1) % REC_RING;
+            // Dropped only if the main thread stalls for the whole ring (~40 s)
+            if (next != recRead.load(std::memory_order_acquire)) {
+                recRing[w] = input[in];
+                recWrite.store(next, std::memory_order_release);
+                recCaptured++;
+            }
+        }
+
         if (!freeze) sampleCounter++;
 
         // Loop: jump back, release everything, restart the event list
         if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
             sampleCounter = loopStartSamples;
             pd.allNotesOff();
+            stopAllClips();
+            // While recording, each pass round the loop becomes its own take
+            int n = recPassCount;
+            if (recActive && n < (int)recPassEnds.size()) {
+                recPassEnds[n] = recCaptured;
+                recPassCount = n + 1;
+            }
             currentEv = activeEvents.get_first();
         }
     }
@@ -591,286 +702,55 @@ void AudioEngine::processAudio(float* outL, float* outR, uint32_t frames)
 // Purely offline rendering.
 //
 
-bool AudioEngine::exportWav(const char* path, float playhead_beat, float durationSeconds)
+bool AudioEngine::exportWav(const char* path, EventTree* events, float startBeat, float endBeat,
+                            float tailSeconds)
 {
-    // ========== SETUP LIBSNDFILE ==========
     SF_INFO info{};
     info.samplerate = (int)sampleRate;
     info.channels   = 2;
     info.format     = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
-
     SNDFILE* snd = sf_open(path, SFM_WRITE, &info);
     if (!snd) {
-        std::cerr << "Failed to open WAV file for writing\n";
+        std::cerr << "Failed to open " << path << " for writing\n";
         return false;
     }
 
-    const uint64_t totalFrames = (uint64_t)(durationSeconds * sampleRate);
-    printf("duration: %f, totalFrames: %ld, sampleRate: %f\n", durationSeconds, totalFrames, sampleRate);
+    // From here the JACK callback outputs silence and this thread runs the
+    // engine: the queued messages below are applied by the first block.
+    std::lock_guard<std::mutex> lock(processMutex);
+    bool wasRecording = recRequested;
+    recRequested = false;
 
-    std::vector<float> buffer(totalFrames * 2, 0.0f);
+    setEvents(events);
+    resetSampleCounter(startBeat, -1.0f);   // no loop
+    setPlayState(true);
 
-    // ========== LOCAL OFFLINE STATE ==========
-    const float sr = sampleRate;
+    const double spb = samplesPerBeat();
+    const uint64_t playFrames = (uint64_t)std::max(0.0, (endBeat - startBeat) * spb);
+    const uint64_t totalFrames = playFrames + (uint64_t)(tailSeconds * sampleRate);
 
-    // Local polyphonic arrays
-    std::vector<float> freq(MAX_VOICES, 0.0f);
-    std::vector<float> phase(MAX_VOICES, 0.0f);
-    std::vector<uint8_t> voicePs(MAX_VOICES, 0);
-    // std::vector<float> env(MAX_VOICES, 0.0f);
-    float env[MAX_VOICES][3];
-    uint8_t state[MAX_VOICES][3];
-    memset(env,   0, sizeof(env));
-    memset(state, 0, sizeof(state));
-    // std::vector<uint8_t> state(MAX_VOICES, 0); // 0=off,1=attack,2=sustain/decay,3=release
-
-    float divisorSmooth = 1.0f;
-
-    // Event sequencing (beat-based)
-    double secondsPerBeat  = 60.0 / tempoBPM;
-    double samplesPerBeat  = secondsPerBeat * sampleRate;
-
-    // Pre-sort events (offline safety, though normally sorted already)
-    EventTree events = activeEvents;
-
-    // For wrap-around event playback
-    bool hasEvents = events.root ? true : false;
-    if (activeEvents.root) {
-        printf("empty\n");
+    constexpr uint32_t BLOCK = 256;
+    float L[BLOCK], R[BLOCK], frames[2 * BLOCK];
+    bool stopped = false;
+    for (uint64_t done = 0; done < totalFrames;) {
+        // Stop the transport at the end so releases and effect tails ring out
+        if (!stopped && done >= playFrames) {
+            setPlayState(false);
+            stopped = true;
+        }
+        uint32_t n = (uint32_t)std::min<uint64_t>(BLOCK, totalFrames - done);
+        if (!stopped) n = (uint32_t)std::min<uint64_t>(n, playFrames - done);   // stop exactly at the end
+        processAudio(L, R, nullptr, n);
+        for (uint32_t i = 0; i < n; i++) {
+            frames[2 * i]     = L[i];
+            frames[2 * i + 1] = R[i];
+        }
+        sf_writef_float(snd, frames, n);
+        done += n;
     }
-    if (!hasEvents) {
-        // No events? Write silence.
-        sf_writef_float(snd, buffer.data(), totalFrames);
-        sf_close(snd);
-        printf("hey!\n");
-        return true;
-    }
+    if (!stopped) setPlayState(false);
+    recRequested = wasRecording;
 
-    // ========== PER-SAMPLE OFFLINE RENDER LOOP ==========
-    uint64_t sc = playhead_beat * samplesPerBeat; // offline sample counter
-    int totalZero = 0;
-    int totalNonZero = 0;
-
-    Event* currentEv = events.root;
-    while (currentEv->left)
-      currentEv = currentEv->left;
-    while (currentEv && currentEv->type != EV_NOTE_START)
-      currentEv = next(currentEv);
-    if (currentEv) {
-      printf("FIRSTEV: %f\n", currentEv->beat);
-    } else {
-      printf("no event\n");
-    }
-
-    printf("totalFrames: %ld\n", totalFrames);
-
-    for (uint64_t in = 0; in < totalFrames; ++in)
-    {
-        float s = 0.0f;
-
-        // --- Sequencer: map sampleCounter → beat and fire events when crossing beat positions ---
-        currentBeat = double(sc) / samplesPerBeat;
-        b = currentBeat;
-
-        // Trigger all events whose beat <= current beat (looping)
-        if (!freeze) {
-
-            // double lastBeat = currentBeat;
-            // currentBeat = beat;  // update for envelope or external code, if needed
-
-            //size_t count = activeEvents.size();
-
-            // If beat jumped backwards (tempo change) or we reset
-            // we restart scanning from index 0
-            if (currentBeat < lastBeat) {
-                nextEventIndex = 0;
-            }
-
-            if (countdown < 51) countdown--;
-
-            // Consume events while currentBeat passes their beat positions
-            while (currentEv &&
-                currentEv->beat <= currentBeat)
-            {
-                countdown--;
-
-                // Only trigger if we *passed* this beat within this audio block
-                if (currentEv->type == EV_NOTE_START) {
-                    printf("note on: %d at %ld\n", currentEv->id, in);
-
-                    // NOTE ON
-                    size_t voiceIndex = MAX_VOICES;
-                    for (size_t v = 0; v < MAX_VOICES; ++v) {
-                        if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) {
-                            voiceIndex = v;
-                            break;
-                        }
-                    }
-                    if (voiceIndex == MAX_VOICES)
-                        voiceIndex = 0; // steal voice 0
-
-                    voiceIDs[voiceIndex] = currentEv->id;
-                    for (int i = 0; i < 3; i++) {
-                        voiceFreqs[voiceIndex][i] = ref * currentEv->ratio.eval();
-                        voicePhases[voiceIndex][i] = 0.0f;
-                        voiceEnvs[voiceIndex][i]   = 0.0f;
-                        voiceStates[voiceIndex][i] = 1;
-                    }
-                    voiceProfiles[voiceIndex] = currentEv->profile;
-                }
-                else {
-                    // NOTE OFF
-                    printf("note off: %d\n", currentEv->id);
-                    for (size_t v = 0; v < MAX_VOICES; ++v) {
-                        if ((voiceStates[v][0] != 0 || voiceStates[v][1] != 0 || \
-                              voiceStates[v][2] != 0) &&
-                            currentEv->id == voiceIDs[v])
-                        {
-                          //printf("heylo\n");
-                            voiceStates[v][0] = 3;
-                            voiceStates[v][1] = 3;
-                            voiceStates[v][2] = 3;
-                            break;
-                        }
-                    }
-                }
-
-                currentEv = next_note(currentEv);
-                if (currentEv) {
-                  printf("nextEv beat: %f\n", currentEv->beat);
-                } else {
-                  printf("no more notes\n");
-                }
-
-                // Loop the sequence
-                // if (nextEventIndex >= count) {
-                //     nextEventIndex = 0;
-
-                //     // If we wrapped but the next event is in the future,
-                //     // we should stop scanning here.
-                //     if (activeEvents[0].beat > currentBeat)
-                //         break;
-                // }
-            }
-        }
-
-        // --- Per-voice synthesis (similar to old data_callback) ---
-        int activeCount = 0;
-        for (size_t v = 0; v < MAX_VOICES; ++v) {
-            // printf("voiceStates: %d, %d, %d\n", voiceStates[v][0], voiceStates[v][1], voiceStates[2]);
-            if (voiceStates[v][0] == 0 && voiceStates[v][1] == 0 && voiceStates[v][2] == 0) continue; // inactive
-
-            activeCount++;
-
-            for (int e = 0; e < 3; e++) {
-                // Envelope update OSC i
-                if (voiceStates[v][e] == 1) {
-                    // Attack
-                    float atkStep = (profiles[voiceProfiles[v]].settings[e].attack > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].attack  * sr)) : 1.0f;
-                    voiceEnvs[v][e] += atkStep;
-                    if (voiceEnvs[v][e] >= 1.0f) {
-                        voiceEnvs[v][e] = 1.0f;
-                        voiceStates[v][e] = 2; // sustain/decay
-                    }
-                } else if (voiceStates[v][e] == 2) {
-                    // Decay toward sustain
-                    float decStep = (profiles[voiceProfiles[v]].settings[e].decay   > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].decay  * sr)) : 1.0f;
-                    if (voiceEnvs[v][e] > profiles[voiceProfiles[v]].settings[e].sustain) {
-                        voiceEnvs[v][e] -= decStep;
-                        if (voiceEnvs[v][e] <= profiles[voiceProfiles[v]].settings[e].sustain) {
-                            voiceEnvs[v][e] = profiles[voiceProfiles[v]].settings[e].sustain;
-                        }
-                    }
-                } else if (voiceStates[v][e] == 3) {
-                    // Release
-                    float relStep = (profiles[voiceProfiles[v]].settings[e].release > 1e-6) ? (1.0f / (float)(profiles[voiceProfiles[v]].settings[e].release * sr)) : 1.0f;
-                    voiceEnvs[v][e] -= relStep;
-                    if (voiceEnvs[v][e] <= 0.0f) {
-                        voiceEnvs[v][e] = 0.0f;
-                        voiceStates[v][e] = 0; // off
-                    }
-                }
-            }
-
-            // Phase & sample
-            //const float freq = 220.0f * std::pow(2.0f, 3.0/12.0) * std::pow(2, voiceFreqs[v]->evaluate(b, t, 0, 0) - 4.0f);
-
-            for (int i = 0; i < 3; i++) {
-                const float freq = voiceFreqs[v][i];
-                //printf("voice %d freq: %f\n", v, freq);
-                float phase = voicePhases[v][i];
-
-                phase += freq / sr;
-                if (phase >= 1.0f) phase -= 1.0f;
-                voicePhases[v][i] = phase;
-                //printf("gain: %f\n", profiles[voiceProfiles[v]].settings[i].gain);
-                float voiceSample = generateSample(profiles[voiceProfiles[v]].settings[i].waveType, phase) * voiceEnvs[v][i] * profiles[voiceProfiles[v]].settings[i].gain;
-
-                s += voiceSample;
-                // printf("s: %f gain: %f\n", s, profiles[voiceProfiles[v]].settings[i].gain);
-                // fflush(stdout);
-            }
-        }
-
-        // Smooth divisor (like old "divisor" logic)
-        if (activeCount > 0) {
-            if (std::abs(divisorSmooth - (float)activeCount) > 1e-6f) {
-                divisorSmooth += ((float)activeCount - divisorSmooth) / 100.0f;
-            } else {
-                divisorSmooth = (float)activeCount;
-            }
-
-            s /= divisorSmooth;
-        } else {
-            divisorSmooth = 1.0f;
-        }
-
-        // Apply global gain
-        // s *= gain;
-
-        // Clamp
-        if (s > 1.0f) {
-          //printf("YO");
-          s = 1.0f;
-        }
-        if (s < -1.0f) {
-          //printf("YO");
-          s = -1.0f;
-        }
-
-        buffer[in * 2] = s;
-        buffer[in * 2 + 1] = s;
-        sc++;
-        //if (s > 1e-6)
-        //  printf("s: %f\n", s);
-        // toPrint[printIndex] = s;
-        // printIndex++;
-        // if (printIndex == 100) printIndex = 0;
-
-        // if (countdown == 0) {
-        //     printf("hey");
-        //     // Print to file
-        //     FILE* out = fopen("out.csv", "w+");
-        //     char str[16];
-        //     for (int i = 0; i < 99; i++) {
-        //         printIndex++;
-        //         if (printIndex == 100) printIndex = 0;
-        //         sprintf(str, "%f,", toPrint[printIndex]);
-        //         fputs(str, out);
-        //     }
-        //     sprintf(str, "%f", toPrint[++printIndex]);
-        //     fputs(str, out);
-        //     fclose(out);
-        // }
-    }
-    printf("currentBeat: %f\n", b);
-
-    printf("totalZero: %d\n", totalZero);
-    printf("totatNonZero: %d\n", totalNonZero);
-
-    // ========== WRITE TO FILE ==========
-    sf_writef_float(snd, buffer.data(), totalFrames);
     sf_close(snd);
     return true;
 }
-
