@@ -2,19 +2,27 @@
 // Embedded Pure Data (libpd) host.
 //
 // Each track (slot 0..SLOTS-1) can reference a Pd patch file. Notes on that
-// track are sent to the patch instead of the built-in synth, and every
-// patch's [dac~] output is mixed into Sonnote's stereo output.
+// track are sent to the patch, and the patch's [dac~] output becomes that
+// track's audio (render()), which the engine mixes with the other tracks.
+// Every slot runs its patch in a libpd instance of its own, so tracks never
+// share an output, even when they use the same file. This needs a libpd
+// built with multi-instance support (PDINSTANCE), as Arch's is.
 //
 // ---- What a patch receives ----
-//   [r $0-note]  gets lists:   voice  freq  velocity  id
+//   [r $0-note]  gets lists:   voice  freq  velocity  id  gain
 //     voice     0..VOICES-1, allocated by Sonnote (feed straight into [clone])
 //     freq      Hz
 //     velocity  0..1; velocity 0 means note off for that voice
 //     id        Sonnote's note id (stable for the whole note)
+//     gain      the note's own gain (set with g in the note window), as a
+//               linear amplitude: 0 dB = 1, -6 dB = 0.5
 //   Send the list into [clone <voice-abstraction> 16] and each voice gets
-//   "freq velocity id". The starter patch written by openEditor() shows this.
+//   "freq velocity id gain". The starter patch written by openEditor() shows
+//   this. Older voices that unpack only "freq velocity id" ignore the gain.
 //
-//   [r $0-hit]   gets a velocity (0..1) for every perc blip on the track.
+//   [r $0-hit]   gets a velocity for every perc blip on the track: the blip's
+//                gain as a linear amplitude (velocity 100 = 0 dB = 1, so a
+//                full 127 is a little over 1).
 //   The patch decides what the hit sounds like; writePercPatch() makes a
 //   starter one (a tone with a pitch drop plus filtered noise).
 //
@@ -35,12 +43,16 @@
 // reloaded, so a patch always starts with the current values.
 //
 // ---- Threads ----
-//   Main thread : setPatch(), openEditor(), poll()
-//   Audio thread: beginBlock() / note*() / renderFrame() / endBlock()
-// libpd is not thread-safe, so both sides share a mutex. The audio thread
-// only try_locks it: if the main thread holds it (patch loading, editor
-// activity), that block's Pd output is silent and note messages are queued
-// until the next block, so no note-on or note-off is lost.
+//   Main thread : setPatch(), swapSlots(), openEditor(), poll()
+//   Audio thread: beginBlock() / note*() / render() / endBlock()
+// libpd is not thread-safe, so both sides share a mutex, which also guards
+// every slot's state. The audio thread only try_locks it: if the main thread
+// holds it (patch loading, editor activity), that block's Pd output is
+// silent and note messages are queued until the next block, so no note-on
+// or note-off is lost.
+//
+// The editor: each slot's instance has its own Pd GUI, started the first
+// time "Edit in Pd" is used on that track.
 
 #include <array>
 #include <chrono>
@@ -74,8 +86,8 @@ public:
     // Returns false (and leaves the slot unloaded) if the file can't be opened.
     bool setPatch(int slot, const std::string& name);
 
-    // Moves the patches of two slots, so tracks can be reordered without
-    // reloading anything.
+    // Moves the patches (and their instances) of two slots, so tracks can be
+    // reordered without reloading anything.
     void swapSlots(int a, int b);
 
     // Writes the starter perc patch for `name` if the file doesn't exist yet.
@@ -91,8 +103,6 @@ public:
     // Call regularly from the main loop: reloads a patch from disk after its
     // editor window is closed. (The editor is serviced by the audio thread.)
     void poll();
-
-    bool guiRunning() const { return gui; }
 
     // ---------------- Values sent to patches ----------------
     // Callable from any thread. Each keeps only the latest value, which is
@@ -131,34 +141,49 @@ public:
     void endBlock();
     void sendParams();   // deliver changed gains / song parameters (call after beginBlock)
 
-    bool routes(int slot) const;   // does this track play through Pd?
-    void noteOn(int slot, uint32_t id, float freq, float velocity);
-    bool noteOff(uint32_t id);     // true if the note was playing in Pd
+    bool routes(int slot) const;   // does this track have a running patch?
+    void noteOn(int slot, uint32_t id, float freq, float velocity, float noteGain = 1.0f);
+    void noteOff(uint32_t id);     // whichever slot is playing it
     void hit(int slot, float velocity);   // perc blip -> [r $0-hit]
-    // Adds to this frame's input of the slot's patch ([tabreceive~ $0-in]).
-    // Call after renderFrame() for the same frame.
-    void addInput(int slot, float sample);
     void allNotesOff();
 
-    // Adds this frame of Pd output to l and r.
-    void renderFrame(float& l, float& r);
+    // Runs the slot's patch for n frames and adds its output to l and r.
+    // `in` (may be null) is the patch's input for the same frames
+    // ([tabreceive~ $0-in]); it reaches the patch one Pd tick late.
+    // Does nothing for a slot without a patch, or while libpd isn't ours.
+    void render(int slot, const float* in, float* l, float* r, int n);
 
 private:
-    struct Instance {
-        std::string file;      // resolved path, "" if unused
-        std::string canvas;    // "pd-<filename>", Pd's name for the patch window
-        void* handle = nullptr;
-        int refs = 0;          // how many slots use this file
-        bool reloadHidden = false;
-    };
-
     struct Voice {
         uint32_t id = 0;
         float freq = 0.0f;
+        float gain = 1.0f;
         bool active = false;
     };
 
-    struct NoteMsg { int dz; int voice; float freq; float vel; uint32_t id; };  // voice -1 = perc hit
+    // One track's Pd: its own libpd instance and the patch running in it.
+    // Guarded by mtx (see Threads above).
+    struct Slot {
+        struct _pdinstance* pd = nullptr;  // created the first time a patch is loaded
+        std::string file;      // resolved path, "" = no patch
+        std::string canvas;    // "pd-<filename>", Pd's name for the patch window
+        void* handle = nullptr;
+        int dz = 0;            // $0 of the running patch, 0 = none
+        bool gui = false;      // this instance's editor has been started
+        bool resend = false;   // patch (re)loaded: send it every parameter
+        std::array<Voice, VOICES> voices{};
+        int nextVoice = 0;
+        float out[2 * 64] = {};       // one Pd tick of output, interleaved
+        int outFrames = 0, outPos = 0;
+        float in[64] = {};            // input collected for the next tick
+        bool hasInput = false;        // `in` has something to send
+        bool tableLive = false;       // the patch's $0-in table holds non-silence
+    };
+
+    // A note request. Carried out straight away while the audio thread holds
+    // libpd, otherwise queued until the next block that does.
+    enum class Req : uint8_t { NoteOn, NoteOff, Hit, AllOff };
+    struct NoteMsg { Req kind; int slot; uint32_t id; float freq; float vel; float gain; };
 
     // A value waiting to be sent to Pd. `known` = it has been set at least once.
     struct Param {
@@ -169,48 +194,36 @@ private:
     };
     std::array<Param, SLOTS> gain;           // per slot, linear
     Param tempo, playing, refFreq;
-    std::atomic<bool> resendAll{false};      // a patch was (re)loaded
-    void sendGain(int slot);                 // audio thread, locked
+    void sendGain(Slot& s, int slot);        // audio thread, locked, bound
 
     bool ready = false;
+    int sampleRate = 48000;
     std::chrono::steady_clock::time_point lastDiag{};
     void printDiag();
-    // libpd's instance. Multi-instance builds (e.g. Arch's libpd) keep the
-    // current instance per thread, so every thread that calls libpd must set
-    // it first, or libpd crashes dereferencing a null instance.
-    struct _pdinstance* instance = nullptr;
-    void bindThread() const;
-    bool gui = false;
     std::mutex mtx;
 
-    // Main-thread side (guarded by mtx when libpd is touched)
-    std::array<Instance, SLOTS> inst;
-    std::array<std::string, SLOTS> slotFile;  // resolved path per slot
-
-    // Shared: written by main thread, read by audio thread
-    std::array<std::atomic<int>, SLOTS> slotInst{};  // instance index, -1 = none
-    std::array<std::atomic<int>, SLOTS> instDz{};    // $0 of instance, 0 = closed
+    std::array<Slot, SLOTS> slots;
+    // slots[i] has a running patch. Readable without mtx (routes()).
+    std::array<std::atomic<bool>, SLOTS> live{};
 
     // Audio-thread side
     bool locked = false;
-    std::array<std::array<Voice, VOICES>, SLOTS> voices{};
-    std::array<int, SLOTS> nextVoice{};
-    std::array<int, SLOTS> seenDz{};
     std::array<NoteMsg, MAX_QUEUE> queue{};
     int queued = 0;
-    float outBuf[2 * 64] = {};
-    float inBuf[SLOTS][64] = {};           // per instance: input collected for the next tick
-    std::array<bool, SLOTS> hasInput{};    // per instance: inBuf has something to send
-    std::array<bool, SLOTS> tableLive{};   // per instance: its $0-in table holds non-silence
-    int outFrames = 0;   // frames in outBuf (one Pd tick)
-    int outPos = 0;
     float blockPeak = 0.0f;
 
+    // libpd keeps a current instance (per thread, in Arch's build), so every
+    // call into libpd must select the right one first.
+    static void bind(const Slot& s);
+    bool ensureInstance(Slot& s);                              // needs mtx; binds it
+    bool loadFile(Slot& s, const std::string& file, bool visible);  // needs mtx
+    void unload(Slot& s);                                      // needs mtx
+    void markLive(int slot) { live[slot] = slots[slot].dz != 0; }
+
     std::string resolve(const std::string& name) const;
-    int  openInstance(const std::string& file, bool visible);  // needs mtx
-    void releaseInstance(int i);                               // needs mtx
-    void send(const NoteMsg& m);                               // audio thread
-    void syncVoices(int instIndex);                            // audio thread
+    void request(const NoteMsg& m);                            // audio thread
+    void execute(const NoteMsg& m);                            // audio thread, locked
+    void sendNote(Slot& s, int voice, float freq, float vel, uint32_t id, float gain);
     static bool writeStarterPatch(const std::string& file);
     static bool writePercPatch(const std::string& file, int variant);
     static bool writeAudioPatch(const std::string& file);

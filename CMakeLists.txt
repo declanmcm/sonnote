@@ -63,6 +63,36 @@ target_link_libraries(SDL2::SDL2)
 # ---------- OpenGL ----------
 find_package(OpenGL REQUIRED)
 
+# ---------- VST3 hosting (extern/vst3sdk, MIT) ----------
+# Just the SDK's hosting sources, not its own CMake project. Needs the
+# base, cmake, pluginterfaces and public.sdk submodules.
+find_package(X11 REQUIRED)
+set(VST3_SDK ${CMAKE_SOURCE_DIR}/extern/vst3sdk)
+add_library(vst3_hosting STATIC
+  ${VST3_SDK}/pluginterfaces/base/conststringtable.cpp
+  ${VST3_SDK}/pluginterfaces/base/coreiids.cpp
+  ${VST3_SDK}/pluginterfaces/base/funknown.cpp
+  ${VST3_SDK}/pluginterfaces/base/ustring.cpp
+  ${VST3_SDK}/public.sdk/source/common/commoniids.cpp
+  ${VST3_SDK}/public.sdk/source/common/commonstringconvert.cpp
+  ${VST3_SDK}/public.sdk/source/common/memorystream.cpp
+  ${VST3_SDK}/public.sdk/source/common/threadchecker_linux.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/connectionproxy.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/eventlist.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/hostclasses.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/module.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/module_linux.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/parameterchanges.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/plugprovider.cpp
+  ${VST3_SDK}/public.sdk/source/vst/hosting/processdata.cpp
+  ${VST3_SDK}/public.sdk/source/vst/utility/stringconvert.cpp
+  ${VST3_SDK}/public.sdk/source/vst/vstinitiids.cpp
+)
+target_include_directories(vst3_hosting PUBLIC ${VST3_SDK})
+target_compile_definitions(vst3_hosting PUBLIC RELEASE=1)
+target_link_libraries(vst3_hosting PUBLIC dl)
+
 # ---------- App ----------
 add_executable(app
   src/main.cpp
@@ -72,6 +102,7 @@ add_executable(app
   src/parser.cpp
   src/utils.cpp
   src/pd_host.cpp
+  src/vst3_host.cpp
 )
 
 target_include_directories(app PRIVATE
@@ -99,6 +130,8 @@ target_link_libraries(app PRIVATE
   ${JACK_LIBRARIES}
   ${SNDFILE_LIBRARIES}
   ${LIBPD_LIBRARY}
+  vst3_hosting
+  X11::X11
 )
 
 # Some Linux toolchains need these explicitly

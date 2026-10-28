@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 // doesn't exist yet: notes -> [clone sonnote-voice 16] -> gain -> [dac~].
 static const char* kStarterPatch =
     "#N canvas 120 120 620 400 12;\n"
-    "#X text 20 10 Sonnote sends: voice freq velocity id. Velocity 0 is note off.;\n"  // 0
+    "#X text 20 10 Sonnote sends: voice freq velocity id gain. Velocity 0 is note off.;\n"  // 0
     "#X obj 20 50 r \\$0-note;\n"                                                   // 1
     "#X obj 20 90 clone sonnote-voice 16;\n"                                         // 2
     "#X obj 20 130 *~ 0.15;\n"                                                       // 3
@@ -37,20 +37,24 @@ static const char* kStarterPatch =
     "#X connect 8 0 4 1;\n";
 
 // One voice of the starter patch: a sine with a short attack and release.
+// The note's gain scales the velocity, so velocity 0 is still note off.
 static const char* kStarterVoice =
     "#N canvas 140 140 420 300 12;\n"
-    "#X obj 20 20 inlet;\n"
-    "#X obj 20 50 unpack f f f;\n"
-    "#X obj 20 140 osc~;\n"
-    "#X obj 130 80 sel 0;\n"
-    "#X msg 130 110 0 300;\n"
-    "#X msg 200 110 \\$1 10;\n"
-    "#X obj 130 140 vline~;\n"
-    "#X obj 20 180 *~;\n"
-    "#X obj 20 220 outlet~;\n"
+    "#X obj 20 20 inlet;\n"           // 0
+    "#X obj 20 50 unpack f f f f;\n"  // 1: freq velocity id gain
+    "#X obj 20 140 osc~;\n"           // 2
+    "#X obj 130 105 sel 0;\n"         // 3
+    "#X msg 130 135 0 300;\n"         // 4
+    "#X msg 200 135 \\$1 10;\n"       // 5
+    "#X obj 130 165 vline~;\n"        // 6
+    "#X obj 20 200 *~;\n"             // 7
+    "#X obj 20 240 outlet~;\n"        // 8
+    "#X obj 130 78 *;\n"              // 9: velocity * gain
     "#X connect 0 0 1 0;\n"
     "#X connect 1 0 2 0;\n"
-    "#X connect 1 1 3 0;\n"
+    "#X connect 1 1 9 0;\n"
+    "#X connect 1 3 9 1;\n"
+    "#X connect 9 0 3 0;\n"
     "#X connect 3 0 4 0;\n"
     "#X connect 3 1 5 0;\n"
     "#X connect 4 0 6 0;\n"
@@ -115,6 +119,7 @@ static const char* kAudioPatch =
     "#X connect 2 0 3 0;\n"
     "#X connect 2 0 3 1;\n";
 
+// Shows or hides a patch window. Its slot's instance must be bound.
 static void sendVis(const std::string& canvas, bool on) {
     if (canvas.empty() || !libpd_exists(canvas.c_str())) return;
     libpd_start_message(1);
@@ -125,37 +130,38 @@ static void sendVis(const std::string& canvas, bool on) {
 PdHost::~PdHost() {
     if (!ready) return;
     std::lock_guard<std::mutex> lock(mtx);
-    bindThread();
-    for (int i = 0; i < SLOTS; i++) {
-        if (inst[i].handle && libpd_exists(inst[i].canvas.c_str()))
-            libpd_closefile(inst[i].handle);
-        inst[i] = Instance{};
+    for (Slot& s : slots) {
+        if (!s.pd) continue;
+        unload(s);
+        if (s.gui) libpd_stop_gui();
+        libpd_free_instance(s.pd);
+        s.pd = nullptr;
     }
-    if (gui) libpd_stop_gui();
 }
 
 // Pd's console output (errors from patches, "print" objects) goes to stderr.
 static void pdPrint(const char* s) { std::fputs(s, stderr); }
 
-void PdHost::bindThread() const {
-    if (instance) libpd_set_instance(instance);
+void PdHost::bind(const Slot& s) {
+    if (s.pd) libpd_set_instance(s.pd);
 }
 
-bool PdHost::init(int sampleRate) {
+bool PdHost::init(int sr) {
+    sampleRate = sr;
     for (int i = 0; i < SLOTS; i++) {
-        slotInst[i] = -1; instDz[i] = 0;
+        live[i] = false;
         if (!gain[i].known) gain[i].set(1.0f);   // 0 dB until the track says otherwise
     }
     libpd_init();
-    instance = libpd_this_instance();
     libpd_set_printhook(pdPrint);
-    if (libpd_init_audio(0, 2, sampleRate) != 0) {
-        std::fprintf(stderr, "[pd] libpd_init_audio failed\n");
+    // Every slot gets an instance of its own; check that this libpd can
+    // make them (the first one is kept for slot 0).
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!ensureInstance(slots[0])) {
+        status = "libpd has no multi-instance support: Pd patches won't play";
+        std::fprintf(stderr, "[pd] %s\n", status.c_str());
         return false;
     }
-    libpd_start_message(1);
-    libpd_add_float(1.0f);
-    libpd_finish_message("pd", "dsp");
     ready = true;
     return true;
 }
@@ -172,36 +178,50 @@ std::string PdHost::resolve(const std::string& name) const {
     return fs::absolute(p).lexically_normal().string();
 }
 
-int PdHost::openInstance(const std::string& file, bool visible) {
-    // Tracks that share a file share one running copy of the patch.
-    for (int i = 0; i < SLOTS; i++) {
-        if (inst[i].file == file && inst[i].handle) { inst[i].refs++; return i; }
-    }
-    int i = 0;
-    while (i < SLOTS && !inst[i].file.empty()) i++;
-    if (i == SLOTS) return -1;
+bool PdHost::ensureInstance(Slot& s) {
+    if (s.pd) { bind(s); return true; }
+    s.pd = libpd_new_instance();   // also makes it the current instance
+    if (!s.pd) return false;
+    libpd_set_printhook(pdPrint);
+    if (libpd_init_audio(0, 2, sampleRate) != 0)
+        std::fprintf(stderr, "[pd] libpd_init_audio failed\n");
+    libpd_start_message(1);
+    libpd_add_float(1.0f);
+    libpd_finish_message("pd", "dsp");
+    return true;
+}
 
+bool PdHost::loadFile(Slot& s, const std::string& file, bool visible) {
+    if (!ensureInstance(s)) return false;
     fs::path p = file;
     std::string dir = p.parent_path().string(), base = p.filename().string();
     void* h = libpd_openfile(base.c_str(), dir.c_str());
-    if (!h) return -1;
-
-    inst[i].file = file;
-    inst[i].canvas = "pd-" + base;
-    inst[i].handle = h;
-    inst[i].refs = 1;
-    if (gui && !visible) sendVis(inst[i].canvas, false);
-    instDz[i] = libpd_getdollarzero(h);
-    return i;
+    if (!h) return false;
+    s.file = file;
+    s.canvas = "pd-" + base;
+    s.handle = h;
+    s.dz = libpd_getdollarzero(h);
+    if (s.gui && !visible) sendVis(s.canvas, false);
+    // A new patch starts with no voices playing and gets every parameter
+    s.voices = {};
+    s.nextVoice = 0;
+    s.outFrames = s.outPos = 0;
+    std::fill(std::begin(s.in), std::end(s.in), 0.0f);
+    s.hasInput = s.tableLive = false;
+    s.resend = true;
+    return true;
 }
 
-void PdHost::releaseInstance(int i) {
-    if (i < 0 || --inst[i].refs > 0) return;
-    instDz[i] = 0;
+void PdHost::unload(Slot& s) {
+    bind(s);
     // If its editor window was closed, Pd has already freed the patch.
-    if (inst[i].handle && libpd_exists(inst[i].canvas.c_str()))
-        libpd_closefile(inst[i].handle);
-    inst[i] = Instance{};
+    if (s.handle && libpd_exists(s.canvas.c_str()))
+        libpd_closefile(s.handle);
+    s.file.clear();
+    s.canvas.clear();
+    s.handle = nullptr;
+    s.dz = 0;
+    s.voices = {};
 }
 
 bool PdHost::setPatch(int slot, const std::string& name) {
@@ -209,25 +229,22 @@ bool PdHost::setPatch(int slot, const std::string& name) {
     std::string file = resolve(name);
 
     std::lock_guard<std::mutex> lock(mtx);
-    bindThread();
-    int cur = slotInst[slot];
-    if (cur >= 0 && file == slotFile[slot] && inst[cur].handle) return true;  // already loaded
+    Slot& s = slots[slot];
+    if (!file.empty() && file == s.file && s.dz) return true;  // already loaded
 
-    slotInst[slot] = -1;          // audio thread stops routing first
-    releaseInstance(cur);
-    slotFile[slot].clear();
+    live[slot] = false;
+    unload(s);
 
     if (file.empty()) { status = "Track " + std::to_string(slot + 1) + ": no patch"; return true; }
     if (!fs::exists(file)) {
         status = "Not found: " + file;
         return false;
     }
-    int i = openInstance(file, false);
-    if (i < 0) { status = "Pd couldn't open " + file; return false; }
-
-    slotFile[slot] = file;
-    slotInst[slot] = i;
-    resendAll = true;   // give the patch the current gain and song parameters
+    if (!loadFile(s, file, false)) {
+        status = s.pd ? "Pd couldn't open " + file : "Couldn't make a Pd instance for track " + std::to_string(slot + 1);
+        return false;
+    }
+    markLive(slot);
     status = "Track " + std::to_string(slot + 1) + ": " + fs::path(file).filename().string();
     return true;
 }
@@ -281,15 +298,6 @@ bool PdHost::ensurePercPatch(const std::string& name, int variant) {
     return fs::exists(file) || writePercPatch(file, variant);
 }
 
-void PdHost::swapSlots(int a, int b) {
-    if (a == b || a < 0 || b < 0 || a >= SLOTS || b >= SLOTS) return;
-    std::lock_guard<std::mutex> lock(mtx);   // the audio thread never sees a half swap
-    std::swap(slotFile[a], slotFile[b]);
-    int ia = slotInst[a];
-    slotInst[a] = slotInst[b].load();
-    slotInst[b] = ia;
-}
-
 std::string PdHost::findGuiDir() {
     // The directory that contains tcl/pd-gui.tcl in a Pd vanilla install.
     std::vector<std::string> dirs;
@@ -328,6 +336,14 @@ std::string PdHost::guiProblem() {
     return "";
 }
 
+void PdHost::swapSlots(int a, int b) {
+    if (a == b || a < 0 || b < 0 || a >= SLOTS || b >= SLOTS) return;
+    std::lock_guard<std::mutex> lock(mtx);   // the audio thread never sees a half swap
+    std::swap(slots[a], slots[b]);
+    markLive(a);
+    markLive(b);
+}
+
 bool PdHost::openEditor(int slot, const std::string& name) {
     if (!ready) return false;
     if (name.empty()) { status = "Type a patch name first"; return false; }
@@ -340,8 +356,9 @@ bool PdHost::openEditor(int slot, const std::string& name) {
     if (!setPatch(slot, name)) return false;
 
     std::lock_guard<std::mutex> lock(mtx);
-    bindThread();
-    if (!gui) {
+    Slot& s = slots[slot];
+    bind(s);
+    if (!s.gui) {
         std::string dir = findGuiDir();
         if (dir.empty()) {
             status = "Pd GUI not found: install Pd or set PD_GUI_DIR";
@@ -355,13 +372,14 @@ bool PdHost::openEditor(int slot, const std::string& name) {
             status = "Couldn't start the Pd GUI from " + dir;
             return false;
         }
-        gui = true;
+        s.gui = true;
     }
-    sendVis(inst[slotInst[slot]].canvas, true);   // show / raise this patch
+    sendVis(s.canvas, true);   // show / raise this patch
     status = "Editing " + fs::path(file).filename().string();
     return true;
 }
 
+// Needs mtx (it reads the slots).
 void PdHost::printDiag() {
     auto now = std::chrono::steady_clock::now();
     if (now - lastDiag < std::chrono::seconds(1)) return;
@@ -376,37 +394,37 @@ void PdHost::printDiag() {
                  ticks, miss, on, off, hits, fails, unrouted, peak,
                  (int)diag.playing, (int)diag.frozen, diag.events.exchange(0),
                  (float)diag.beat, (float)diag.nextBeat);
-    for (int s = 0; s < SLOTS; s++) {
-        int i = slotInst[s];
-        if (i >= 0) std::fprintf(stderr, " track %d -> %s ($0=%d)", s + 1,
-                                 fs::path(inst[i].file).filename().c_str(), (int)instDz[i]);
+    for (int i = 0; i < SLOTS; i++) {
+        const Slot& s = slots[i];
+        if (s.dz) std::fprintf(stderr, " track %d -> %s ($0=%d)", i + 1,
+                               fs::path(s.file).filename().c_str(), s.dz);
     }
     std::fprintf(stderr, "\n");
 }
 
 void PdHost::poll() {
     if (!ready) return;
-    if (debug) printDiag();
-    // The editor itself is serviced inside libpd_process_float on the audio
+    // The editors are serviced inside libpd_process_float on the audio
     // thread; this only checks for patch windows that were closed.
     std::lock_guard<std::mutex> lock(mtx);
-    bindThread();
+    if (debug) printDiag();
     // Closing a patch window in the editor frees the patch. Reload it from
     // disk (hidden), so "edit, save, close" leaves the saved version playing.
     for (int i = 0; i < SLOTS; i++) {
-        Instance& in = inst[i];
-        if (!in.handle || libpd_exists(in.canvas.c_str())) continue;
-        fs::path p = in.file;
-        in.handle = libpd_openfile(p.filename().string().c_str(), p.parent_path().string().c_str());
-        if (in.handle) {
-            sendVis(in.canvas, false);
-            instDz[i] = libpd_getdollarzero(in.handle);
-            resendAll = true;
-            status = "Reloaded " + p.filename().string();
+        Slot& s = slots[i];
+        if (!s.handle) continue;
+        bind(s);
+        if (libpd_exists(s.canvas.c_str())) continue;
+        std::string file = s.file;
+        s.handle = nullptr;
+        s.dz = 0;
+        if (loadFile(s, file, false)) {
+            status = "Reloaded " + fs::path(file).filename().string();
         } else {
-            instDz[i] = 0;
-            status = "Couldn't reload " + p.filename().string();
+            s.file = file;   // remembered, so the track still names it
+            status = "Couldn't reload " + fs::path(file).filename().string();
         }
+        markLive(i);
     }
 }
 
@@ -425,27 +443,34 @@ void PdHost::setTempo(float bpm)    { if (bpm > 0.0f) tempo.set(bpm); }
 void PdHost::setPlaying(bool on)    { playing.set(on ? 1.0f : 0.0f); }
 void PdHost::setRefFreq(float hz)   { refFreq.set(hz); }
 
-void PdHost::sendGain(int slot) {
-    int i = slotInst[slot];
-    if (i < 0 || !instDz[i]) return;
+void PdHost::sendGain(Slot& s, int slot) {
     char recv[32];
-    std::snprintf(recv, sizeof recv, "%d-gain", (int)instDz[i]);
+    std::snprintf(recv, sizeof recv, "%d-gain", s.dz);
     libpd_float(recv, gain[slot].value);   // ignored if the patch has no [r $0-gain]
 }
 
 void PdHost::sendParams() {
     if (!locked) return;   // stays dirty, sent next block
-    bool all = resendAll.exchange(false);
-    auto due = [all](Param& p) { bool d = p.dirty.exchange(false); return p.known && (d || all); };
-
-    for (int s = 0; s < SLOTS; s++)
-        if (due(gain[s])) sendGain(s);
-    if (due(tempo)) {
-        libpd_float("sonnote-tempo", tempo.value);
-        libpd_float("sonnote-beatms", 60000.0f / tempo.value);
+    // The song parameters are global names, but each instance has its own
+    // namespace, so every patch is sent its own copy.
+    bool tempoDue = tempo.dirty.exchange(false);
+    bool playDue  = playing.dirty.exchange(false);
+    bool refDue   = refFreq.dirty.exchange(false);
+    for (int i = 0; i < SLOTS; i++) {
+        Slot& s = slots[i];
+        bool all = s.resend;
+        bool gainDue = gain[i].dirty.exchange(false);
+        s.resend = false;
+        if (!s.dz) continue;
+        bind(s);
+        if (gain[i].known && (gainDue || all)) sendGain(s, i);
+        if (tempo.known && (tempoDue || all)) {
+            libpd_float("sonnote-tempo", tempo.value);
+            libpd_float("sonnote-beatms", 60000.0f / tempo.value);
+        }
+        if (playing.known && (playDue || all)) libpd_float("sonnote-playing", playing.value);
+        if (refFreq.known && (refDue || all))  libpd_float("sonnote-ref", refFreq.value);
     }
-    if (due(playing)) libpd_float("sonnote-playing", playing.value);
-    if (due(refFreq)) libpd_float("sonnote-ref", refFreq.value);
 }
 
 // ======================================================
@@ -456,8 +481,7 @@ bool PdHost::beginBlock() {
     locked = ready && mtx.try_lock();
     if (ready && !locked) diag.lockMisses++;
     if (locked) {
-        bindThread();   // JACK's thread starts with no libpd instance set
-        for (int q = 0; q < queued; q++) send(queue[q]);
+        for (int q = 0; q < queued; q++) execute(queue[q]);
         queued = 0;
     }
     return locked;
@@ -471,131 +495,137 @@ void PdHost::endBlock() {
 }
 
 bool PdHost::routes(int slot) const {
-    if (!ready || slot < 0 || slot >= SLOTS) return false;
-    int i = slotInst[slot];
-    return i >= 0 && instDz[i] != 0;
+    return ready && slot >= 0 && slot < SLOTS && live[slot];
 }
 
-void PdHost::send(const NoteMsg& m) {
-    if (!locked) {
-        if (queued < MAX_QUEUE) queue[queued++] = m;
+void PdHost::request(const NoteMsg& m) {
+    if (locked) execute(m);
+    else if (queued < MAX_QUEUE) queue[queued++] = m;
+}
+
+void PdHost::sendNote(Slot& s, int voice, float freq, float vel, uint32_t id, float noteGain) {
+    char recv[32];
+    std::snprintf(recv, sizeof recv, "%d-note", s.dz);
+    libpd_start_message(5);
+    libpd_add_float((float)voice);
+    libpd_add_float(freq);
+    libpd_add_float(vel);
+    libpd_add_float((float)id);
+    libpd_add_float(noteGain);
+    if (libpd_finish_list(recv) != 0) diag.sendFails++;   // no [r $0-note] in the patch
+    if (vel > 0.0f) diag.notesOn++; else diag.notesOff++;
+}
+
+void PdHost::execute(const NoteMsg& m) {
+    switch (m.kind) {
+    case Req::NoteOn: {
+        if (m.slot < 0 || m.slot >= SLOTS || !slots[m.slot].dz) return;
+        Slot& s = slots[m.slot];
+        bind(s);
+        auto& vs = s.voices;
+        // Round-robin over free voices, so a voice's release tail can finish
+        // before it's reused. If all are busy, steal the next one.
+        int v = -1;
+        for (int k = 0; k < VOICES; k++) {
+            int c = (s.nextVoice + k) % VOICES;
+            if (!vs[c].active) { v = c; break; }
+        }
+        if (v < 0) {
+            v = s.nextVoice;
+            sendNote(s, v, vs[v].freq, 0.0f, vs[v].id, vs[v].gain);
+        }
+        s.nextVoice = (v + 1) % VOICES;
+        vs[v] = {m.id, m.freq, m.gain, true};
+        sendNote(s, v, m.freq, m.vel, m.id, m.gain);
         return;
     }
-    char recv[32];
-    if (m.voice < 0) {
-        std::snprintf(recv, sizeof recv, "%d-hit", m.dz);
+    case Req::NoteOff:
+        for (Slot& s : slots) {
+            for (int v = 0; v < VOICES; v++) {
+                Voice& vo = s.voices[v];
+                if (!vo.active || vo.id != m.id) continue;
+                vo.active = false;
+                bind(s);
+                sendNote(s, v, vo.freq, 0.0f, vo.id, vo.gain);
+                return;
+            }
+        }
+        return;
+    case Req::Hit: {
+        if (m.slot < 0 || m.slot >= SLOTS || !slots[m.slot].dz) return;
+        Slot& s = slots[m.slot];
+        bind(s);
+        char recv[32];
+        std::snprintf(recv, sizeof recv, "%d-hit", s.dz);
         if (libpd_float(recv, m.vel) != 0) diag.sendFails++;   // no [r $0-hit] in the patch
         else diag.hits++;
         return;
     }
-    std::snprintf(recv, sizeof recv, "%d-note", m.dz);
-    libpd_start_message(4);
-    libpd_add_float((float)m.voice);
-    libpd_add_float(m.freq);
-    libpd_add_float(m.vel);
-    libpd_add_float((float)m.id);
-    if (libpd_finish_list(recv) != 0) diag.sendFails++;   // no [r $0-note] in the patch
-    if (m.vel > 0.0f) diag.notesOn++; else diag.notesOff++;
-}
-
-// A reloaded or replaced patch starts with no voices playing.
-void PdHost::syncVoices(int i) {
-    int dz = instDz[i];
-    if (dz != seenDz[i]) {
-        seenDz[i] = dz;
-        voices[i] = {};
-        nextVoice[i] = 0;
+    case Req::AllOff:
+        for (Slot& s : slots) {
+            if (!s.dz) continue;
+            bind(s);
+            for (int v = 0; v < VOICES; v++) {
+                Voice& vo = s.voices[v];
+                if (!vo.active) continue;
+                vo.active = false;
+                sendNote(s, v, vo.freq, 0.0f, vo.id, vo.gain);
+            }
+        }
+        return;
     }
 }
 
-void PdHost::noteOn(int slot, uint32_t id, float freq, float velocity) {
+void PdHost::noteOn(int slot, uint32_t id, float freq, float velocity, float noteGain) {
     if (!routes(slot)) return;
-    int i = slotInst[slot];
-    syncVoices(i);
-    auto& vs = voices[i];
+    request({Req::NoteOn, slot, id, freq, velocity, noteGain});
+}
 
-    // Round-robin over free voices, so a voice's release tail can finish
-    // before it's reused. If all are busy, steal the next one.
-    int v = -1;
-    for (int k = 0; k < VOICES; k++) {
-        int c = (nextVoice[i] + k) % VOICES;
-        if (!vs[c].active) { v = c; break; }
-    }
-    if (v < 0) {
-        v = nextVoice[i];
-        send({seenDz[i], v, vs[v].freq, 0.0f, vs[v].id});
-    }
-    nextVoice[i] = (v + 1) % VOICES;
-    vs[v] = {id, freq, true};
-    send({seenDz[i], v, freq, velocity, id});
+void PdHost::noteOff(uint32_t id) {
+    if (ready) request({Req::NoteOff, -1, id, 0.0f, 0.0f, 0.0f});
 }
 
 void PdHost::hit(int slot, float velocity) {
     if (!routes(slot)) return;
-    send({(int)instDz[slotInst[slot]], -1, 0.0f, velocity, 0});
-}
-
-bool PdHost::noteOff(uint32_t id) {
-    if (!ready) return false;
-    for (int i = 0; i < SLOTS; i++) {
-        syncVoices(i);
-        for (int v = 0; v < VOICES; v++) {
-            Voice& vo = voices[i][v];
-            if (vo.active && vo.id == id) {
-                vo.active = false;
-                send({seenDz[i], v, vo.freq, 0.0f, id});
-                return true;
-            }
-        }
-    }
-    return false;
+    request({Req::Hit, slot, 0, 0.0f, velocity, 1.0f});
 }
 
 void PdHost::allNotesOff() {
-    if (!ready) return;
-    for (int i = 0; i < SLOTS; i++) {
-        syncVoices(i);
-        for (int v = 0; v < VOICES; v++) {
-            Voice& vo = voices[i][v];
-            if (!vo.active) continue;
-            vo.active = false;
-            send({seenDz[i], v, vo.freq, 0.0f, vo.id});
-        }
-    }
+    if (ready) request({Req::AllOff, -1, 0, 0.0f, 0.0f, 0.0f});
 }
 
-void PdHost::addInput(int slot, float sample) {
-    if (!locked || slot < 0 || slot >= SLOTS || outPos <= 0) return;
-    int i = slotInst[slot];
-    if (i < 0 || !instDz[i]) return;
-    inBuf[i][outPos - 1] += sample;
-    hasInput[i] = true;
-}
-
-void PdHost::renderFrame(float& l, float& r) {
-    if (!locked) return;
-    if (outPos >= outFrames) {
-        // Audio-track input collected during the last tick goes in for this one
-        // ([tabreceive~] replays the table every tick, so once the input
-        // stops it's cleared once rather than left looping.)
-        for (int i = 0; i < SLOTS; i++) {
-            if ((!hasInput[i] && !tableLive[i]) || !instDz[i]) continue;
-            char name[32];
-            std::snprintf(name, sizeof name, "%d-in", (int)instDz[i]);
-            libpd_write_array(name, 0, inBuf[i], 64);   // fails harmlessly without the table
-            std::fill(std::begin(inBuf[i]), std::end(inBuf[i]), 0.0f);
-            tableLive[i] = hasInput[i];
-            hasInput[i] = false;
+void PdHost::render(int slot, const float* in, float* l, float* r, int n) {
+    if (!locked || slot < 0 || slot >= SLOTS) return;
+    Slot& s = slots[slot];
+    if (!s.dz) return;
+    bind(s);
+    for (int k = 0; k < n; k++) {
+        if (s.outPos >= s.outFrames) {
+            // Input collected during the last tick goes in for this one
+            // ([tabreceive~] replays the table every tick, so once the input
+            // stops it's cleared once rather than left looping.)
+            if (s.hasInput || s.tableLive) {
+                char name[32];
+                std::snprintf(name, sizeof name, "%d-in", s.dz);
+                libpd_write_array(name, 0, s.in, 64);   // fails harmlessly without the table
+                std::fill(std::begin(s.in), std::end(s.in), 0.0f);
+                s.tableLive = s.hasInput;
+                s.hasInput = false;
+            }
+            static const float noInput[1] = {0.0f};
+            libpd_process_float(1, noInput, s.out);
+            s.outFrames = libpd_blocksize();
+            s.outPos = 0;
+            diag.ticks++;
         }
-        static const float noInput[1] = {0.0f};
-        libpd_process_float(1, noInput, outBuf);
-        outFrames = libpd_blocksize();
-        outPos = 0;
-        diag.ticks++;
+        float pl = s.out[2 * s.outPos], pr = s.out[2 * s.outPos + 1];
+        blockPeak = std::max(blockPeak, std::max(std::fabs(pl), std::fabs(pr)));
+        l[k] += pl;
+        r[k] += pr;
+        if (in) {
+            s.in[s.outPos] += in[k];
+            s.hasInput = true;
+        }
+        s.outPos++;
     }
-    float pl = outBuf[2 * outPos], pr = outBuf[2 * outPos + 1];
-    blockPeak = std::max(blockPeak, std::max(std::fabs(pl), std::fabs(pr)));
-    l += pl;
-    r += pr;
-    outPos++;
 }

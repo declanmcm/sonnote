@@ -28,12 +28,19 @@ Event* currentEv;
 
 std::vector<std::vector<Clip>> g_clips(MAX_TRACKS);
 std::mutex g_clipsMutex;
+std::vector<std::vector<AutoLane>> g_automation(MAX_TRACKS);
+std::mutex g_automationMutex;
 
 AudioEngine::AudioEngine() {
     // Lock memory to avoid page faults in audio thread
     mlockall(MCL_CURRENT | MCL_FUTURE);
     for (auto& g : trackGain) g = 1.0f;
+    for (auto& a : trackAudible) a = true;
     recRing.assign(REC_RING, 0.0f);
+    busData.assign((size_t)MAX_TRACKS * 2 * MAX_BLOCK, 0.0f);
+    clipInData.assign((size_t)MAX_TRACKS * MAX_BLOCK, 0.0f);
+    metroBuf.assign(MAX_BLOCK, 0.0f);
+    fxScratch.assign(2 * MAX_BLOCK, 0.0f);
 }
 
 AudioEngine::~AudioEngine() {
@@ -292,6 +299,10 @@ void AudioEngine::setTrackGain(int track, float db) {
     if (track >= 0 && track < MAX_TRACKS) trackGain[track] = PdHost::dbToGain(db);
 }
 
+void AudioEngine::setTrackAudible(int track, bool on) {
+    if (track >= 0 && track < MAX_TRACKS) trackAudible[track] = on;
+}
+
 size_t AudioEngine::drainRecording(std::vector<float>& out) {
     size_t r = recRead.load(std::memory_order_relaxed);
     size_t w = recWrite.load(std::memory_order_acquire);
@@ -372,7 +383,11 @@ void AudioEngine::applyMessages() {
         case MessageType::SetPlayState:
             isPlaying = msg.bValue;
             pd.setPlaying(isPlaying);
-            if (!isPlaying) { pd.allNotesOff(); stopAllClips(); }
+            if (!isPlaying) {
+                pd.allNotesOff(); instrumentsAllNotesOff(0); stopAllClips();
+                for (auto& o : percOffs) o.active = false;
+            }
+            autoEpoch++;
             std::fflush(stdout);
             break;
 
@@ -408,9 +423,13 @@ void AudioEngine::applyMessages() {
 
         case MessageType::ResetSampleCounter:
             pd.allNotesOff();
+            instrumentsAllNotesOff(0);
             stopAllClips();
+            for (auto& o : percOffs) o.active = false;
+            autoEpoch++;
             currentBeat = 0.0;
             nextEventIndex = 0;
+            metroBeat = INT64_MIN;   // click again if restarting on a beat
             // Clear voices
             for (size_t i = 0; i < MAX_VOICES; ++i) {
                 for (int j = 0; j < 3; j++) {
@@ -563,14 +582,78 @@ static Event* next_playable(Event* ev) {
     return ev;
 }
 
-// Sequencer + Pd. Notes and perc blips are sent to the Pd patch of their
-// track; every patch's [dac~] output is mixed by libpd and written to the
-// JACK buffers.
+// One sample of the metronome at sample index `sc`: a short sine blip that
+// starts whenever the playhead reaches a whole beat.
+float AudioEngine::metronomeSample(uint64_t sc, double samplesPerBeat) {
+    int64_t beat = (int64_t)std::floor((double)sc / samplesPerBeat);
+    if (beat != metroBeat) {
+        // Only click on the beat itself, not when starting (or looping) mid-beat
+        bool onBeat = (double)sc - beat * samplesPerBeat < 1.0;
+        if (onBeat && metronome.load(std::memory_order_relaxed) && !exporting) {
+            metroFreq = (beat % 4 == 0) ? 1760.0f : 1320.0f;
+            metroPhase = 0.0f;
+            metroEnv = 0.35f;
+        }
+        metroBeat = beat;
+    }
+    if (metroEnv < 1e-4f) return 0.0f;
+    float s = metroEnv * sinf(2.0f * (float)M_PI * metroPhase);
+    metroPhase += metroFreq / sampleRate;
+    if (metroPhase >= 1.0f) metroPhase -= 1.0f;
+    metroEnv *= std::exp(-1.0f / (0.015f * sampleRate));   // ~15 ms decay
+    return s;
+}
+
+// Fires every event the playhead (currentBeat) has reached. `offset` is
+// where in the current block that is, for the VST3 plugins.
+void AudioEngine::fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uint32_t offset) {
+    while (currentEv && currentEv->beat <= currentBeat) {
+        if (currentEv->type == EV_NOTE_START) {
+            int t = currentEv->profile;
+            float freq = ref * currentEv->ratio.eval();
+            float noteGain = PdHost::dbToGain(currentEv->gainDb);
+            bool played = false;
+            if (pd.routes(t)) {
+                pd.noteOn(t, currentEv->id, freq, 1.0f, noteGain);
+                played = true;
+            }
+            if (t >= 0 && t < MAX_TRACKS && plugins[t].instrument) {
+                // The note's gain becomes its velocity: 0 dB = 100/127
+                float velocity = std::clamp(noteGain * (100.0f / 127.0f), 0.0f, 1.0f);
+                plugins[t].instrument->noteOn((int)offset, currentEv->id, freq, velocity);
+                played = true;
+            }
+            if (!played) pd.diag.unroutedNotes++;   // track has no patch or instrument
+        } else if (currentEv->type == EV_NOTE_END) {
+            pd.noteOff(currentEv->id);
+            for (TrackPlugins& tp : plugins)
+                if (tp.instrument) tp.instrument->noteOff((int)offset, currentEv->id);
+        } else if (currentEv->type == EV_PERC) {
+            // Starting (or looping back) mid-song skips past every
+            // earlier event at once; only play hits that are due now.
+            double lateSamples = (currentBeat - currentEv->beat) * samplesPerBeat;
+            if (lateSamples <= blockFrames) {
+                // The blip's velocity is kept as a gain, like a note's (0 dB = 1)
+                float g = PdHost::dbToGain(currentEv->gainDb);
+                pd.hit(currentEv->profile, g);
+                percNoteOn(currentEv->profile, currentEv->id, g, offset);
+            }
+        } else if (currentEv->type == EV_AUDIO_START) {
+            // Started late (mid-clip) it still plays from the right place
+            startClip(currentEv->profile, currentEv->id, currentEv->beat, samplesPerBeat);
+        } else if (currentEv->type == EV_AUDIO_END) {
+            stopClip(currentEv->profile, currentEv->id);
+        }
+        pd.diag.events++;
+        currentEv = next_playable(currentEv);
+    }
+}
+
+// Sequencer + mixer. Each track renders into its own bus (its Pd patch, or
+// its clips when it has no patch); the buses are then summed with the
+// metronome into the output. Works in pieces of at most MAX_BLOCK frames.
 void AudioEngine::processAudio(float* outL, float* outR, const float* input, uint32_t frames)
 {
-    memset(outL, 0, frames * sizeof(float));
-    memset(outR, 0, frames * sizeof(float));
-
     // Take libpd for this block. If the main thread is busy with it, Pd is
     // silent for this block and note messages are queued, not lost.
     pd.beginBlock();
@@ -596,66 +679,151 @@ void AudioEngine::processAudio(float* outL, float* outR, const float* input, uin
     // Clip lists are only read while the main thread isn't changing them
     std::unique_lock<std::mutex> clipLock(g_clipsMutex, std::try_to_lock);
 
-    for (uint32_t in = 0; in < frames; ++in) {
+    for (uint32_t done = 0; done < frames;) {
+        uint32_t n = std::min<uint32_t>(MAX_BLOCK, frames - done);
+        processBlock(outL + done, outR + done, input ? input + done : nullptr, n,
+                     samplesPerBeat, clipLock.owns_lock());
+        done += n;
+    }
+
+    pd.diag.beat = (float)currentBeat;
+    playBeat.store(currentBeat, std::memory_order_relaxed);
+    pd.endBlock();
+}
+
+// One piece of at most MAX_BLOCK frames. While playing it's cut into
+// segments that end where the next event falls due or the loop wraps, so
+// events fire on the right sample and everything within a segment can be
+// rendered as a block.
+void AudioEngine::processBlock(float* outL, float* outR, const float* input, uint32_t n,
+                               double samplesPerBeat, bool clipsReadable)
+{
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        std::fill_n(busL(t), n, 0.0f);
+        std::fill_n(busR(t), n, 0.0f);
+    }
+    std::fill_n(metroBuf.data(), n, 0.0f);
+    const uint64_t blockStart = sampleCounter;   // for the plugins' transport
+
+    for (uint32_t pos = 0; pos < n;) {
+        uint32_t len = n - pos;
         if (isPlaying) {
             currentBeat = double(sampleCounter) / samplesPerBeat;
             b = currentBeat;
-
-            // Fire every event the playhead has reached
-            while (!freeze && currentEv && currentEv->beat <= currentBeat) {
-                if (currentEv->type == EV_NOTE_START) {
-                    if (pd.routes(currentEv->profile))
-                        pd.noteOn(currentEv->profile, currentEv->id,
-                                  ref * currentEv->ratio.eval(), 1.0f);
-                    else
-                        pd.diag.unroutedNotes++;   // track has no Pd patch
-                } else if (currentEv->type == EV_NOTE_END) {
-                    pd.noteOff(currentEv->id);
-                } else if (currentEv->type == EV_PERC) {
-                    // Starting (or looping back) mid-song skips past every
-                    // earlier event at once; only play hits that are due now.
-                    double lateSamples = (currentBeat - currentEv->beat) * samplesPerBeat;
-                    if (lateSamples <= frames)
-                        pd.hit(currentEv->profile, 1.0f);
-                } else if (currentEv->type == EV_AUDIO_START) {
-                    // Started late (mid-clip) it still plays from the right place
-                    startClip(currentEv->profile, currentEv->id, currentEv->beat, samplesPerBeat);
-                } else if (currentEv->type == EV_AUDIO_END) {
-                    stopClip(currentEv->profile, currentEv->id);
-                }
-                pd.diag.events++;
-                currentEv = next_playable(currentEv);
-            }
-        }
-
-        // Pd keeps running while stopped, so release tails finish and
-        // patches being edited stay audible.
-        float l = 0.0f, r = 0.0f;
-        pd.renderFrame(l, r);
-
-        // Clips, positioned by the sample counter so they stay in time
-        if (isPlaying && clipLock.owns_lock()) {
-            for (const ClipVoice& v : clipVoices) {
-                if (!v.active || v.track < 0 || v.track >= (int)g_clips.size()) continue;
-                const auto& clips = g_clips[v.track];
-                if (v.clip >= clips.size()) continue;
-                const Clip& c = clips[v.clip];
-                int64_t pos = (int64_t)sampleCounter - v.startSc + (int64_t)c.startSample;
-                if (pos < 0 || pos >= (int64_t)c.samples.size()) continue;
-                float smp = c.samples[(size_t)pos] * trackGain[v.track].load(std::memory_order_relaxed);
-                if (pd.routes(v.track)) {
-                    pd.addInput(v.track, smp);   // through the track's patch
-                } else {
-                    l += smp;
-                    r += smp;
+            if (!freeze) {
+                fireDueEvents(samplesPerBeat, n, pos);
+                // End the segment where the next event falls due (at least one
+                // frame, in case rounding leaves it just short)
+                if (currentEv) {
+                    double due = std::ceil((double)currentEv->beat * samplesPerBeat) - (double)sampleCounter;
+                    if (due < len) len = (uint32_t)std::max(1.0, due);
                 }
             }
+            // ...or where the counter passes the loop end
+            if (loopEndSamples > 0) {
+                int64_t toWrap = (int64_t)loopEndSamples + 1 - (int64_t)sampleCounter;
+                if (toWrap < 1) len = 1;
+                else if (toWrap < (int64_t)len) len = (uint32_t)toWrap;
+            }
+            // ...or where a perc hit on a VST3 instrument ends
+            len = firePercOffs(pos, len);
+            if (!freeze) applyAutomation(pos, len, samplesPerBeat);
         }
 
-        outL[in] = std::clamp(l, -1.0f, 1.0f);
-        outR[in] = std::clamp(r, -1.0f, 1.0f);
-
+        renderSegment(pos, len, input, samplesPerBeat, clipsReadable);
+        pos += len;
         if (!isPlaying) continue;
+
+        if (!freeze) sampleCounter += len;
+
+        // Loop: jump back, release everything, restart the event list
+        if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
+            sampleCounter = loopStartSamples;
+            metroBeat = INT64_MIN;
+            pd.allNotesOff();
+            instrumentsAllNotesOff((int)std::min(pos, n - 1));
+            stopAllClips();
+            for (auto& o : percOffs) o.active = false;
+            autoEpoch++;
+            // While recording, each pass round the loop becomes its own take
+            int k = recPassCount;
+            if (recActive && k < (int)recPassEnds.size()) {
+                recPassEnds[k] = recCaptured;
+                recPassCount = k + 1;
+            }
+            currentEv = activeEvents.get_first();
+        }
+    }
+
+    // VST3 instruments add to their track's bus, then its effects process it
+    processPlugins(n, blockStart, samplesPerBeat);
+
+    // Mix: every audible track's bus plus the metronome. Muted tracks are
+    // still rendered (so Pd and VST3 tails carry on), just not heard.
+    std::array<bool, MAX_TRACKS> audible;
+    for (int t = 0; t < MAX_TRACKS; t++)
+        audible[t] = trackAudible[t].load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; i++) {
+        float l = metroBuf[i], r = metroBuf[i];
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            if (!audible[t]) continue;
+            l += busL(t)[i];
+            r += busR(t)[i];
+        }
+        outL[i] = std::clamp(l, -1.0f, 1.0f);
+        outR[i] = std::clamp(r, -1.0f, 1.0f);
+    }
+
+    if (!isPlaying) sampleCounter += n;
+}
+
+// Renders frames [pos, pos + len) of the current block into the track buses.
+// No events fall due inside the segment, so sample i of it is at
+// sampleCounter + i (or stays at sampleCounter while frozen).
+void AudioEngine::renderSegment(uint32_t pos, uint32_t len, const float* input,
+                                double samplesPerBeat, bool clipsReadable)
+{
+    const uint64_t sc = sampleCounter;
+    const uint32_t step = freeze ? 0 : 1;
+
+    // Clips, positioned by the sample counter so they stay in time. A track
+    // with a Pd patch plays them through it ([tabreceive~ $0-in]); otherwise
+    // they go straight onto its bus.
+    std::array<bool, MAX_TRACKS> hasClipIn{};
+    if (isPlaying && clipsReadable) {
+        for (const ClipVoice& v : clipVoices) {
+            if (!v.active || v.track < 0 || v.track >= MAX_TRACKS || v.track >= (int)g_clips.size()) continue;
+            const auto& clips = g_clips[v.track];
+            if (v.clip >= clips.size()) continue;
+            const Clip& c = clips[v.clip];
+            const float g = trackGain[v.track].load(std::memory_order_relaxed);
+            const bool toPd = pd.routes(v.track);
+            float* dst = toPd ? clipIn(v.track) : busL(v.track) + pos;
+            if (toPd && !hasClipIn[v.track]) {
+                std::fill_n(dst, len, 0.0f);
+                hasClipIn[v.track] = true;
+            }
+            int64_t first = (int64_t)sc - v.startSc + (int64_t)c.startSample;
+            for (uint32_t i = 0; i < len; i++) {
+                int64_t p = first + (int64_t)(i * step);
+                if (p < 0 || p >= (int64_t)c.samples.size()) continue;
+                dst[i] += c.samples[(size_t)p] * g;
+            }
+            if (!toPd)   // mono clip: same on both sides
+                for (uint32_t i = 0; i < len; i++) busR(v.track)[pos + i] = busL(v.track)[pos + i];
+        }
+    }
+
+    // Pd runs for every track with a patch, playing or not, so release tails
+    // finish and patches being edited stay audible.
+    for (int t = 0; t < MAX_TRACKS; t++)
+        if (pd.routes(t))
+            pd.render(t, hasClipIn[t] ? clipIn(t) : nullptr, busL(t) + pos, busR(t) + pos, (int)len);
+
+    if (!isPlaying) return;
+
+    for (uint32_t i = 0; i < len; i++) {
+        metroBuf[pos + i] = metronomeSample(sc + i * step, samplesPerBeat);
 
         // Capture the input while recording
         if (recActive && input) {
@@ -663,36 +831,210 @@ void AudioEngine::processAudio(float* outL, float* outR, const float* input, uin
             size_t next = (w + 1) % REC_RING;
             // Dropped only if the main thread stalls for the whole ring (~40 s)
             if (next != recRead.load(std::memory_order_acquire)) {
-                recRing[w] = input[in];
+                recRing[w] = input[pos + i];
                 recWrite.store(next, std::memory_order_release);
                 recCaptured++;
             }
         }
-
-        if (!freeze) sampleCounter++;
-
-        // Loop: jump back, release everything, restart the event list
-        if (loopEndSamples > 0 && sampleCounter > loopEndSamples) {
-            sampleCounter = loopStartSamples;
-            pd.allNotesOff();
-            stopAllClips();
-            // While recording, each pass round the loop becomes its own take
-            int n = recPassCount;
-            if (recActive && n < (int)recPassEnds.size()) {
-                recPassEnds[n] = recCaptured;
-                recPassCount = n + 1;
-            }
-            currentEv = activeEvents.get_first();
-        }
     }
-
-    if (!isPlaying) sampleCounter += frames;
-    pd.diag.beat = (float)currentBeat;
-    pd.endBlock();
 }
 
 
 
+
+void AudioEngine::instrumentsAllNotesOff(int offset) {
+    for (TrackPlugins& tp : plugins)
+        if (tp.instrument) tp.instrument->allNotesOff(offset);
+}
+
+// A perc blip on a track with a VST3 instrument: a short note at the
+// track's hit frequency (settings[0].freq; C2 if it isn't set, where GM
+// drum maps put the kick), sent with the track's tuning mode like any note.
+void AudioEngine::percNoteOn(int t, uint32_t id, float gain, uint32_t offset) {
+    if (t < 0 || t >= MAX_TRACKS || !plugins[t].instrument) return;
+    vst3::Plugin& inst = *plugins[t].instrument;
+    float freq = profiles[t].settings[0].freq;
+    if (!(freq > 0.0f)) freq = 65.406f;
+    // A blip still sounding is ended first, so its note-off can't cut the new one
+    for (PercOff& o : percOffs)
+        if (o.active && o.track == t && o.id == id) { inst.noteOff((int)offset, id); o.active = false; }
+    inst.noteOn((int)offset, id, freq, std::clamp(gain * (100.0f / 127.0f), 0.0f, 1.0f));
+    uint64_t due = sampleCounter + (uint64_t)std::max(1.0f, PERC_GATE * sampleRate);
+    for (PercOff& o : percOffs) {
+        if (o.active) continue;
+        o = {true, t, id, due};
+        return;
+    }
+    inst.noteOff((int)offset, id);   // no room to wait: end it straight away
+}
+
+// Ends the perc notes due by the start of this segment, and shortens the
+// segment to end where the next one is due.
+uint32_t AudioEngine::firePercOffs(uint32_t pos, uint32_t len) {
+    for (PercOff& o : percOffs) {
+        if (!o.active) continue;
+        if (o.due <= sampleCounter) {
+            if (plugins[o.track].instrument) plugins[o.track].instrument->noteOff((int)pos, o.id);
+            o.active = false;
+        } else if (o.due - sampleCounter < len) {
+            len = (uint32_t)(o.due - sampleCounter);
+        }
+    }
+    return len;
+}
+
+// Sends every automation lane's value to its plugin over the segment, one
+// point every AUTO_STEP frames (plugins smooth between them), whenever it
+// has changed.
+void AudioEngine::applyAutomation(uint32_t pos, uint32_t len, double samplesPerBeat) {
+    constexpr uint32_t AUTO_STEP = 64;
+    std::unique_lock<std::mutex> lock(g_automationMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    for (int t = 0; t < MAX_TRACKS && t < (int)g_automation.size(); t++) {
+        for (AutoLane& lane : g_automation[t]) {
+            if (lane.points.empty() || lane.held) continue;
+            vst3::Plugin* p = plugin(t, lane.plugin);
+            if (!p) continue;
+            for (uint32_t i = 0; i < len; i += AUTO_STEP) {
+                double beat = double(sampleCounter + i) / samplesPerBeat;
+                float v = lane.valueAt(beat);
+                if (lane.sentEpoch == autoEpoch && std::abs(v - lane.lastSent) < 1e-5f) continue;
+                p->setParameter((int)(pos + i), lane.param, v);
+                lane.lastSent = v;
+                lane.sentEpoch = autoEpoch;
+            }
+        }
+    }
+}
+
+void AudioEngine::processPlugins(uint32_t n, uint64_t blockStart, double samplesPerBeat) {
+    vst3::Transport tr;
+    tr.playing = isPlaying;
+    tr.tempo = tempoBPM;
+    tr.samplePos = (int64_t)blockStart;
+    tr.beat = (double)blockStart / samplesPerBeat;
+    float* inL = fxScratch.data();
+    float* inR = inL + MAX_BLOCK;
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        TrackPlugins& tp = plugins[t];
+        if (tp.instrument) tp.instrument->process(nullptr, nullptr, busL(t), busR(t), (int)n, tr);
+        for (auto& fx : tp.effects) {
+            std::copy_n(busL(t), n, inL);
+            std::copy_n(busR(t), n, inR);
+            std::fill_n(busL(t), n, 0.0f);
+            std::fill_n(busR(t), n, 0.0f);
+            fx->process(inL, inR, busL(t), busR(t), (int)n, tr);
+        }
+    }
+}
+
+// ======================================================
+// =================== VST3 PLUGINS ======================
+// ======================================================
+
+bool AudioEngine::setInstrument(int track, const std::string& name, std::string& status) {
+    if (track < 0 || track >= MAX_TRACKS) return false;
+    std::unique_ptr<vst3::Plugin> plugin;
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        auto& cur = plugins[track].instrument;
+        if (name.empty() ? !cur : (cur && cur->query() == name)) return true;   // nothing to do
+    }
+    if (!name.empty()) {
+        std::string error;
+        plugin = vst3::Plugin::load(name, true, sampleRate, (int)MAX_BLOCK, error);
+        if (!plugin) { status = error; return false; }
+        plugin->setTuning(plugins[track].tuning);
+        status = "Track " + std::to_string(track + 1) + ": " + plugin->name();
+    }
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        std::swap(plugins[track].instrument, plugin);
+    }
+    return true;   // the old one (if any) goes here, outside the lock
+}
+
+bool AudioEngine::setEffects(int track, const std::vector<std::string>& names, std::string& status) {
+    if (track < 0 || track >= MAX_TRACKS) return false;
+    std::vector<std::unique_ptr<vst3::Plugin>> old;
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        old = std::move(plugins[track].effects);
+        plugins[track].effects.clear();
+    }
+    std::vector<std::unique_ptr<vst3::Plugin>> chain;
+    bool ok = true;
+    for (const std::string& name : names) {
+        auto same = std::find_if(old.begin(), old.end(),
+                                 [&](const auto& p) { return p && p->query() == name; });
+        if (same != old.end()) { chain.push_back(std::move(*same)); continue; }
+        std::string error;
+        auto p = vst3::Plugin::load(name, false, sampleRate, (int)MAX_BLOCK, error);
+        if (p) chain.push_back(std::move(p));
+        else { status = error; ok = false; }
+    }
+    if (ok) status = "Track " + std::to_string(track + 1) + ": " + std::to_string(chain.size()) + " effect(s)";
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        plugins[track].effects = std::move(chain);
+    }
+    return ok;   // effects no longer in the chain are freed here
+}
+
+void AudioEngine::clearPlugins(int track) {
+    if (track < 0 || track >= MAX_TRACKS) return;
+    TrackPlugins gone;
+    {
+        std::lock_guard<std::mutex> lock(processMutex);
+        std::swap(gone.instrument, plugins[track].instrument);
+        std::swap(gone.effects, plugins[track].effects);
+        plugins[track].tuning = vst3::TuningMode::PerNote;
+    }
+}
+
+void AudioEngine::swapTrackPlugins(int a, int b) {
+    if (a == b || a < 0 || b < 0 || a >= MAX_TRACKS || b >= MAX_TRACKS) return;
+    std::lock_guard<std::mutex> lock(processMutex);
+    std::swap(plugins[a], plugins[b]);
+}
+
+void AudioEngine::setTuning(int track, vst3::TuningMode m) {
+    if (track < 0 || track >= MAX_TRACKS) return;
+    std::lock_guard<std::mutex> lock(processMutex);
+    plugins[track].tuning = m;
+    if (plugins[track].instrument) plugins[track].instrument->setTuning(m);
+}
+
+vst3::Plugin* AudioEngine::instrument(int track) {
+    return track >= 0 && track < MAX_TRACKS ? plugins[track].instrument.get() : nullptr;
+}
+
+vst3::Plugin* AudioEngine::plugin(int track, int which) {
+    if (track < 0 || track >= MAX_TRACKS) return nullptr;
+    TrackPlugins& tp = plugins[track];
+    if (which == AUTO_INSTRUMENT) return tp.instrument.get();
+    return which >= 1 && which <= (int)tp.effects.size() ? tp.effects[which - 1].get() : nullptr;
+}
+
+void AudioEngine::syncPluginControllers() {
+    for (TrackPlugins& tp : plugins) {
+        if (tp.instrument) tp.instrument->syncController();
+        for (auto& fx : tp.effects) fx->syncController();
+    }
+}
+
+std::vector<vst3::Plugin*> AudioEngine::effects(int track) {
+    std::vector<vst3::Plugin*> out;
+    if (track >= 0 && track < MAX_TRACKS)
+        for (auto& p : plugins[track].effects) out.push_back(p.get());
+    return out;
+}
+
+bool AudioEngine::loadPluginState(vst3::Plugin* p, const std::vector<uint8_t>& state) {
+    if (!p || state.empty()) return false;
+    std::lock_guard<std::mutex> lock(processMutex);
+    return p->loadState(state);
+}
 
 // ======================================================
 // ====================== EXPORT WAV =====================
@@ -720,6 +1062,14 @@ bool AudioEngine::exportWav(const char* path, EventTree* events, float startBeat
     std::lock_guard<std::mutex> lock(processMutex);
     bool wasRecording = recRequested;
     recRequested = false;
+    exporting = true;
+    auto eachPlugin = [this](auto fn) {
+        for (TrackPlugins& tp : plugins) {
+            if (tp.instrument) fn(*tp.instrument);
+            for (auto& fx : tp.effects) fn(*fx);
+        }
+    };
+    eachPlugin([](vst3::Plugin& p) { p.setOffline(true); });
 
     setEvents(events);
     resetSampleCounter(startBeat, -1.0f);   // no loop
@@ -750,6 +1100,8 @@ bool AudioEngine::exportWav(const char* path, EventTree* events, float startBeat
     }
     if (!stopped) setPlayState(false);
     recRequested = wasRecording;
+    exporting = false;
+    eachPlugin([](vst3::Plugin& p) { p.setOffline(false); });
 
     sf_close(snd);
     return true;

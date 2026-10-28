@@ -15,6 +15,7 @@
 #include <mutex>
 #include <memory>
 #include <iostream>
+#include <chrono>
 #include <sndfile.h>
 #include <fftw3.h>
 #include "parser.hpp"
@@ -39,6 +40,12 @@ float ref = 440.0f;
 
 enum class TrackType : int32_t { Standard = 0, Audio = 1, Perc = 2 };
 
+// What automation mode shows for a track (Track::autoPlugin): nothing, the
+// velocity of its notes / blips, or a parameter of one of its plugins
+// (AUTO_INSTRUMENT or the k-th effect, see AutoLane).
+constexpr int AUTO_NONE     = -2;
+constexpr int AUTO_VELOCITY = -1;
+
 struct Track {
     std::string name;
     TrackType   type  = TrackType::Standard;
@@ -49,7 +56,122 @@ struct Track {
     float       gainDb = 0.0f;   // sent to the Pd patch as [r $0-gain]; PdHost::MIN_DB = silent
     std::string pdPatch;         // resolved against PdHost::patchDir; "" = no patch
     Profile     profile;         // built-in synth settings (perc tracks use freq/hold)
+
+    // VST3 plugins (the loaded instances live in AudioEngine)
+    std::string vstInstrument;   // name or path; "" = none
+    std::string vstEffects;      // comma-separated names, in processing order
+    int         tuning = 0;      // vst3::TuningMode used for the instrument
+    // Plugin settings: filled in just before saving and read from files,
+    // applied (and cleared) when the plugins are loaded
+    std::vector<uint8_t> instrumentState;
+    std::vector<std::vector<uint8_t>> effectStates;
+
+    // Lane shown in automation mode, picked with the button on the track's row
+    int         autoPlugin = AUTO_VELOCITY;
+    uint32_t    autoParam  = 0;
+    std::string autoName;        // e.g. "Vital: Filter 1 Cutoff"
 };
+
+// Name of the lane automation mode shows for a track
+static std::string autoTargetName(const Track& t) {
+    if (t.autoPlugin == AUTO_VELOCITY && t.type != TrackType::Audio) return "Velocity";
+    if (t.autoPlugin >= 0) return t.autoName.empty() ? "Parameter " + std::to_string(t.autoParam) : t.autoName;
+    return "(none)";
+}
+
+// Velocity (0-1, i.e. MIDI velocity / 127) <-> the gain notes and blips
+// keep (Event::gainDb). Velocity 100 is 0 dB, so files from before velocity
+// play as they did.
+static float gainDbToVelocity(float db) {
+    return std::clamp(PdHost::dbToGain(db) * (100.0f / 127.0f), 0.0f, 1.0f);
+}
+static float velocityToGainDb(float v) {
+    if (v <= 0.0f) return PdHost::MIN_DB;
+    return std::max(PdHost::MIN_DB, 20.0f * std::log10(v * (127.0f / 100.0f)));
+}
+
+// ---- Automation points (hold g_automationMutex while changing them) ----
+
+// Puts a point at `beat`, replacing one already there. Returns its index.
+static size_t putAutoPoint(std::vector<AutoPoint>& pts, float beat, float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    auto it = std::lower_bound(pts.begin(), pts.end(), beat,
+                               [](const AutoPoint& p, float b) { return p.beat < b; });
+    if (it != pts.end() && std::abs(it->beat - beat) < 1e-6f) it->value = value;
+    else it = pts.insert(it, {beat, value});
+    return (size_t)(it - pts.begin());
+}
+
+// Removes the points strictly between beats a and b (either order)
+static void eraseAutoPoints(std::vector<AutoPoint>& pts, float a, float b) {
+    float lo = std::min(a, b), hi = std::max(a, b);
+    pts.erase(std::remove_if(pts.begin(), pts.end(),
+                             [&](const AutoPoint& p) { return p.beat > lo + 1e-6f && p.beat < hi - 1e-6f; }),
+              pts.end());
+}
+
+// Drops the points strictly between beats a and b that the line between
+// their neighbours already passes within `tol` of, so a drawn or recorded
+// stretch keeps its shape with far fewer points.
+static void simplifyAutoPoints(std::vector<AutoPoint>& pts, float a, float b, float tol) {
+    float lo = std::min(a, b), hi = std::max(a, b);
+    std::vector<AutoPoint> out;
+    size_t kept = SIZE_MAX;   // index in pts of the last point kept
+    for (size_t i = 0; i < pts.size(); i++) {
+        bool inside = pts[i].beat > lo + 1e-6f && pts[i].beat < hi - 1e-6f;
+        if (inside && kept != SIZE_MAX && i + 1 < pts.size()) {
+            // Could everything since the last kept point be a straight line to the next one?
+            const AutoPoint& k = pts[kept];
+            const AutoPoint& n = pts[i + 1];
+            float span = n.beat - k.beat;
+            bool fits = true;
+            for (size_t j = kept + 1; j <= i && fits; j++) {
+                float lerp = span > 1e-9f ? k.value + (n.value - k.value) * (pts[j].beat - k.beat) / span : n.value;
+                fits = std::abs(lerp - pts[j].value) < tol;
+            }
+            if (fits) continue;
+        }
+        out.push_back(pts[i]);
+        kept = i;
+    }
+    pts = std::move(out);
+}
+
+static AutoLane* findAutoLane(int t, int plugin, uint32_t param) {
+    if (t < 0 || t >= (int)g_automation.size()) return nullptr;
+    for (AutoLane& l : g_automation[t])
+        if (l.plugin == plugin && l.param == param) return &l;
+    return nullptr;
+}
+
+// The lane for a parameter, added if it doesn't exist yet. Adding one can
+// move the others, so don't keep pointers to lanes across calls.
+static AutoLane* ensureAutoLane(int t, int plugin, uint32_t param, const std::string& name) {
+    if (t < 0 || t >= (int)g_automation.size()) return nullptr;
+    if (AutoLane* l = findAutoLane(t, plugin, param)) {
+        if (l->name.empty()) l->name = name;
+        return l;
+    }
+    std::lock_guard<std::mutex> lock(g_automationMutex);
+    AutoLane lane;
+    lane.plugin = plugin;
+    lane.param = param;
+    lane.name = name;
+    g_automation[t].push_back(std::move(lane));
+    return &g_automation[t].back();
+}
+
+// The names in a comma-separated list, trimmed, without empty ones
+static std::vector<std::string> splitNames(const std::string& list) {
+    std::vector<std::string> out;
+    std::stringstream ss(list);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t a = item.find_first_not_of(" \t"), b = item.find_last_not_of(" \t");
+        if (a != std::string::npos) out.push_back(item.substr(a, b - a + 1));
+    }
+    return out;
+}
 
 // Every track, in panel order. Notes and perc blips refer to their track by
 // index (Event::profile), which is also the track's Pd slot.
@@ -1143,7 +1265,8 @@ bool save_song(const std::string& path,
                EventTree& beatEvents,
                EventTree& timeEvents,
                const std::vector<Track>& tracks,
-               const std::vector<std::vector<Clip>>& clips)
+               const std::vector<std::vector<Clip>>& clips,
+               const std::vector<std::vector<AutoLane>>& automation)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -1287,6 +1410,60 @@ bool save_song(const std::string& path,
         }
     }
 
+    // VST3 plugins per track: names, tuning mode and settings
+    auto putBytes = [&f](const void* data, uint32_t len) {
+        f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        f.write(reinterpret_cast<const char*>(data), len);
+    };
+    f.write("VST3", 4);
+    for (const Track& tr : tracks) {
+        putBytes(tr.vstInstrument.data(), (uint32_t)tr.vstInstrument.size());
+        putBytes(tr.vstEffects.data(), (uint32_t)tr.vstEffects.size());
+        int32_t tuning = tr.tuning;
+        f.write(reinterpret_cast<const char*>(&tuning), sizeof(tuning));
+        putBytes(tr.instrumentState.data(), (uint32_t)tr.instrumentState.size());
+        uint32_t nfx = (uint32_t)tr.effectStates.size();
+        f.write(reinterpret_cast<const char*>(&nfx), sizeof(nfx));
+        for (const auto& st : tr.effectStates) putBytes(st.data(), (uint32_t)st.size());
+    }
+
+    // Reference frequency (the 1/1), in Hz
+    f.write("REFF", 4);
+    f.write(reinterpret_cast<const char*>(&ref), sizeof(float));
+
+    // Gain of each beat event in dB (only notes use it), in the order the
+    // beat events were written above
+    f.write("NGDB", 4);
+    f.write(reinterpret_cast<const char*>(&eventCount), sizeof(eventCount));
+    for (current = beatEvents.get_first(); current; current = next(current))
+      f.write(reinterpret_cast<const char*>(&current->gainDb), sizeof(float));
+
+    // Automation per track: the lane automation mode shows, then every lane
+    // with its points
+    f.write("AUTO", 4);
+    for (size_t i = 0; i < tracks.size(); i++) {
+        const Track& tr = tracks[i];
+        int32_t sel = tr.autoPlugin;
+        f.write(reinterpret_cast<const char*>(&sel), sizeof(sel));
+        f.write(reinterpret_cast<const char*>(&tr.autoParam), sizeof(tr.autoParam));
+        putBytes(tr.autoName.data(), (uint32_t)tr.autoName.size());
+        uint32_t lanes = i < automation.size() ? (uint32_t)automation[i].size() : 0;
+        f.write(reinterpret_cast<const char*>(&lanes), sizeof(lanes));
+        for (uint32_t k = 0; k < lanes; k++) {
+            const AutoLane& lane = automation[i][k];
+            int32_t plugin = lane.plugin;
+            f.write(reinterpret_cast<const char*>(&plugin), sizeof(plugin));
+            f.write(reinterpret_cast<const char*>(&lane.param), sizeof(lane.param));
+            putBytes(lane.name.data(), (uint32_t)lane.name.size());
+            uint32_t n = (uint32_t)lane.points.size();
+            f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            for (const AutoPoint& pt : lane.points) {
+                f.write(reinterpret_cast<const char*>(&pt.beat), sizeof(float));
+                f.write(reinterpret_cast<const char*>(&pt.value), sizeof(float));
+            }
+        }
+    }
+
     f.close();
     return true;
 }
@@ -1423,6 +1600,7 @@ struct Canvas2D {
     uint32_t nextID = 1;
     float split_start = -1.0f;
     int heldProfile = -1;   // track of a note picked up with f / l, -1 = none
+    float heldGainDb = 0.0f; // and its gain
 
     std::vector<Event*> currentEvsAtCursor;
 
@@ -1440,6 +1618,130 @@ struct Canvas2D {
     Event* select1closest = nullptr;
     Event* select2closest = nullptr;
     bool selectFirst = true;
+    char compareText[64];
+
+    // '-': the focus harmonics go down from the focus (8/9, 4/5, ...)
+    // instead of up (9/8, 5/4, ...)
+    bool inverseHarmony = false;
+
+    // Notes copied with c, pasted at the cursor with v. Kept by value, so
+    // they survive the originals being edited or deleted.
+    struct CopiedNote {
+      float offset;   // beats after the earliest copied note
+      float length;   // beats
+      Ratio ratio;
+      int profile;
+      float gainDb;
+    };
+    std::vector<CopiedNote> clipboard;
+
+    // Note gain box (g): the dB value being typed, and the notes it goes to
+    // on Enter. Esc cancels.
+    struct GainEdit {
+      bool active = false;
+      std::string text;
+      std::vector<Event*> targets;   // note starts
+    } gainEdit;
+
+    // The EV_NOTE_END that closes a note start, or nullptr
+    static Event* noteEndOf(Event* start) {
+      Event* e = start ? next(start) : nullptr;
+      while (e && !(e->type == EV_NOTE_END && e->id == start->id)) e = next(e);
+      return e;
+    }
+
+    std::vector<Event*> selectedNotes() {
+      std::vector<Event*> out;
+      for (Event* e = beatEvents.get_first(); e; e = next(e))
+        if (e->type == EV_NOTE_START && e->selected) out.push_back(e);
+      return out;
+    }
+
+    // Deselects every note. Returns true if any was selected.
+    bool clearSelection() {
+      bool any = false;
+      for (Event* e = beatEvents.get_first(); e; e = next(e))
+        if (e->selected) { e->selected = false; any = true; }
+      return any;
+    }
+
+    bool hasEvent(const Event* ev) {
+      for (Event* e = beatEvents.get_first(); e; e = next(e))
+        if (e == ev) return true;
+      return false;
+    }
+
+    void copyNotes(const std::vector<Event*>& starts) {
+      if (starts.empty()) return;
+      clipboard.clear();
+      float first = starts[0]->beat;
+      for (Event* s : starts) first = std::min(first, s->beat);
+      for (Event* s : starts) {
+        Event* end = noteEndOf(s);
+        if (!end) continue;
+        clipboard.push_back({s->beat - first, end->beat - s->beat, s->ratio, s->profile, s->gainDb});
+      }
+    }
+
+    // Puts the clipboard down with its earliest note at `beat`
+    void pasteNotes(float beat) {
+      for (const CopiedNote& n : clipboard) {
+        Event* e1 = new Event(beat + n.offset, EV_NOTE_START, n.ratio);
+        Event* e2 = new Event(beat + n.offset + n.length, EV_NOTE_END);
+        e1->profile = e2->profile = n.profile;
+        e1->gainDb = n.gainDb;
+        if (!spareIDs.empty()) {
+          e1->id = e2->id = spareIDs.back();
+          spareIDs.pop_back();
+        } else {
+          e1->id = e2->id = nextID++;
+        }
+        e1->time = calc_time(&timeEvents, e1->beat);
+        e2->time = calc_time(&timeEvents, e2->beat);
+        beatEvents.insert(e1);
+        beatEvents.insert(e2);
+      }
+      if (!clipboard.empty()) empty = false;
+    }
+
+    void startGainEdit(std::vector<Event*> targets) {
+      if (targets.empty()) return;
+      gainEdit = {true, "", std::move(targets)};
+    }
+
+    void cancelGainEdit() { gainEdit = {}; }
+
+    // A key typed while the gain box is open: digits, '.', '-', '+',
+    // Backspace, and Enter to apply.
+    void gainEditKey(int key) {
+      std::string& t = gainEdit.text;
+      if (key == '\r' || key == '\n') {
+        commitGainEdit();
+      } else if (key == 8 || key == 127) {
+        if (!t.empty()) t.pop_back();
+      } else if (((key >= '0' && key <= '9') || key == '.' || key == '-' || key == '+') && t.size() < 12) {
+        t.push_back((char)key);
+      }
+    }
+
+    void commitGainEdit() {
+      char* end = nullptr;
+      float db = std::strtof(gainEdit.text.c_str(), &end);
+      if (!gainEdit.text.empty() && end && *end == '\0' && std::isfinite(db)) {
+        db = std::clamp(db, PdHost::MIN_DB, 24.0f);
+        for (Event* e : gainEdit.targets)
+          if (hasEvent(e)) e->gainDb = db;   // skip notes deleted meanwhile
+      }
+      gainEdit = {};
+    }
+
+    // Drops every pointer to a note, for when the whole song is replaced
+    void forgetNotes() {
+      select1closest = select2closest = nullptr;
+      selectFirst = true;
+      originEv = nullptr;
+      gainEdit = {};
+    }
 
     Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
 
@@ -2069,6 +2371,357 @@ struct Canvas2D {
         return -1;
     }
 
+    // ---- Automation mode (Tab) ----
+    // The notes area becomes an editor for one lane of the current track:
+    // the one picked with the button on its row. For a plugin parameter,
+    // click or drag on empty space to draw the curve, drag a point to move
+    // it and d deletes the point under the cursor. For Velocity, click or
+    // drag across the notes / blips to set theirs.
+    bool autoMode = false;
+    int  lastClick = 0;   // click as of the previous draw, to tell presses from holds
+
+    enum AutoDrag { AUTO_DRAG_NONE, AUTO_DRAG_POINT, AUTO_DRAG_PENCIL, AUTO_DRAG_VELOCITY };
+    struct AutoEdit {
+      AutoDrag mode = AUTO_DRAG_NONE;
+      int      track = -1, plugin = 0;
+      uint32_t param = 0;
+      size_t   point = 0;               // point being dragged (velocity: the hit's id)
+      float    lo = 0, hi = 0, last = 0; // pencil: beats the stroke has covered, and where it is
+      float    lastX = 0;               // velocity: cursor x on the previous draw
+    } autoEdit;
+
+    // Parameter picker, opened by the button on the track's row. Typing filters it.
+    struct PickerEntry { int plugin; uint32_t param; std::string name; };
+    struct Picker {
+      bool open = false;
+      int track = -1;
+      std::string filter;
+      float scroll = 0.0f;
+      std::vector<PickerEntry> entries;
+    } picker;
+
+    void openPicker(int t) {
+      picker = {};
+      if (t < 0 || t >= (int)g_tracks.size()) return;
+      picker.open = true;
+      picker.track = t;
+      if (g_tracks[t].type != TrackType::Audio)
+        picker.entries.push_back({AUTO_VELOCITY, 0, "Velocity"});
+      if (!engine) return;
+      for (int k = 0;; k++) {
+        vst3::Plugin* p = engine->plugin(t, k);
+        if (!p) { if (k == AUTO_INSTRUMENT) continue; break; }
+        for (const vst3::ParamInfo& pi : p->parameters())
+          picker.entries.push_back({k, pi.id, p->name() + ": " + pi.name});
+      }
+    }
+
+    std::vector<const PickerEntry*> pickerMatches() const {
+      auto lower = [](std::string s) { for (char& c : s) c = (char)std::tolower((unsigned char)c); return s; };
+      std::string f = lower(picker.filter);
+      std::vector<const PickerEntry*> out;
+      for (const PickerEntry& e : picker.entries)
+        if (f.empty() || lower(e.name).find(f) != std::string::npos) out.push_back(&e);
+      return out;
+    }
+
+    void choosePickerEntry(const PickerEntry& e) {
+      int t = picker.track;
+      if (t >= 0 && t < (int)g_tracks.size()) {
+        Track& tr = g_tracks[t];
+        tr.autoPlugin = e.plugin;
+        tr.autoParam = e.param;
+        tr.autoName = e.name;
+        if (e.plugin >= 0) ensureAutoLane(t, e.plugin, e.param, e.name);
+      }
+      picker = {};
+    }
+
+    // A key typed while the picker is open: filters it; Enter picks the first match
+    void pickerKey(int key) {
+      std::string& f = picker.filter;
+      if (key == '\r' || key == '\n') {
+        auto m = pickerMatches();
+        if (!m.empty()) { PickerEntry e = *m[0]; choosePickerEntry(e); }
+      } else if (key == 8 || key == 127) {
+        if (!f.empty()) f.pop_back();
+        picker.scroll = 0;
+      } else if (key >= 32 && key <= 126 && f.size() < 40) {
+        f.push_back((char)key);
+        picker.scroll = 0;
+      }
+    }
+
+    // Beats <-> screen x in the notes area
+    float xOfBeat(Vec2 topLeft, float beat) { return worldToScreen(topLeft, {calc_time(&timeEvents, beat), 0.0f}).x; }
+    float beatAtX(Vec2 topLeft, float x) {
+      return std::max(0.0f, calc_beat(&timeEvents, screenToWorld(topLeft, {x, 0.0f}).x));
+    }
+
+    void drawAutomation(VulkanRenderer& r, Vec2 topLeft, Vec2 bottomRight, Vec2 hover, bool hovered,
+                        int click, const std::vector<char>& keys, int wheel) {
+      const float x1 = topLeft.x, x2 = bottomRight.x, yb = bottomRight.y, yt = topLeft.y;
+      const float ay0 = yb + 12, ay1 = yt - 30;   // value 0 and 1
+      const bool pressed = click == 1 && lastClick != 1, held = click == 1;
+      auto rect = [&](float x, float y, float w, float h, ui::Color c) {
+        float l = std::max(x, x1), rr = std::min(x + w, x2);
+        float bt = std::max(y, yb), tp = std::min(y + h, yt);
+        if (rr > l && tp > bt) r.addRect(l, bt, rr - l, tp - bt, c.r, c.g, c.b);
+      };
+      auto yOf = [&](float v) { return ay0 + std::clamp(v, 0.0f, 1.0f) * (ay1 - ay0); };
+      auto valueAtY = [&](float y) { return std::clamp((y - ay0) / (ay1 - ay0), 0.0f, 1.0f); };
+      auto text = [&](std::string s, float x, float y, float size, glm::vec4 c) {
+        laneLabels.push_back(std::move(s));
+        r.addText(laneLabels.back().c_str(), x, y, size, c);
+      };
+      const glm::vec4 dim(0.6f, 0.6f, 0.6f, 1.0f), bright(0.95f, 0.95f, 0.95f, 1.0f);
+
+      // Background, value grid, beat lines, loop end and playhead
+      rect(x1, yb, x2 - x1, yt - yb, {0.05f, 0.05f, 0.06f});
+      for (int k = 0; k <= 4; k++) {
+        float y = ay0 + k * (ay1 - ay0) / 4;
+        rect(x1, y, x2 - x1, 1, (k == 0 || k == 4) ? ui::Color{0.25f, 0.25f, 0.28f} : ui::Color{0.13f, 0.13f, 0.15f});
+      }
+      float t0 = std::max(0.0f, screenToWorld(topLeft, {x1, 0.0f}).x);
+      float t1 = screenToWorld(topLeft, {x2, 0.0f}).x;
+      if (t1 > t0) {
+        int b0 = (int)std::floor(calc_beat(&timeEvents, t0)), b1 = (int)std::ceil(calc_beat(&timeEvents, t1));
+        for (int i = std::max(b0, 0); i <= b1 && i - b0 < 2000; i++)
+          rect(xOfBeat(topLeft, (float)i), ay0, 1, ay1 - ay0, i % 4 == 0 ? ui::Color{0.30f, 0.30f, 0.38f} : ui::Color{0.18f, 0.18f, 0.22f});
+      }
+      rect(worldToScreen(topLeft, {loop_end, 0.0f}).x, yb, 1, yt - yb, {0.235f, 0.235f, 0.235f});
+      rect(worldToScreen(topLeft, {playhead_time, 0.0f}).x, yb, 1, yt - yb, {0.784f, 0.08f, 0.08f});
+
+      if (picker.open) {
+        drawPicker(r, x1, x2, yb, yt, hover, hovered, pressed, wheel);
+        return;
+      }
+
+      const int t = g_currentTrack;
+      if (t < 0 || t >= (int)g_tracks.size()) return;
+      Track& tr = g_tracks[t];
+      const ui::Color tc = tr.color;
+      std::string title = "Automation  |  " + tr.name + ": " + autoTargetName(tr);
+      if (autoEdit.track != t) autoEdit = {};
+
+      // ---- Velocity: one stem per note / blip of the track ----
+      if (tr.autoPlugin == AUTO_VELOCITY && tr.type != TrackType::Audio) {
+        text(title + "    drag a note: set its velocity  |  drag between notes: paint across them  |  Tab: back to notes", x1 + 6, yt - 18, 13.0f, bright);
+        int type = tr.type == TrackType::Perc ? EV_PERC : EV_NOTE_START;
+        std::vector<Event*> hits;
+        for (Event* e = beatEvents.get_first(); e; e = next(e))
+          if (e->type == type && e->profile == t) hits.push_back(e);
+
+        struct Stem { Event* e; float x; };
+        std::vector<Stem> stems;
+        for (Event* e : hits) stems.push_back({e, worldToScreen(topLeft, {e->time, 0.0f}).x});
+
+        // The one hit under the cursor: of the stems near it, the one whose
+        // head is closest. Notes at the same time stack up on one stem, and
+        // only this one is highlighted and moved.
+        Event* nearest = nullptr;
+        float best = 1e9f;
+        for (const Stem& st : stems) {
+          if (!hovered || std::abs(st.x - hover.x) > 5.0f) continue;
+          float d = std::hypot(st.x - hover.x, yOf(gainDbToVelocity(st.e->gainDb)) - hover.y);
+          if (d < best) { best = d; nearest = st.e; }
+        }
+        const bool onHead = nearest != nullptr;
+
+        // A press on a stem drags just that one hit up and down; a press
+        // away from every stem paints the stems the cursor passes over
+        if (hovered && pressed) {
+          autoEdit = {onHead ? AUTO_DRAG_POINT : AUTO_DRAG_VELOCITY, t};
+          autoEdit.point = onHead ? nearest->id : 0;
+        }
+        if (autoEdit.mode == AUTO_DRAG_POINT) {
+          if (!held) autoEdit = {};
+          else
+            for (const Stem& st : stems)
+              if (st.e->id == autoEdit.point) { st.e->gainDb = velocityToGainDb(valueAtY(hover.y)); nearest = st.e; }
+        } else if (autoEdit.mode == AUTO_DRAG_VELOCITY) {
+          if (!held) {
+            autoEdit = {};
+          } else if (hovered) {
+            float from = pressed ? hover.x : autoEdit.lastX;
+            float lo = std::min(from, hover.x) - 3, hi = std::max(from, hover.x) + 3;
+            float db = velocityToGainDb(valueAtY(hover.y));
+            for (const Stem& st : stems)
+              if (st.x >= lo && st.x <= hi) st.e->gainDb = db;
+          }
+          autoEdit.lastX = hover.x;
+        }
+
+        // The selected hit last, so it's drawn over the others on its stem
+        std::stable_partition(stems.begin(), stems.end(), [&](const Stem& st) { return st.e != nearest; });
+        for (const Stem& st : stems) {
+          if (st.x < x1 - 4 || st.x > x2 + 4) continue;
+          float y = yOf(gainDbToVelocity(st.e->gainDb));
+          ui::Color c = st.e == nearest ? ui::Color{0.95f, 0.95f, 0.95f} : tc;
+          rect(st.x - 1, ay0, 2, y - ay0, {c.r * 0.7f, c.g * 0.7f, c.b * 0.7f});
+          if (st.x >= x1 && st.x <= x2) r.addCircle(st.x, y, st.e == nearest ? 5.0f : 4.0f, c.r, c.g, c.b);
+        }
+        if (nearest) {
+          char buf[48];
+          std::snprintf(buf, sizeof buf, "vel %d (%+.1f dB)",
+                        (int)std::lround(gainDbToVelocity(nearest->gainDb) * 127), nearest->gainDb);
+          float x = 0;
+          for (const Stem& st : stems) if (st.e == nearest) x = st.x;
+          text(buf, std::clamp(x + 8, x1 + 4, x2 - 120), std::min(yOf(gainDbToVelocity(nearest->gainDb)) + 8, yt - 34), 12.0f, bright);
+        }
+        if (hits.empty())
+          text(std::string("No ") + (type == EV_PERC ? "blips" : "notes") + " on this track yet", x1 + 6, yt - 36, 13.0f, dim);
+        return;
+      }
+
+      // ---- A plugin parameter ----
+      if (tr.autoPlugin < 0) {
+        text(title + "    pick a parameter with the Auto button on the track  |  Tab: back to notes", x1 + 6, yt - 18, 13.0f, bright);
+        return;
+      }
+      vst3::Plugin* plug = engine ? engine->plugin(t, tr.autoPlugin) : nullptr;
+      text(title + (plug ? "" : " (plugin not loaded)") +
+           "    click / drag: draw  |  drag a point: move  |  d: delete point  |  Tab: back to notes",
+           x1 + 6, yt - 18, 13.0f, bright);
+      AutoLane* lane = ensureAutoLane(t, tr.autoPlugin, tr.autoParam, tr.autoName);
+      if (!lane) return;
+      std::vector<AutoPoint>& pts = lane->points;
+      if (autoEdit.mode != AUTO_DRAG_NONE && (autoEdit.plugin != tr.autoPlugin || autoEdit.param != tr.autoParam))
+        autoEdit = {};
+
+      // Point under the cursor
+      int hoverPt = -1;
+      float best = 7.0f;
+      for (size_t i = 0; hovered && i < pts.size(); i++) {
+        float d = std::hypot(xOfBeat(topLeft, pts[i].beat) - hover.x, yOf(pts[i].value) - hover.y);
+        if (d < best) { best = d; hoverPt = (int)i; }
+      }
+      if (hoverPt >= 0 && autoEdit.mode == AUTO_DRAG_NONE && containsKey(keys, 'd')) {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        pts.erase(pts.begin() + hoverPt);
+        hoverPt = -1;
+      }
+
+      if (hovered && pressed) {
+        float b = beatAtX(topLeft, hover.x), v = valueAtY(hover.y);
+        if (hoverPt >= 0) {
+          autoEdit = {AUTO_DRAG_POINT, t, tr.autoPlugin, tr.autoParam, (size_t)hoverPt};
+        } else {
+          std::lock_guard<std::mutex> lock(g_automationMutex);
+          putAutoPoint(pts, b, v);
+          autoEdit = {AUTO_DRAG_PENCIL, t, tr.autoPlugin, tr.autoParam, 0, b, b, b};
+        }
+      } else if (autoEdit.mode == AUTO_DRAG_POINT) {
+        if (!held) {
+          autoEdit = {};
+        } else if (hovered && autoEdit.point < pts.size()) {
+          // Moves between its neighbours, so the order (and its index) stays
+          size_t i = autoEdit.point;
+          float lo = i > 0 ? pts[i - 1].beat : 0.0f;
+          float hi = i + 1 < pts.size() ? pts[i + 1].beat : 1e9f;
+          std::lock_guard<std::mutex> lock(g_automationMutex);
+          pts[i].beat = std::clamp(beatAtX(topLeft, hover.x), lo, hi);
+          pts[i].value = valueAtY(hover.y);
+          hoverPt = (int)i;
+        }
+      } else if (autoEdit.mode == AUTO_DRAG_PENCIL) {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        if (!held) {
+          simplifyAutoPoints(pts, autoEdit.lo, autoEdit.hi, 0.01f);
+          autoEdit = {};
+        } else if (hovered) {
+          // The stroke replaces whatever it passes over
+          float b = beatAtX(topLeft, hover.x);
+          eraseAutoPoints(pts, autoEdit.last, b);
+          putAutoPoint(pts, b, valueAtY(hover.y));
+          autoEdit.last = b;
+          autoEdit.lo = std::min(autoEdit.lo, b);
+          autoEdit.hi = std::max(autoEdit.hi, b);
+        }
+      }
+
+      // The curve, one screen column at a time; level before the first point
+      // and after the last, as it plays. With no points, a dashed line at the
+      // parameter's current value.
+      ui::Color lc = {tc.r * 0.9f, tc.g * 0.9f, tc.b * 0.9f};
+      if (!pts.empty()) {
+        float prevY = yOf(lane->valueAt(beatAtX(topLeft, x1)));
+        for (float px = x1; px < x2; px += 1.0f) {
+          float y = yOf(lane->valueAt(beatAtX(topLeft, px)));
+          float lo = std::min(prevY, y), hi = std::max(prevY, y);
+          rect(px, lo - 1, 1, hi - lo + 2, lc);
+          prevY = y;
+        }
+        if (lane->held) text("Recording...", x1 + 6, yt - 36, 13.0f, glm::vec4(1.0f, 0.5f, 0.5f, 1.0f));
+      } else {
+        float y = yOf(plug ? (float)plug->paramValue(tr.autoParam) : 0.0f);
+        for (float px = x1; px < x2; px += 10.0f) rect(px, y, 5, 1, {0.45f, 0.45f, 0.5f});
+        text("No automation yet: click or drag to draw some, or turn on Rec and move the control in the plugin while playing",
+             x1 + 6, yt - 36, 13.0f, dim);
+      }
+      for (size_t i = 0; i < pts.size(); i++) {
+        float x = xOfBeat(topLeft, pts[i].beat);
+        if (x < x1 || x > x2) continue;
+        bool hot = (int)i == hoverPt;
+        if (hot) r.addCircle(x, yOf(pts[i].value), 5.0f, 0.95f, 0.95f, 0.95f);
+        else     r.addCircle(x, yOf(pts[i].value), 3.0f, tc.r, tc.g, tc.b);
+      }
+
+      // Value under the cursor (or of the point being moved)
+      if (hovered) {
+        float b = hoverPt >= 0 ? pts[hoverPt].beat : beatAtX(topLeft, hover.x);
+        float v = hoverPt >= 0 ? pts[hoverPt].value : valueAtY(hover.y);
+        std::string shown = plug ? plug->paramText(tr.autoParam, v) : "";
+        char buf[48];
+        std::snprintf(buf, sizeof buf, "beat %.2f   %.0f%%", b, v * 100.0f);
+        text(std::string(buf) + (shown.empty() ? "" : "   " + shown),
+             std::clamp(hover.x + 10, x1 + 4, x2 - 220), std::clamp(hover.y + 10, yb + 4, yt - 52), 12.0f, bright);
+      }
+    }
+
+    void drawPicker(VulkanRenderer& r, float x1, float x2, float yb, float yt, Vec2 hover,
+                    bool hovered, bool pressed, int wheel) {
+      const float rowH = 18.0f;
+      const float listTop = yt - 46;
+      auto text = [&](std::string s, float x, float y, float size, glm::vec4 c) {
+        laneLabels.push_back(std::move(s));
+        r.addText(laneLabels.back().c_str(), x, y, size, c);
+      };
+      std::string who = picker.track >= 0 && picker.track < (int)g_tracks.size() ? g_tracks[picker.track].name : "";
+      text("Automate " + who + ":  type to filter  |  click or Enter to pick  |  Esc: cancel", x1 + 6, yt - 18, 13.0f,
+           glm::vec4(0.95f, 0.95f, 0.95f, 1.0f));
+      text("Filter: " + picker.filter + "_", x1 + 6, yt - 38, 14.0f, glm::vec4(0.95f, 0.85f, 0.3f, 1.0f));
+
+      std::vector<const PickerEntry*> m = pickerMatches();
+      float listH = listTop - yb;
+      picker.scroll = std::clamp(picker.scroll - wheel * 2.0f, 0.0f, std::max(0.0f, m.size() * rowH - listH));
+      if (m.empty()) {
+        text(picker.entries.empty() ? "Nothing to automate: this track has no VST3 plugins"
+                                    : "No parameters match", x1 + 6, listTop - 18, 13.0f, glm::vec4(0.6f, 0.6f, 0.6f, 1.0f));
+        return;
+      }
+      int first = (int)(picker.scroll / rowH);
+      for (int i = first; i < (int)m.size(); i++) {
+        float top = listTop - (i * rowH - picker.scroll);
+        float bottom = top - rowH;
+        if (bottom < yb) break;
+        if (top > listTop + 0.5f) continue;
+        bool hot = hovered && hover.y <= top && hover.y > bottom && hover.x >= x1 && hover.x <= x2;
+        if (hot) r.addRect(x1, bottom, x2 - x1, rowH, 0.25f, 0.25f, 0.32f);
+        else if (i % 2) r.addRect(x1, bottom, x2 - x1, rowH, 0.09f, 0.09f, 0.11f);
+        const PickerEntry& e = *m[i];
+        const AutoLane* lane = e.plugin >= 0 ? findAutoLane(picker.track, e.plugin, e.param) : nullptr;
+        bool has = lane && !lane->points.empty();
+        text(e.name + (has ? "   (automated)" : ""), x1 + 10, bottom + 3, 13.0f,
+             has ? glm::vec4(0.6f, 0.9f, 0.6f, 1.0f) : glm::vec4(0.9f, 0.9f, 0.9f, 1.0f));
+        if (hot && pressed) {
+          PickerEntry chosen = e;
+          choosePickerEntry(chosen);
+          return;
+        }
+      }
+    }
+
     void draw(VulkanRenderer& renderer, CurrentBox& nw, Vec2 hover, int click, std::vector<char> keys, char*& jump, char*& split, int dx, int dy) {
         // ---- Layout: notes on top, then the perc strip, then the audio strip ----
         noteWindowH = nw.y2 - nw.y1;
@@ -2100,6 +2753,10 @@ struct Canvas2D {
                     :                            Region::Audio;
         bool inNotes = hoverRegion == Region::Notes;
 
+        // The open parameter picker takes the mouse wheel
+        int pickerWheel = 0;
+        if (autoMode && picker.open && inNotes) { pickerWheel = dy; dy = 0; dx = 0; }
+
         // Mouse wheel over a strip scrolls its lanes rather than the notes
         SubPanel* hoveredPanel = hoverRegion == Region::Perc  ? &perc
                                : hoverRegion == Region::Audio ? &audio : nullptr;
@@ -2130,6 +2787,24 @@ struct Canvas2D {
         }
 
         prevHover = hover;
+
+        if (autoMode) {
+          if (hovered) {
+            if (containsKey(keys, ' ')) play_triggered_from_space = true;
+            if (containsKey(keys, 't')) tuner_triggered = true;
+            if (containsKey(keys, 'p')) playhead_time = calc_time(&timeEvents, beatAtX(topLeft, hover.x));
+            if (containsKey(keys, 'u')) {
+              float x = calc_time(&timeEvents, beatAtX(topLeft, hover.x));
+              loop_end = std::abs(loop_end - x) < 1e-6 ? -1.0f : x;
+            }
+          }
+          drawAutomation(renderer, topLeft, bottomRight, hover, inNotes, click, keys, pickerWheel);
+          drawSubPanels(renderer, perc, audio, nw.x1, nw.x2, topLeft);
+          drawClips(renderer, audio, nw.x1, nw.x2, topLeft, clipSpans(), ClipSpan{}, 0.0f);
+          lastClick = click;
+          return;
+        }
+        lastClick = click;
 
         // Compute visible world rect
         Vec2 wA = screenToWorld(topLeft,      topLeft);
@@ -2229,7 +2904,10 @@ struct Canvas2D {
                 Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, freq_to_octave(ratio_to_freq(noteEv->ratio))});
                 // printf("a: {%f, %f}, b: {%f, %f}\n", a.x, a.y, b.x, b.y);
                 ui::Color nc = trackColor(noteEv->profile);
+                if (noteEv->selected)   // yellow outline behind the note
+                  addCanvasRect(renderer, topLeft, bottomRight, ap.x - 1, ap.y - 3, bp.x - ap.x + 2, 6, 1.0, 1.0, 0.26);
                 addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 2, nc.r, nc.g, nc.b);
+                // (A note's gain / velocity is shown in automation mode, under Velocity)
                 if (std::abs(std::floor(noteEv->beat) - noteEv->beat) < 1e-6) {
                   // Draw rhythm line at note start
                   addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 15, 1, 30, 0.47, 0.47, 0.63);
@@ -2297,19 +2975,24 @@ struct Canvas2D {
               Ratio closest = {999999999,1};
               bool hoveredWithin = unsnappedHoverW.x >= prevEv->time && \
                                unsnappedHoverW.x < currentBeatEv->time;
-              while (ratio_to_octave(current) < top.y) {
+              // Inverse intervals fall from `current`, so go one octave further up
+              while (ratio_to_octave(current) < top.y + (inverseHarmony ? 1.0f : 0.0f)) {
                 uint32_t hRange = std::pow(2, std::atoi(g_settings.harmRange.c_str()));
                 std::vector<uint32_t> altHRange = extractARange(g_settings.altHarmRange.data());
                 float r = 0.73;
                 float g = 0.45882;
                 float b = 0.807;
                 for (uint32_t i = hRange; i < hRange * 2; i++) {
-                  Ratio interval = {i, hRange};
+                  // Up: i/hRange (9/8, 5/4, ...). Inverse: hRange/i (8/9, 4/5, ...)
+                  Ratio interval = inverseHarmony ? Ratio{hRange, i} : Ratio{i, hRange};
                   Ratio currentAdded = multiplyR(current, interval);
-                  if (ratio_to_octave(currentAdded) > top.y)
+                  if (ratio_to_octave(currentAdded) > top.y) {
+                    if (inverseHarmony) continue;   // inverse ones fall as i grows
                     break;
-                  else if (ratio_to_octave(currentAdded) < bottom.y)
+                  } else if (ratio_to_octave(currentAdded) < bottom.y) {
+                    if (inverseHarmony) break;
                     continue;
+                  }
                   Ratio diff = subtractR(currentAdded, prevEv->ratio);
                   if (prevEv->ratio.eval() > currentAdded.eval())
                     diff = subtractR(prevEv->ratio, currentAdded);
@@ -2317,7 +3000,8 @@ struct Canvas2D {
                   if (diff.num != 0) {
                     Vec2 ap = worldToScreen(topLeft, { prevEv->time, ratio_to_octave(currentAdded)});
                     Vec2 bp = worldToScreen(topLeft, { currentBeatEv->time, ratio_to_octave(currentAdded)});
-                    int factor = std::log2(simplifyR(interval).den);
+                    Ratio simpInterval = simplifyR(interval);
+                    int factor = std::log2(inverseHarmony ? simpInterval.num : simpInterval.den);
                     float cr = r * factor;
                     cr = cr - std::floor(cr);
                     float cg = g * factor;
@@ -2346,10 +3030,14 @@ struct Canvas2D {
                         continue;
                       }
                     }
-                    Ratio currentAdded = multiplyR(current, interval);
-                    if (ratio_to_octave(currentAdded) > top.y)
-                      break;
-                    else if (ratio_to_octave(currentAdded) < bottom.y) {
+                    Ratio step = inverseHarmony ? Ratio{interval.den, interval.num} : interval;
+                    Ratio currentAdded = multiplyR(current, step);
+                    if (ratio_to_octave(currentAdded) > top.y) {
+                      if (!inverseHarmony) break;
+                      interval.num++;
+                      continue;
+                    } else if (ratio_to_octave(currentAdded) < bottom.y) {
+                      if (inverseHarmony) break;
                       interval.num++;
                       continue;
                     }
@@ -2415,24 +3103,6 @@ struct Canvas2D {
             }
         }
 
-        if (selectFirst && select1closest && select2closest) {
-          // Draw measurement
-          Ratio rat = simplifyR(divideR(select2closest->ratio, select1closest->ratio));
-          Ratio simpRat = rat;
-          if (simpRat.num > simpRat.den) {
-            while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
-              simpRat.num /= 2;
-            }
-          } else {
-            while (simpRat.den % 2 == 0 && simpRat.den > simpRat.num * 2) {
-              simpRat.den /= 2;
-            }
-          }
-          sprintf(measureText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
-          printf("%s\n", measureText);
-          renderer.addText(measureText, bottomRight.x - 150, bottomRight.y + 3, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-        }
-
         // Key handling (P to change playhead position, L to change note length, D to delete a note, F to change the note's frequency)
         if (hovered) {
             if (containsKey(keys, 't'))
@@ -2448,6 +3118,8 @@ struct Canvas2D {
             }
             if (containsKey(keys, 'h'))
                 snap_foci = !snap_foci;
+            if (containsKey(keys, '-'))
+                inverseHarmony = !inverseHarmony;
             if (containsKey(keys, 's')) {
               // First press marks one end, second press splits the span
               // between the two into `split` equal divisions
@@ -2466,49 +3138,9 @@ struct Canvas2D {
             }
             if (containsKey(keys, ' '))
                 play_triggered_from_space = true;
-            if (containsKey(keys, 'v')) {
-                // Paste notes
-                Event* current = beatEvents.get_first();
-                std::vector<Event*> noteStarts;
-                float firstSelectedTime = -1.0f;
-                while (current) {
-                  if (current->type == EV_NOTE_START) {
-                    if (current->selected) {
-                        printf("new note: %f, %s\n", current->beat, current->string_expr.c_str());
-                      if (std::abs(firstSelectedTime + 1.0f) < 1e-6)
-                        firstSelectedTime = current->beat;
-                      noteStarts.push_back(current);
-                    }
-                  } else if (current->type == EV_NOTE_END) {
-                    for (int i = 0; i < (int)noteStarts.size(); i++) {
-                      if (noteStarts[i]->id == current->id) {
-                        // Process note
-                        Event* e1 = new Event(calc_beat(&timeEvents, hoverW.x) + noteStarts[i]->beat - firstSelectedTime, EV_NOTE_START, noteStarts[i]->ratio);
-                        Event* e2 = new Event(calc_beat(&timeEvents, hoverW.x) + current->beat - firstSelectedTime, EV_NOTE_END);
-                        e1->profile = e2->profile = noteStarts[i]->profile;
-                        if ((int)spareIDs.size() > 0) {
-                          e1->id = spareIDs[(int)spareIDs.size() - 1];
-                          spareIDs.pop_back();
-                          e2->id = e1->id;
-                        } else {
-                          e1->id = nextID;
-                          e2->id = nextID++;
-                        }
-                        beatEvents.insert(e1);
-                        beatEvents.insert(e2);
-                        e1->time = calc_time(&timeEvents, e1->beat);
-                        e2->time = calc_time(&timeEvents, e2->beat);
-                        e1->origin = originEv;
-                        beatEvents.inorder();
-                        beatEvents.ordered = false;
-                        noteStarts.erase(find(noteStarts.begin(), noteStarts.end(), noteStarts[i]));
-                        break;
-                      }
-                    }
-                  }
-                  current = next_note(current);
-                }
-            } if (containsKey(keys, 'r')) {
+            if (containsKey(keys, 'v'))
+                pasteNotes(snappedBeat);
+            if (containsKey(keys, 'r')) {
                 // Remove selected notes
             }
         }
@@ -2579,15 +3211,49 @@ struct Canvas2D {
           }
         }
 
-        if (containsKey(keys, 'e')) {
+        if (containsKey(keys, 'e') && closest) {
           if (selectFirst) {
             select1 = hoverW;
             select1closest = closest;
+            select2closest = nullptr;
           } else {
             select2 = hoverW;
             select2closest = closest;
           }
           selectFirst = !selectFirst;
+        }
+
+        // Interval between the notes picked with e. Between the first and
+        // second press it's measured against the closest note.
+        Event* compareTo = selectFirst ? select2closest : closest;
+        if (select1closest && compareTo) {
+          Ratio rat = simplifyR(divideR(compareTo->ratio, select1closest->ratio));
+          Ratio simpRat = rat;
+          if (simpRat.num > simpRat.den) {
+            while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
+              simpRat.num /= 2;
+            }
+          } else {
+            while (simpRat.den % 2 == 0 && simpRat.den > simpRat.num * 2) {
+              simpRat.den /= 2;
+            }
+          }
+          sprintf(compareText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
+          renderer.addText(compareText, bottomRight.x - 150, bottomRight.y + 21, 15.0f, glm::vec4(1.0f, 1.0f, 0.6f, 1.0f));
+        }
+        if (!selectFirst && select1closest) {   // mark the first note while choosing the second
+          Vec2 p = worldToScreen(topLeft, {select1closest->time, ratio_to_octave(select1closest->ratio)});
+          if (p.x >= topLeft.x && p.x <= bottomRight.x && p.y >= bottomRight.y && p.y <= topLeft.y)
+            renderer.addCircle(p.x, p.y, 4.0f, 1.0f, 1.0f, 0.6f);
+        }
+
+        // c copies the selected notes (or the closest one if none are
+        // selected); g opens the gain box for the same notes
+        if (hovered && (containsKey(keys, 'c') || containsKey(keys, 'g'))) {
+          std::vector<Event*> notes = selectedNotes();
+          if (notes.empty() && closest) notes.push_back(closest);
+          if (containsKey(keys, 'c')) copyNotes(notes);
+          if (containsKey(keys, 'g')) startGainEdit(notes);
         }
 
         // Draw origin line
@@ -2648,7 +3314,7 @@ struct Canvas2D {
                 // Delete the note because it will be replaced
                 beatEvents.inorder();
                 Event* noteEnd = next(closest);
-                while (noteEnd->id != closest->id) {
+                while (noteEnd && closest && noteEnd->id != closest->id) {
                     noteEnd = next(noteEnd);
                 }
                 // Delete any foci that were on this note
@@ -2675,8 +3341,10 @@ struct Canvas2D {
                   current = next_type(current, EV_FOCUS);
                 }
 
-                if (!containsKey(keys, 'd'))
+                if (!containsKey(keys, 'd')) {
                   heldProfile = closest->profile;
+                  heldGainDb = closest->gainDb;
+                }
                 if (containsKey(keys, 'l')) {
                   placing = true;
                   if (std::abs(hoverW.x - closest->time) < std::abs(hoverW.x - noteEnd->time)) {
@@ -2703,6 +3371,12 @@ struct Canvas2D {
                 beatEvents.remove_event(noteEnd);
                 //beatEvents.remove_event(current);
                 beatEvents.inorder();
+                if (containsKey(keys, 'd')) {
+                  forgetEvents({closest, noteEnd});
+                } else {   // f / l put the note back as a new event
+                  if (select1closest == closest) { select1closest = nullptr; selectFirst = true; }
+                  if (select2closest == closest) select2closest = nullptr;
+                }
             }
         }
 
@@ -2934,6 +3608,7 @@ struct Canvas2D {
                   Event* e1 = new Event(currently_dragged.x, EV_NOTE_START, hoverR);
                   Event* e2 = new Event(currently_dragged.y, EV_NOTE_END);
                   e1->profile = e2->profile = noteTrack;
+                  if (heldProfile >= 0) e1->gainDb = heldGainDb;
                   heldProfile = -1;
                   if ((int)spareIDs.size() > 0) {
                     e1->id = spareIDs[(int)spareIDs.size() - 1];
@@ -2979,6 +3654,7 @@ struct Canvas2D {
                         e2 = new Event(snappedBeat, EV_NOTE_END);
                     }
                     e1->profile = e2->profile = noteTrack;
+                    if (heldProfile >= 0) e1->gainDb = heldGainDb;
                     if ((int)spareIDs.size() > 0) {
                         e1->id = spareIDs[(int)spareIDs.size() - 1];
                         spareIDs.pop_back();
@@ -3035,6 +3711,41 @@ struct Canvas2D {
           if (cy > perc.bottom && cy < perc.top && cx >= nw.x1 && cx <= nw.x2)
             renderer.addCircle(cx, cy, 4.0f, 0.8f, 0.2f, 0.2f);
         }
+
+        if (inverseHarmony)
+          renderer.addText("Inverse harmony (-)", topLeft.x + 3, topLeft.y - 16, 13.0f, glm::vec4(1.0f, 0.63f, 0.353f, 1.0f));
+
+        if (gainEdit.active) drawGainBox(renderer, topLeft, bottomRight);
+    }
+
+    // The note gain box, next to the first of its notes (kept inside the notes area)
+    void drawGainBox(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
+        const float w = 210.0f, h = 40.0f;
+        Event* first = nullptr;
+        for (Event* e : gainEdit.targets)
+          if (!first || e->beat < first->beat) first = e;
+        Vec2 p = {topLeft.x + 20, topLeft.y - 60};
+        if (first && hasEvent(first))
+          p = worldToScreen(topLeft, {first->time, ratio_to_octave(first->ratio)});
+        float x = std::clamp(p.x, topLeft.x + 4, std::max(topLeft.x + 4, bottomRight.x - w - 4));
+        float y = std::clamp(p.y + 10, bottomRight.y + 4, std::max(bottomRight.y + 4, topLeft.y - h - 4));
+
+        renderer.addRect(x - 1, y - 1, w + 2, h + 2, 0.95f, 0.85f, 0.3f);   // border
+        renderer.addRect(x, y, w, h, 0.10f, 0.10f, 0.12f);
+
+        // Current gain: shared by all the notes, or "mixed"
+        bool same = true;
+        for (Event* e : gainEdit.targets)
+          if (std::abs(e->gainDb - gainEdit.targets[0]->gainDb) > 1e-4f) same = false;
+        char now[32];
+        if (same) std::snprintf(now, sizeof now, "%+.1f dB", gainEdit.targets[0]->gainDb);
+        else      std::snprintf(now, sizeof now, "mixed");
+        size_t n = gainEdit.targets.size();
+        laneLabels.push_back("Gain of " + std::to_string(n) + (n == 1 ? " note" : " notes") +
+                             " (now " + now + "):");
+        renderer.addText(laneLabels.back().c_str(), x + 6, y + h - 15, 12.0f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
+        laneLabels.push_back(gainEdit.text + "_ dB    Enter / Esc");
+        renderer.addText(laneLabels.back().c_str(), x + 6, y + 5, 14.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
     }
 
     // Clips in the audio strip: a box in the track's colour with a low-res
@@ -3212,7 +3923,8 @@ struct Canvas2D {
 bool load_song(const std::string& path,
                Canvas2D* canvas,
                std::vector<Track>& tracks, uint32_t* nextID,
-               std::vector<std::vector<Clip>>& clipsOut, float sampleRate)
+               std::vector<std::vector<Clip>>& clipsOut, float sampleRate,
+               std::vector<std::vector<AutoLane>>& autoOut)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -3232,6 +3944,7 @@ bool load_song(const std::string& path,
     int t, l, p;
     uint32_t id, numR, denR, numB, denB;
     uint32_t next_id = 0;
+    std::vector<Event*> beatEvs;   // in file order, for the NGDB section
     // Read time events
 
     f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
@@ -3301,6 +4014,7 @@ bool load_song(const std::string& path,
       toInsert->profile = p;
       std::fflush(stdout);
       canvas->beatEvents.insert(toInsert);
+      beatEvs.push_back(toInsert);
     }
     *nextID = next_id + 1;
     canvas->beatEvents.reparent_tree();
@@ -3390,6 +4104,79 @@ bool load_song(const std::string& path,
                     clipsOut[i].push_back(std::move(c));
                 }
             }
+        } else if (std::strncmp(tag, "VST3", 4) == 0) {
+            auto getBytes = [&f](auto& out) {
+                uint32_t len = 0;
+                if (!f.read(reinterpret_cast<char*>(&len), sizeof(len)) || len > (64u << 20)) return false;
+                out.resize(len);
+                return (bool)f.read(reinterpret_cast<char*>(out.data()), len);
+            };
+            for (Track& tr : loaded) {
+                int32_t tuning = 0;
+                uint32_t nfx = 0;
+                if (!getBytes(tr.vstInstrument) || !getBytes(tr.vstEffects)) return false;
+                f.read(reinterpret_cast<char*>(&tuning), sizeof(tuning));
+                tr.tuning = std::clamp<int32_t>(tuning, 0, vst3::TUNING_MODES - 1);
+                if (!getBytes(tr.instrumentState)) return false;
+                if (!f.read(reinterpret_cast<char*>(&nfx), sizeof(nfx)) || nfx > 256) return false;
+                tr.effectStates.resize(nfx);
+                for (auto& st : tr.effectStates)
+                    if (!getBytes(st)) return false;
+            }
+        } else if (std::strncmp(tag, "REFF", 4) == 0) {
+            float r = 0.0f;
+            f.read(reinterpret_cast<char*>(&r), sizeof(r));
+            if (f && r > 0.0f && std::isfinite(r)) {
+                ref = r;
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "%g", r);
+                g_settings.refFreq = buf;
+            }
+        } else if (std::strncmp(tag, "NGDB", 4) == 0) {
+            uint32_t count = 0;
+            f.read(reinterpret_cast<char*>(&count), sizeof(count));
+            for (uint32_t k = 0; f && k < count; k++) {
+                float db = 0.0f;
+                f.read(reinterpret_cast<char*>(&db), sizeof(db));
+                if (f && k < beatEvs.size() && std::isfinite(db)) beatEvs[k]->gainDb = db;
+            }
+        } else if (std::strncmp(tag, "AUTO", 4) == 0) {
+            auto getString = [&f](std::string& out) {
+                uint32_t len = 0;
+                if (!f.read(reinterpret_cast<char*>(&len), sizeof(len)) || len > 4096) return false;
+                out.assign(len, '\0');
+                return (bool)f.read(out.data(), len);
+            };
+            autoOut.assign(MAX_TRACKS, {});
+            for (size_t i = 0; i < loaded.size(); i++) {
+                Track& tr = loaded[i];
+                int32_t sel = AUTO_VELOCITY;
+                uint32_t lanes = 0;
+                f.read(reinterpret_cast<char*>(&sel), sizeof(sel));
+                f.read(reinterpret_cast<char*>(&tr.autoParam), sizeof(tr.autoParam));
+                if (!getString(tr.autoName)) return false;
+                tr.autoPlugin = std::max<int32_t>(sel, AUTO_NONE);
+                if (!f.read(reinterpret_cast<char*>(&lanes), sizeof(lanes)) || lanes > 100000) return false;
+                for (uint32_t k = 0; k < lanes; k++) {
+                    AutoLane lane;
+                    int32_t plugin = 0;
+                    uint32_t n = 0;
+                    f.read(reinterpret_cast<char*>(&plugin), sizeof(plugin));
+                    f.read(reinterpret_cast<char*>(&lane.param), sizeof(lane.param));
+                    if (!getString(lane.name)) return false;
+                    if (!f.read(reinterpret_cast<char*>(&n), sizeof(n)) || n > (16u << 20)) return false;
+                    lane.plugin = std::max(0, plugin);
+                    lane.points.resize(n);
+                    for (AutoPoint& pt : lane.points) {
+                        f.read(reinterpret_cast<char*>(&pt.beat), sizeof(float));
+                        f.read(reinterpret_cast<char*>(&pt.value), sizeof(float));
+                    }
+                    if (!f) return false;
+                    std::sort(lane.points.begin(), lane.points.end(),
+                              [](const AutoPoint& a, const AutoPoint& b) { return a.beat < b.beat; });
+                    autoOut[i].push_back(std::move(lane));
+                }
+            }
         } else {
             break;
         }
@@ -3414,6 +4201,7 @@ bool load_song(const std::string& path,
 
     tracks = std::move(loaded);
     clipsOut.resize(MAX_TRACKS);
+    autoOut.resize(MAX_TRACKS);
     f.close();
     return true;
 }
@@ -3477,6 +4265,8 @@ struct App {
     float       bpm = 110.0f;
     std::string freqText[3];             // percussion freq text boxes
     std::string pdPatchText;             // Pd patch name for the current track
+    std::string vstInstText;             // VST3 instrument of the current track
+    std::string vstFxText;               // VST3 effects of the current track
 
     explicit App(AudioEngine& e) : engine(e) {}
     App(const App&) = delete;
@@ -3497,9 +4287,11 @@ struct App {
         for (int k = 0; k < 3; k++) {
             char buf[32];
             std::snprintf(buf, sizeof buf, "%.2f", profile.settings[k].freq);
-            freqText[k] = buf;
+            freqText[k] = profile.settings[k].freq > 0.0f ? buf : "";
         }
         pdPatchText = track().pdPatch;
+        vstInstText = track().vstInstrument;
+        vstFxText = track().vstEffects;
         scrollToTrack(index);
     }
 
@@ -3521,6 +4313,9 @@ struct App {
     // Swaps two tracks: their rows, their notes and blips, and their Pd slots.
     void swapTracks(int a, int b) {
         if (a == b) return;
+        endAutoTakes();
+        gBeatOctCanvas.picker = {};
+        gBeatOctCanvas.autoEdit = {};
         std::swap(g_tracks[a], g_tracks[b]);
         auto remap = [a, b](int& t) { if (t == a) t = b; else if (t == b) t = a; };
         for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next(e))
@@ -3528,9 +4323,14 @@ struct App {
         remap(g_currentTrack);
         remap(gBeatOctCanvas.heldProfile);
         engine.pd.swapSlots(a, b);
+        engine.swapTrackPlugins(a, b);
         {
             std::lock_guard<std::mutex> lock(g_clipsMutex);
             std::swap(g_clips[a], g_clips[b]);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_automationMutex);
+            std::swap(g_automation[a], g_automation[b]);
         }
         engine.setProfile(g_tracks[a].profile, a);
         engine.setProfile(g_tracks[b].profile, b);
@@ -3575,9 +4375,14 @@ struct App {
         for (int k = i; k < n - 1; k++) swapTracks(k, k + 1);   // move it to the end...
         g_tracks.pop_back();                                     // ...and drop it
         engine.pd.setPatch(n - 1, "");
+        engine.clearPlugins(n - 1);
         {
             std::lock_guard<std::mutex> lock(g_clipsMutex);
             g_clips[n - 1].clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_automationMutex);
+            g_automation[n - 1].clear();
         }
         applyTrackGains();
         tracksChanged = true;
@@ -3608,16 +4413,19 @@ struct App {
         return engine.pd.setPatch(i, t.pdPatch);
     }
 
-    // Mute and solo are applied through each track's Pd gain: while any track
-    // is soloed only soloed tracks are heard, and a muted track never is.
+    // Mute and solo leave the track out of the engine's final mix, so they
+    // work whatever produces the sound (clips, Pd or a VST3 instrument):
+    // while any track is soloed only soloed tracks are heard, and a muted
+    // track never is.
     void applyTrackGains() {
         bool anySolo = std::any_of(g_tracks.begin(), g_tracks.end(),
                                    [](const Track& t) { return t.solo; });
         for (int i = 0; i < (int)g_tracks.size(); i++) {
             const Track& t = g_tracks[i];
             bool audible = !t.mute && (!anySolo || t.solo);
-            engine.pd.setGain(i, audible ? t.gainDb : PdHost::MIN_DB);
-            engine.setTrackGain(i, audible ? t.gainDb : PdHost::MIN_DB);
+            engine.pd.setGain(i, t.gainDb);
+            engine.setTrackGain(i, t.gainDb);
+            engine.setTrackAudible(i, audible);
         }
     }
 
@@ -3652,6 +4460,81 @@ struct App {
         engine.pd.openEditor(g_currentTrack, pdPatchText);
     }
 
+    // ---- VST3 ----
+    // Loads track i's instrument and effects (keeping ones already loaded),
+    // then applies any settings read from a file. Status goes to the status line.
+    void loadPlugins(int i) {
+        Track& t = g_tracks[i];
+        std::string status;
+        engine.setTuning(i, (vst3::TuningMode)t.tuning);
+        engine.setInstrument(i, t.vstInstrument, status);
+        engine.setEffects(i, splitNames(t.vstEffects), status);
+        if (!t.instrumentState.empty()) engine.loadPluginState(engine.instrument(i), t.instrumentState);
+        std::vector<vst3::Plugin*> fx = engine.effects(i);
+        for (size_t k = 0; k < fx.size() && k < t.effectStates.size(); k++)
+            engine.loadPluginState(fx[k], t.effectStates[k]);
+        t.instrumentState.clear();
+        t.effectStates.clear();
+        if (!status.empty()) engine.pd.status = status;
+    }
+
+    void commitVstInstrument() {
+        track().vstInstrument = vstInstText;
+        loadPlugins(g_currentTrack);
+    }
+
+    void commitVstEffects() {
+        track().vstEffects = vstFxText;
+        loadPlugins(g_currentTrack);
+    }
+
+    // The Edit buttons open the plugin windows, or close them if they're open
+    bool instrumentEditorOpen() {
+        vst3::Plugin* p = engine.instrument(g_currentTrack);
+        return p && p->editorOpen();
+    }
+    bool effectEditorsOpen() {
+        for (vst3::Plugin* p : engine.effects(g_currentTrack))
+            if (p->editorOpen()) return true;
+        return false;
+    }
+
+    void editVstInstrument() {
+        if (instrumentEditorOpen()) { engine.instrument(g_currentTrack)->closeEditor(); return; }
+        commitVstInstrument();
+        vst3::Plugin* p = engine.instrument(g_currentTrack);
+        if (!p) { engine.pd.status = vstInstText.empty() ? "Type an instrument name first" : engine.pd.status; return; }
+        if (!p->openEditor()) engine.pd.status = p->name() + " has no editor window";
+    }
+
+    void editVstEffects() {
+        if (effectEditorsOpen()) {
+            for (vst3::Plugin* p : engine.effects(g_currentTrack)) p->closeEditor();
+            return;
+        }
+        commitVstEffects();
+        std::vector<vst3::Plugin*> fx = engine.effects(g_currentTrack);
+        if (fx.empty()) { engine.pd.status = "No effects on this track"; return; }
+        for (vst3::Plugin* p : fx)
+            if (!p->openEditor()) engine.pd.status = p->name() + " has no editor window";
+    }
+
+    void cycleTuning() {
+        track().tuning = (track().tuning + 1) % vst3::TUNING_MODES;
+        engine.setTuning(g_currentTrack, (vst3::TuningMode)track().tuning);
+    }
+
+    // Copies every plugin's settings into its track, for saving
+    void collectPluginStates() {
+        for (int i = 0; i < (int)g_tracks.size(); i++) {
+            Track& t = g_tracks[i];
+            t.instrumentState.clear();
+            t.effectStates.clear();
+            if (vst3::Plugin* p = engine.instrument(i)) t.instrumentState = p->saveState();
+            for (vst3::Plugin* p : engine.effects(i)) t.effectStates.push_back(p->saveState());
+        }
+    }
+
     // Pushes every track's settings to the engine, and unloads the Pd slots
     // of tracks that no longer exist.
     void syncEngine() {
@@ -3664,11 +4547,16 @@ struct App {
                 if (!t.pdPatch.empty()) (ok ? loaded : failed)++;
             } else {
                 engine.pd.setPatch(i, "");
+                engine.clearPlugins(i);
             }
         }
         applyTrackGains();
-        engine.pd.status = std::to_string(loaded) + " Pd patch(es) loaded" +
-                           (failed ? ", " + std::to_string(failed) + " missing" : "");
+        std::string pdStatus = std::to_string(loaded) + " Pd patch(es) loaded" +
+                               (failed ? ", " + std::to_string(failed) + " missing" : "");
+        engine.pd.status.clear();
+        for (int i = 0; i < (int)g_tracks.size(); i++) loadPlugins(i);
+        // A plugin that failed to load says so; otherwise report the patches
+        if (engine.pd.status.empty() || engine.pd.status.rfind("Track ", 0) == 0) engine.pd.status = pdStatus;
     }
 
     bool playing = false;   // transport state, shared with the main loop
@@ -3700,9 +4588,19 @@ struct App {
     std::vector<float> take;       // the input captured so far
     std::vector<int> takeTracks;   // armed audio tracks when playback started
 
+    // The Rec button in the menu bar. Audio is only recorded into armed
+    // tracks, and automation only written, while it's on.
+    bool recordArmed = false;
+
+    void toggleRecord() {
+        recordArmed = !recordArmed;
+        if (!recordArmed) stopRecording();   // automation takes end in pollAutomation()
+    }
+
     // Called as playback starts.
     void startRecordingIfArmed() {
         takeTracks.clear();
+        if (!recordArmed) return;
         for (int i = 0; i < (int)g_tracks.size(); i++)
             if (g_tracks[i].type == TrackType::Audio && g_tracks[i].armed) takeTracks.push_back(i);
         if (takeTracks.empty()) return;
@@ -3872,21 +4770,139 @@ struct App {
         c.beatEvents.insert(ev);
     }
 
+    // ---- Recording automation ----
+    // While playing with Rec on, moving a control in a plugin's window
+    // writes it into that parameter's lane at the playhead, replacing what
+    // was there, for as long as the control keeps moving (touch). Playback
+    // leaves the lane alone meanwhile, so it doesn't fight the control.
+    struct AutoTake {
+        int track, plugin;
+        uint32_t param;
+        float from, last;   // beats written so far in this pass
+        std::chrono::steady_clock::time_point lastEdit;
+    };
+    std::vector<AutoTake> autoTakes;
+    float lastPlayBeat = 0.0f;
+    static constexpr std::chrono::milliseconds TOUCH_RELEASE{400};
+
+    void endAutoTake(const AutoTake& tk) {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        if (AutoLane* lane = findAutoLane(tk.track, tk.plugin, tk.param)) {
+            lane->held = false;
+            simplifyAutoPoints(lane->points, tk.from, tk.last, 0.003f);
+        }
+    }
+
+    void endAutoTakes() {
+        for (const AutoTake& tk : autoTakes) endAutoTake(tk);
+        autoTakes.clear();
+    }
+
+    void recordAutoPoint(int t, int k, vst3::Plugin& p, const vst3::ParamEdit& e, float beat) {
+        auto now = std::chrono::steady_clock::now();
+        std::string name;
+        if (!findAutoLane(t, k, e.id)) name = p.name() + ": " + p.paramName(e.id);
+        AutoLane* lane = ensureAutoLane(t, k, e.id, name);
+        if (!lane) return;
+        auto tk = std::find_if(autoTakes.begin(), autoTakes.end(), [&](const AutoTake& a) {
+            return a.track == t && a.plugin == k && a.param == e.id;
+        });
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        if (tk == autoTakes.end()) {
+            lane->held = true;
+            autoTakes.push_back({t, k, e.id, beat, beat, now});
+        } else {
+            eraseAutoPoints(lane->points, tk->last, beat);   // what was there gets replaced
+            tk->last = beat;
+            tk->lastEdit = now;
+        }
+        putAutoPoint(lane->points, beat, (float)e.value);
+    }
+
+    // Call every main-loop pass: collects the edits made in plugin windows
+    // (recording them when it should) and ends takes whose control has
+    // stopped moving. Returns true if any lane changed (redraw).
+    bool pollAutomation() {
+        const bool rec = playing && recordArmed;
+        const float beat = (float)engine.playheadBeat();
+        bool changed = false;
+        if (beat + 1e-4f < lastPlayBeat) endAutoTakes();   // looped (or restarted): a new pass
+        lastPlayBeat = beat;
+
+        std::vector<vst3::ParamEdit> edits;
+        for (int t = 0; t < (int)g_tracks.size(); t++) {
+            int count = 1 + (int)engine.effects(t).size();
+            for (int k = 0; k < count; k++) {
+                vst3::Plugin* p = engine.plugin(t, k);
+                if (!p) continue;
+                edits.clear();
+                p->takeEdits(edits);
+                if (!rec) continue;
+                for (const vst3::ParamEdit& e : edits) recordAutoPoint(t, k, *p, e, beat);
+                changed |= !edits.empty();
+            }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < autoTakes.size();) {
+            if (rec && now - autoTakes[i].lastEdit < TOUCH_RELEASE) { i++; continue; }
+            endAutoTake(autoTakes[i]);
+            autoTakes.erase(autoTakes.begin() + i);
+            changed = true;
+        }
+        return changed;
+    }
+
+    void toggleAutomationMode() {
+        Canvas2D& c = gBeatOctCanvas;
+        c.autoMode = !c.autoMode;
+        c.picker = {};
+        c.autoEdit = {};
+        c.cancelEdit();
+    }
+
+    // The button on a track's row in automation mode
+    void openAutomationPicker(int i) {
+        selectTrack(i);
+        gBeatOctCanvas.autoMode = true;
+        gBeatOctCanvas.openPicker(i);
+    }
+
     void saveProject() {
-        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks, g_clips);
+        collectPluginStates();
+        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks, g_clips,
+                  g_automation);
+        for (Track& t : g_tracks) {   // only needed in the file
+            t.instrumentState.clear();
+            t.effectStates.clear();
+        }
     }
 
     void loadProject() {
         std::vector<std::vector<Clip>> clips(MAX_TRACKS);
+        std::vector<std::vector<AutoLane>> automation(MAX_TRACKS);
         gBeatOctCanvas.clipEdit = {};
-        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate);
+        gBeatOctCanvas.picker = {};
+        gBeatOctCanvas.autoEdit = {};
+        gBeatOctCanvas.forgetNotes();
+        autoTakes.clear();   // their lanes are about to go
+        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate,
+                  automation);
+        engine.setFrequency(ref);   // the file may have its own reference frequency
         {
             std::lock_guard<std::mutex> lock(g_clipsMutex);
             g_clips = std::move(clips);
         }
+        {
+            std::lock_guard<std::mutex> lock(g_automationMutex);
+            g_automation = std::move(automation);
+            g_automation.resize(MAX_TRACKS);
+        }
         g_tracks.reserve(MAX_TRACKS);
-        for (Track& t : g_tracks)   // perc tracks always start with a patch
-            if (t.type == TrackType::Perc && t.pdPatch.empty()) t.pdPatch = freePercPatchName(g_tracks);
+        // Perc tracks start with a patch, unless they play a VST3 instrument
+        for (Track& t : g_tracks)
+            if (t.type == TrackType::Perc && t.pdPatch.empty() && t.vstInstrument.empty())
+                t.pdPatch = freePercPatchName(g_tracks);
         gBeatOctCanvas.beatEvents.inorder();
         gBeatOctCanvas.beatEvents.find_loop();
         syncEngine();
@@ -4023,6 +5039,21 @@ static void rebuildTrackRows(App& app) {
                                        PdHost::MIN_DB, 12.0f, 1.0f,
                                        [&app](Widget&) { app.applyTrackGains(); }));
         gain->labelFn = [i] { return gainLabel(g_tracks[i].gainDb); };
+
+        // In automation mode the current track's gain slider becomes the
+        // button that picks which lane to show
+        auto autoShown = [i] { return gBeatOctCanvas.autoMode && i == g_currentTrack; };
+        gain->visibleFn = [autoShown] { return !autoShown(); };
+        Widget* pick = row->add(button({10, 23, rowW - 16, 15}, "",
+                                       [&app, i](Widget&) { app.openAutomationPicker(i); },
+                                       {0.22f, 0.36f, 0.50f}));
+        pick->textColor = {1, 1, 1};
+        pick->visibleFn = autoShown;
+        pick->labelFn = [i] {
+            std::string label = "Auto: " + autoTargetName(g_tracks[i]);
+            if (label.size() > 26) label = label.substr(0, 24) + "..";
+            return label;
+        };
     }
 }
 
@@ -4105,6 +5136,19 @@ static void buildUI(App& app) {
     export_midi("export.mid", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents);
 }));
 
+    // Record: arms recording into armed audio tracks and of automation
+    Widget* rec = menuBar->add(button({52, 2, 50, 18}, "Rec", [&app](Widget&) { app.toggleRecord(); }));
+    rec->textColor = {1, 1, 1};
+    rec->colorFn = [&app] {
+        return app.recordArmed ? Color{0.80f, 0.12f, 0.12f} : Color{0.22f, 0.22f, 0.24f};
+    };
+    Widget* autoBtn = menuBar->add(button({108, 2, 130, 18}, "Automation (Tab)",
+                                          [&app](Widget&) { app.toggleAutomationMode(); }));
+    autoBtn->textColor = {1, 1, 1};
+    autoBtn->colorFn = [] {
+        return gBeatOctCanvas.autoMode ? Color{0.22f, 0.36f, 0.50f} : Color{0.22f, 0.22f, 0.24f};
+    };
+
     // ---- Control panel, left column ----
     cw->add(slider({10, 10, 120, 15}, "BPM", &app.bpm, 20, 200, 1,
                    [&app](Widget&) { app.engine.setTempo(app.bpm); }))
@@ -4143,6 +5187,42 @@ static void buildUI(App& app) {
     pdStatus->textColor = {0.7f, 0.7f, 0.7f};
     pdStatus->labelFn = [&app] { return app.engine.pd.status; };
     pdStatus->visibleFn = standardOnly;
+
+    // VST3 instrument and effects of the current track
+    Widget* inst = cw->add(textBox({610, 45, 140, 15}, "Inst:", &app.vstInstText, {}, /*labelLeft=*/true));
+    inst->maxLen = 255;
+    inst->onCommit = [&app](Widget&) { app.commitVstInstrument(); };
+    cw->add(button({755, 45, 45, 15}, "Edit", [&app](Widget&) { app.editVstInstrument(); }))
+        ->labelFn = [&app] { return std::string(app.instrumentEditorOpen() ? "Close" : "Edit"); };
+    Widget* fx = cw->add(textBox({865, 45, 150, 15}, "FX:", &app.vstFxText, {}, /*labelLeft=*/true));
+    fx->maxLen = 255;
+    fx->onCommit = [&app](Widget&) { app.commitVstEffects(); };
+    cw->add(button({1020, 45, 45, 15}, "Edit", [&app](Widget&) { app.editVstEffects(); }))
+        ->labelFn = [&app] { return std::string(app.effectEditorsOpen() ? "Close" : "Edit"); };
+    cw->add(button({1030, 25, 150, 15}, "", [&app](Widget&) { app.cycleTuning(); }))
+        ->labelFn = [&app] {
+            return std::string("Tuning: ") + vst3::tuningName((vst3::TuningMode)app.track().tuning);
+        };
+
+    // Perc tracks: the note their blips play on a VST3 instrument (empty = C2)
+    Widget* hitFreq = cw->add(textBox({1125, 45, 60, 15}, "Hit Hz:", &app.freqText[0], {},
+                                      /*labelLeft=*/true, {0.8f, 0.7f, 0.3f}));
+    hitFreq->visibleFn = [] { return currentTrackType() == TrackType::Perc; };
+    hitFreq->onCommit = [&app](Widget&) {
+        float hz = (float)std::atof(app.freqText[0].c_str());
+        app.profile.settings[0].freq = hz > 0.0f ? hz : 0.0f;
+        app.freqText[0] = hz > 0.0f ? app.freqText[0] : "";
+        app.sendProfile();
+    };
+
+    Widget* metro = cw->add(button({870, 25, 150, 15}, "", [&app](Widget&) {
+        app.engine.metronome = !app.engine.metronome;
+    }));
+    metro->labelFn = [&app] { return std::string("Metronome (k): ") + (app.engine.metronome ? "On" : "Off"); };
+    metro->colorFn = [&app] {
+        return app.engine.metronome ? Color{0.25f, 0.45f, 0.30f} : Color{0.20f, 0.20f, 0.22f};
+    };
+    metro->textColor = {1, 1, 1};
 
     // Oscillator columns
     //for (int k = 0; k < 3; k++) addOscColumn(*cw, app, k, 140.0f + 130.0f * k);
@@ -4264,10 +5344,36 @@ int main(int, char**)
             case SDL_KEYDOWN: {
                 SDL_Keycode sym = e.key.keysym.sym;
                 char key = sym;
+
+                // While the note gain box is open it takes every key
+                if (gBeatOctCanvas.gainEdit.active) {
+                  if (sym == SDLK_ESCAPE) { gBeatOctCanvas.cancelGainEdit(); break; }
+                  int k = sym;
+                  if (sym == SDLK_KP_ENTER)                     k = '\r';
+                  else if (sym >= SDLK_KP_1 && sym <= SDLK_KP_9) k = '1' + (sym - SDLK_KP_1);
+                  else if (sym == SDLK_KP_0)                    k = '0';
+                  else if (sym == SDLK_KP_PERIOD)               k = '.';
+                  else if (sym == SDLK_KP_MINUS)                k = '-';
+                  else if (sym == SDLK_KP_PLUS)                 k = '+';
+                  gBeatOctCanvas.gainEditKey(k);
+                  break;
+                }
+
+                // While the parameter picker is open it takes every key (to filter)
+                if (gBeatOctCanvas.picker.open) {
+                  if (sym == SDLK_ESCAPE) { gBeatOctCanvas.picker = {}; break; }
+                  if (sym == SDLK_TAB) { app.toggleAutomationMode(); break; }
+                  gBeatOctCanvas.pickerKey(sym == SDLK_KP_ENTER ? '\r' : (int)sym);
+                  break;
+                }
+
                 if (key == SDLK_ESCAPE) {
                   if (app.ui.focused) app.ui.blur();
                   else if (gBeatOctCanvas.cancelEdit()) {}   // stop trimming / moving a clip
                   else if (app.ui.openMenu) app.ui.closeMenu();
+                  else if (gBeatOctCanvas.clearSelection()) {}
+                  else if (vst3::editorsOpen()) vst3::closeAllEditors();
+                  else if (gBeatOctCanvas.autoMode) app.toggleAutomationMode();
                   else running = false;
                   break;
                 }
@@ -4297,6 +5403,10 @@ int main(int, char**)
                     app.selectTrack(hotkeyTrack(key));
                 } else if (key == 'n') {
                     engine.toggleFreeze();
+                } else if (key == 'k') {
+                    engine.metronome = !engine.metronome;
+                } else if (key == '\t') {
+                    app.toggleAutomationMode();
                 }
                 break;
             }
@@ -4359,6 +5469,13 @@ int main(int, char**)
             engine.pd.poll();
             if (engine.pd.status != before) rerender = true;
         }
+        {   // plugin windows, and the plugins' own timers
+            bool wereOpen = vst3::editorsOpen();
+            vst3::idle();
+            if (vst3::editorsOpen() != wereOpen) rerender = true;   // Edit / Close buttons
+        }
+        engine.syncPluginControllers();   // so they show automated values
+        if (app.pollAutomation()) rerender = true;
  
         if (windowActive && rerender) {
             renderer.vertices.clear();
@@ -4386,7 +5503,8 @@ int main(int, char**)
                                std::floor(screenNw.y2 - screenNw.y1));
             rerender = false;
         } else {
-            SDL_Delay(50);
+            // Plugin windows animate from vst3::idle(), so keep it coming often
+            SDL_Delay(vst3::editorsOpen() ? 10 : 50);
         }
     }
  

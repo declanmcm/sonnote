@@ -12,6 +12,9 @@
 #include "parser.hpp"
 #include "utils.hpp"
 #include "pd_host.hpp"
+#include "vst3_host.hpp"
+#include <memory>
+#include <algorithm>
 
 // =============================================
 // ========== PUBLIC AUDIO ENGINE API ==========
@@ -94,7 +97,7 @@ struct Event {
     Event* origin;
     bool selected = false;
     bool finalEv = false;   // last tempo event; used by Canvas2D::accum_beats
-    int velocity = 0;
+    float gainDb = 0.0f;    // note gain in dB (g), sent to the note's Pd patch
     int profile;
     int type;
     uint32_t id;
@@ -581,6 +584,49 @@ struct Clip {
 extern std::vector<std::vector<Clip>> g_clips;
 extern std::mutex g_clipsMutex;
 
+// ---- Automation ----
+// A curve for one VST3 parameter of one of a track's plugins. Points are
+// normalised values (0-1) at beats, joined by straight lines; before the
+// first point and after the last the value stays level. A lane with no
+// points leaves the parameter alone.
+struct AutoPoint {
+    float beat = 0.0f;
+    float value = 0.0f;
+};
+
+// Which of the track's plugins: the instrument, or the k-th effect (1-based)
+constexpr int AUTO_INSTRUMENT = 0;
+
+struct AutoLane {
+    int plugin = AUTO_INSTRUMENT;
+    uint32_t param = 0;            // VST3 ParamID
+    std::string name;              // for display, e.g. "Vital: Filter 1 Cutoff"
+    std::vector<AutoPoint> points; // sorted by beat
+    bool held = false;             // being recorded: playback leaves it alone
+
+    // Audio thread: the value last sent, and in which pass (see autoEpoch)
+    float lastSent = 0.0f;
+    uint32_t sentEpoch = 0;
+
+    float valueAt(double beat) const {
+        if (points.empty()) return 0.0f;
+        if (beat <= points.front().beat) return points.front().value;
+        if (beat >= points.back().beat)  return points.back().value;
+        auto it = std::upper_bound(points.begin(), points.end(), beat,
+                                   [](double b, const AutoPoint& p) { return b < p.beat; });
+        const AutoPoint& b = *it;
+        const AutoPoint& a = *(it - 1);
+        if (b.beat - a.beat < 1e-9f) return b.value;
+        return a.value + (b.value - a.value) * (float)((beat - a.beat) / (b.beat - a.beat));
+    }
+};
+
+// Lanes per track: g_automation[track][lane], always MAX_TRACKS entries.
+// Hold g_automationMutex while changing them; the audio thread only
+// try-locks it, skipping automation for a block rather than waiting.
+extern std::vector<std::vector<AutoLane>> g_automation;
+extern std::mutex g_automationMutex;
+
 // =========================================================
 // =============== LOCK-FREE MESSAGE QUEUE =================
 // =========================================================
@@ -654,6 +700,28 @@ public:
     void setADSR(const ADSRParams& a);
     void setProfile(const Profile& p, int n);
     void setTrackGain(int track, float db);   // clip playback gain (PdHost::MIN_DB = silent)
+    void setTrackAudible(int track, bool on); // mute / solo: silences the track's whole output
+
+    // ---- VST3 plugins (main thread) ----
+    // Each track can have a VST3 instrument, which plays its notes (alongside
+    // its Pd patch, if it has one), and a chain of VST3 effects on its audio.
+    // Plugins are loaded off the audio thread's path and swapped in under
+    // processMutex, so don't call these during exportWav().
+    // setInstrument("") removes it. Returns false (and sets `status`) if a
+    // plugin couldn't be loaded.
+    bool setInstrument(int track, const std::string& name, std::string& status);
+    // Effects in order. Ones already loaded under the same name are kept, with their settings.
+    bool setEffects(int track, const std::vector<std::string>& names, std::string& status);
+    void clearPlugins(int track);
+    void swapTrackPlugins(int a, int b);
+    void setTuning(int track, vst3::TuningMode m);
+    vst3::Plugin* instrument(int track);
+    std::vector<vst3::Plugin*> effects(int track);
+    // AUTO_INSTRUMENT, or the k-th effect (1-based); nullptr if there's none
+    vst3::Plugin* plugin(int track, int which);
+    // Main thread, every pass: lets plugin windows follow automation
+    void syncPluginControllers();
+    bool loadPluginState(vst3::Plugin* p, const std::vector<uint8_t>& state);
 
     // ---- Recording ----
     // While on and playing, the input is captured from the moment playback
@@ -672,6 +740,8 @@ public:
         return out;
     }
     double samplesPerBeat() const { return (60.0 / tempoBPM) * sampleRate; }
+    // Where playback is, in beats (updated every block)
+    double playheadBeat() const { return playBeat.load(std::memory_order_relaxed); }
     void toggleTuner();
     Profile getProfile(int n);
 
@@ -682,6 +752,10 @@ public:
     float sampleRate = 48000.0f;
 
     bool tunerEnabled = false;
+
+    // Click on every beat while playing (higher on every 4th). Left out of
+    // exports. Safe to flip from any thread.
+    std::atomic<bool> metronome{false};
 
     // Replace the entire event list
     // (Audio thread uses double-buffer swap)
@@ -747,6 +821,7 @@ private:
 
     // ---- Clip playback (audio thread) ----
     std::array<std::atomic<float>, MAX_TRACKS> trackGain;   // linear
+    std::array<std::atomic<bool>, MAX_TRACKS> trackAudible; // false = bus left out of the mix
     struct ClipVoice {
         bool     active = false;
         int      track = 0;
@@ -769,6 +844,52 @@ private:
     std::atomic<int> recPassCount{0};
 
     float divisorSmooth = 1.0f;  // for dividing by voice count smoothly
+
+    // ---- Metronome (audio thread) ----
+    bool    exporting = false;    // exportWav() is running: no clicks
+    int64_t metroBeat = INT64_MIN; // beat the playhead was last in
+    float   metroPhase = 0.0f, metroEnv = 0.0f, metroFreq = 0.0f;
+    float   metronomeSample(uint64_t sc, double samplesPerBeat);
+
+    // ---- Per-track buses (audio thread) ----
+    // processAudio() works in pieces of at most MAX_BLOCK frames. Each track
+    // renders into its own stereo bus, which are then mixed to the output.
+    static constexpr uint32_t MAX_BLOCK = 1024;
+    std::vector<float> busData;      // per track: L then R, MAX_BLOCK each
+    std::vector<float> clipInData;   // per track: clip audio going into its Pd patch
+    std::vector<float> metroBuf;
+    float* busL(int t)   { return busData.data() + (size_t)t * 2 * MAX_BLOCK; }
+    float* busR(int t)   { return busL(t) + MAX_BLOCK; }
+    float* clipIn(int t) { return clipInData.data() + (size_t)t * MAX_BLOCK; }
+    void processBlock(float* outL, float* outR, const float* in, uint32_t n,
+                      double samplesPerBeat, bool clipsReadable);
+    void renderSegment(uint32_t pos, uint32_t len, const float* in,
+                       double samplesPerBeat, bool clipsReadable);
+    void fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uint32_t offset);
+
+    // ---- VST3 plugins (audio thread reads them; changed under processMutex) ----
+    struct TrackPlugins {
+        std::unique_ptr<vst3::Plugin> instrument;
+        std::vector<std::unique_ptr<vst3::Plugin>> effects;
+        vst3::TuningMode tuning = vst3::TuningMode::PerNote;
+    };
+    std::array<TrackPlugins, MAX_TRACKS> plugins;
+    std::vector<float> fxScratch;   // effect input, L then R
+    void instrumentsAllNotesOff(int offset);
+
+    // Perc hits played on a VST3 instrument end after PERC_GATE seconds
+    static constexpr float PERC_GATE = 0.1f;
+    struct PercOff { bool active = false; int track = 0; uint32_t id = 0; uint64_t due = 0; };
+    std::array<PercOff, 64> percOffs{};
+    void percNoteOn(int track, uint32_t id, float velocity, uint32_t offset);
+    uint32_t firePercOffs(uint32_t pos, uint32_t len);   // returns len, cut at the next one due
+
+    // Automation (audio thread). autoEpoch changes whenever playback jumps,
+    // so every lane sends its value again.
+    uint32_t autoEpoch = 1;
+    void applyAutomation(uint32_t pos, uint32_t len, double samplesPerBeat);
+    std::atomic<double> playBeat{0.0};
+    void processPlugins(uint32_t n, uint64_t blockStart, double samplesPerBeat);
 
     // =================================
     // Lock-free message queue
