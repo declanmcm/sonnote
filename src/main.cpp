@@ -1613,10 +1613,19 @@ struct Canvas2D {
     Vec2 unsnappedHoverW{0,0};
     float anchorBeatExact = 0.0f;
 
-    Vec2 select1{0,0};
-    Vec2 select2{0,0};
-    Event* select1closest = nullptr;
-    Event* select2closest = nullptr;
+    // An end of an interval measured with e: a note, or a point on a
+    // harmonic line (the line runs from t0 to t1, in seconds)
+    struct MeasurePoint {
+      Event* note = nullptr;
+      bool harmonic = false;
+      Ratio ratio{0, 0};
+      float time = 0.0f;        // where the point was picked
+      float t0 = 0.0f, t1 = 0.0f;
+      bool valid() const { return note || harmonic; }
+      Ratio r() const { return note ? note->ratio : ratio; }
+      float x() const { return note ? note->time : time; }
+    };
+    MeasurePoint select1, select2;
     bool selectFirst = true;
     char compareText[64];
 
@@ -1704,6 +1713,121 @@ struct Canvas2D {
       if (!clipboard.empty()) empty = false;
     }
 
+    // Box select: Shift + left-drag in the notes. Corners in world space
+    // (seconds, octaves), so the box stays put while panning.
+    struct BoxSelect {
+      bool active = false;
+      Vec2 a{0, 0}, b{0, 0};
+    } box;
+
+    // Notes picked up with m: they follow the cursor in time (keeping their
+    // pitches and spacing) until a click puts them down. Esc cancels.
+    struct MoveSel {
+      bool active = false;
+      float anchorBeat = 0.0f;       // snapped beat the cursor was at on m
+      std::vector<Event*> starts;    // note starts
+    } moveSel;
+
+    // Set after a click has been used up (e.g. putting moved notes down), so
+    // holding the button doesn't then go on to start a note. Cleared on release.
+    bool swallowClick = false;
+
+    // Selects every note that overlaps the box (in time) and whose pitch is
+    // inside it. Adds to the current selection.
+    void selectInBox(Vec2 a, Vec2 b) {
+      float t0 = std::min(a.x, b.x), t1 = std::max(a.x, b.x);
+      float y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
+      for (Event* e = beatEvents.get_first(); e; e = next(e)) {
+        if (e->type != EV_NOTE_START) continue;
+        Event* end = noteEndOf(e);
+        float oct = ratio_to_octave(e->ratio);
+        if (end && e->time <= t1 && end->time >= t0 && oct >= y0 && oct <= y1)
+          e->selected = true;
+      }
+    }
+
+    // A copy of e at another beat (a new event, so the audio thread can
+    // finish walking the old one)
+    Event* cloneEventAt(const Event* e, float beat) {
+      Event* c = e->string_expr.empty() ? new Event(beat, e->type) : new Event(beat, e->string_expr, e->type);
+      c->time = calc_time(&timeEvents, beat);
+      c->ratio = e->ratio;
+      c->beatL = e->beatL; c->beatR = e->beatR;
+      c->num = e->num; c->den = e->den;
+      c->primeFactors = e->primeFactors;
+      c->origin = e->origin;
+      c->selected = e->selected;
+      c->gainDb = e->gainDb;
+      c->profile = e->profile;
+      c->id = e->id;
+      return c;
+    }
+
+    // Shifts notes (given by their starts) by delta beats
+    void moveNotes(const std::vector<Event*>& starts, float delta) {
+      std::map<Event*, Event*> moved;   // old -> new
+      for (Event* s : starts) {
+        if (!hasEvent(s)) continue;
+        Event* end = noteEndOf(s);
+        if (!end) continue;
+        moved[s] = cloneEventAt(s, s->beat + delta);
+        moved[end] = cloneEventAt(end, end->beat + delta);
+      }
+      if (moved.empty()) return;
+      std::vector<Event*> old;
+      for (auto& [o, n] : moved) { beatEvents.remove_event(o); old.push_back(o); }
+      for (auto& [o, n] : moved) beatEvents.insert(n);
+      beatEvents.reparent_tree();
+      beatEvents.ordered = false;
+      // Keep links to the moved notes pointing at their new copies
+      auto remap = [&](Event*& p) { auto it = p ? moved.find(p) : moved.end(); if (it != moved.end()) p = it->second; };
+      for (Event* e = beatEvents.get_first(); e; e = next(e)) remap(e->origin);
+      remap(select1.note);
+      remap(select2.note);
+      remap(originEv);
+      forgetEvents(old);   // anything else (gain box, clip edit) lets go
+    }
+
+    // Removes the foci on `ratio`, as d does when deleting a note: a focus
+    // following another focus becomes a break, otherwise it's removed.
+    void removeFociOn(Ratio ratio) {
+      std::vector<Event*> foci;
+      for (Event* e = beatEvents.get_first(); e; e = next(e))
+        if (e->type == EV_FOCUS) foci.push_back(e);
+      Event* previous = nullptr;
+      for (Event* f : foci) {
+        if (f->ratio.num == ratio.num && f->ratio.den == ratio.den) {
+          if (previous && !(previous->ratio.num == 0 && previous->ratio.den == 0)) {
+            f->ratio = {0, 0};
+          } else {
+            beatEvents.remove_event(f);
+            continue;
+          }
+        }
+        previous = f;
+      }
+    }
+
+    // Deletes notes (given by their starts), with their foci
+    void deleteNotes(const std::vector<Event*>& starts) {
+      std::vector<Event*> removed;
+      for (Event* s : starts) {
+        if (!hasEvent(s)) continue;
+        Event* end = noteEndOf(s);
+        removeFociOn(s->ratio);
+        beatEvents.remove_event(s);
+        removed.push_back(s);
+        if (end) { beatEvents.remove_event(end); removed.push_back(end); }
+      }
+      beatEvents.ordered = false;
+      forgetEvents(removed);
+      if (moveSel.active) {
+        auto& v = moveSel.starts;
+        v.erase(std::remove_if(v.begin(), v.end(), [&](Event* e) { return !hasEvent(e); }), v.end());
+        if (v.empty()) moveSel = {};
+      }
+    }
+
     void startGainEdit(std::vector<Event*> targets) {
       if (targets.empty()) return;
       gainEdit = {true, "", std::move(targets)};
@@ -1729,6 +1853,7 @@ struct Canvas2D {
       float db = std::strtof(gainEdit.text.c_str(), &end);
       if (!gainEdit.text.empty() && end && *end == '\0' && std::isfinite(db)) {
         db = std::clamp(db, PdHost::MIN_DB, 24.0f);
+        pushUndo();
         for (Event* e : gainEdit.targets)
           if (hasEvent(e)) e->gainDb = db;   // skip notes deleted meanwhile
       }
@@ -1737,10 +1862,113 @@ struct Canvas2D {
 
     // Drops every pointer to a note, for when the whole song is replaced
     void forgetNotes() {
-      select1closest = select2closest = nullptr;
+      select1 = select2 = {};
       selectFirst = true;
       originEv = nullptr;
       gainEdit = {};
+    }
+
+    // ---- Undo / redo ----
+    // Each step is a copy of beatEvents (notes, foci, splits, perc blips and
+    // clip extents) taken just before an edit, plus each clip's start
+    // offset. Tempo, tracks, automation and selection-only changes aren't
+    // steps. Track deletes / reorders and loading clear the history, since
+    // they renumber the tracks the copies refer to.
+    struct EventSnap {
+      float beat, time;
+      std::string expr;
+      Ratio ratio;
+      float beatL, beatR;
+      uint32_t num, den;
+      bool selected;
+      float gainDb;
+      int profile, type;
+      uint32_t id;
+      int origin;           // index of the origin note in the snapshot, -1 = none
+      uint64_t clipStart;   // EV_AUDIO_START: its clip's startSample
+    };
+    using Snapshot = std::vector<EventSnap>;
+    static constexpr size_t UNDO_LIMIT = 5;
+    std::deque<Snapshot> undoStack, redoStack;
+
+    Snapshot snapshot() {
+      std::vector<Event*> evs;
+      std::map<const Event*, int> index;
+      for (Event* e = beatEvents.get_first(); e; e = next(e)) {
+        index[e] = (int)evs.size();
+        evs.push_back(e);
+      }
+      Snapshot s;
+      s.reserve(evs.size());
+      for (Event* e : evs) {
+        auto o = e->origin ? index.find(e->origin) : index.end();
+        const Clip* c = e->type == EV_AUDIO_START ? clipOf(e) : nullptr;
+        s.push_back({e->beat, e->time, e->string_expr, e->ratio, e->beatL, e->beatR,
+                     e->num, e->den, e->selected, e->gainDb, e->profile, e->type, e->id,
+                     o == index.end() ? -1 : o->second, c ? c->startSample : 0});
+      }
+      return s;
+    }
+
+    void restore(const Snapshot& s) {
+      // Like load_song, the old events are dropped rather than freed: the
+      // audio thread may still be walking them.
+      beatEvents.root = nullptr;
+      std::vector<Event*> made;
+      made.reserve(s.size());
+      uint32_t maxID = 0;
+      for (const EventSnap& n : s) {
+        Event* e = n.expr.empty() ? new Event(n.beat, n.type) : new Event(n.beat, n.expr, n.type);
+        e->time = n.time;
+        e->ratio = n.ratio;
+        e->beatL = n.beatL; e->beatR = n.beatR;
+        e->num = n.num; e->den = n.den;
+        if (n.den != 0) e->primeFactors = getPrimeFactors(n.den);
+        e->selected = n.selected;
+        e->gainDb = n.gainDb;
+        e->profile = n.profile;
+        e->id = n.id;
+        if (n.type != EV_AUDIO_START && n.type != EV_AUDIO_END) maxID = std::max(maxID, n.id);
+        if (n.type == EV_AUDIO_START)
+          if (Clip* c = clipOf(e)) c->startSample = n.clipStart;
+        beatEvents.insert(e);
+        made.push_back(e);
+      }
+      for (size_t i = 0; i < s.size(); i++)
+        if (s[i].origin >= 0) made[i]->origin = made[s[i].origin];
+      beatEvents.reparent_tree();
+      beatEvents.ordered = false;
+      nextID = std::max(nextID, maxID + 1);
+      if (!s.empty()) empty = false;
+
+      // Nothing may point at the old events
+      forgetNotes();
+      clipEdit = {};
+      moveSel = {};
+      box = {};
+      placing = dragging = false;
+      heldProfile = -1;
+    }
+
+    // Call just before an edit to beatEvents
+    void pushUndo() {
+      undoStack.push_back(snapshot());
+      while (undoStack.size() > UNDO_LIMIT) undoStack.pop_front();
+      redoStack.clear();
+    }
+
+    void clearHistory() { undoStack.clear(); redoStack.clear(); }
+
+    bool undo() { return stepHistory(undoStack, redoStack); }
+    bool redo() { return stepHistory(redoStack, undoStack); }
+
+    bool stepHistory(std::deque<Snapshot>& from, std::deque<Snapshot>& to) {
+      if (from.empty()) return false;
+      to.push_back(snapshot());
+      while (to.size() > UNDO_LIMIT) to.pop_front();
+      restore(from.back());
+      from.pop_back();
+      return true;
     }
 
     Event* createEvExpr(float v, std::string expr, int t) { return new Event(v, expr, t); }
@@ -1883,9 +2111,12 @@ struct Canvas2D {
     bool recording = false;
     float recordStartTime = 0.0f;
 
+    // Esc: stops trimming / moving a clip, moving notes, or a selection box
     bool cancelEdit() {
-      if (clipEdit.mode == CLIP_NONE) return false;
+      if (clipEdit.mode == CLIP_NONE && !moveSel.active && !box.active) return false;
       clipEdit = {};
+      moveSel = {};
+      box = {};
       return true;
     }
 
@@ -1928,6 +2159,7 @@ struct Canvas2D {
     }
 
     void commitClipEdit(float beat) {
+      pushUndo();
       auto [start, end] = clipEditExtent(beat);
       ClipSpan sp = clipEdit.span;
       if (clipEdit.mode == CLIP_TRIM_START && engine) {
@@ -1946,8 +2178,8 @@ struct Canvas2D {
       auto gone = [&](Event* e) { return e && std::find(removed.begin(), removed.end(), e) != removed.end(); };
       if (gone(clipEdit.span.start) || gone(clipEdit.span.end)) clipEdit = {};
       if (gone(originEv)) originEv = nullptr;
-      if (gone(select1closest)) select1closest = nullptr;
-      if (gone(select2closest)) select2closest = nullptr;
+      if (gone(select1.note)) { select1 = {}; selectFirst = true; }
+      if (gone(select2.note)) select2 = {};
       for (Event* e = beatEvents.get_first(); e; e = next(e))
         if (gone(e->origin)) e->origin = nullptr;
     }
@@ -2804,6 +3036,11 @@ struct Canvas2D {
           lastClick = click;
           return;
         }
+        if (swallowClick) {
+          if (click == 1) click = 0;
+          else swallowClick = false;
+        }
+        const bool clickPressed = click == 1 && lastClick != 1;
         lastClick = click;
 
         // Compute visible world rect
@@ -2860,6 +3097,11 @@ struct Canvas2D {
 
         Ratio focusAtCursor = {99999999, 99999999};
 
+        // Set when the cursor snaps to a harmonic line, which runs from
+        // harmT0 to harmT1 (seconds)
+        bool harmHover = false;
+        float harmT0 = 0.0f, harmT1 = 0.0f;
+
         currentEvsAtCursor.clear();
         std::vector<Event*> noteStarts;
         Event* prevEv = nullptr;
@@ -2872,6 +3114,9 @@ struct Canvas2D {
                   // Snap to harmonics
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
                     hoverR = snapRootHarmonics(unsnappedHoverW, root);
+                    harmHover = root.num != 0;
+                    harmT0 = lastNoteEvTime;
+                    harmT1 = currentBeatEv->time;
                   }
                 }
                 lastNoteEvTime = currentBeatEv->time;
@@ -2884,6 +3129,9 @@ struct Canvas2D {
                   printf("root ratio: %d/%d\n", root.num, root.den);
                   if (unsnappedHoverW.x > lastNoteEvTime && unsnappedHoverW.x < currentBeatEv->time) {
                     hoverR = snapRootHarmonics(unsnappedHoverW, root);
+                    harmHover = root.num != 0;
+                    harmT0 = lastNoteEvTime;
+                    harmT1 = currentBeatEv->time;
                   }
                 }
                 Event* noteEv = nullptr;
@@ -3063,6 +3311,9 @@ struct Canvas2D {
               if (hoveredWithin && closest.num != 999999999) {
                 focusAtCursor = prevEv->ratio;
                 hoverR = closest;
+                harmHover = true;
+                harmT0 = prevEv->time;
+                harmT1 = currentBeatEv->time;
                 Ratio simpRat = closest;
                 if (simpRat.num > simpRat.den) {
                   while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
@@ -3126,6 +3377,7 @@ struct Canvas2D {
               if (split_start < 0.0f)
                 split_start = snappedBeat;
               else {
+                pushUndo();
                 insertSplit(split_start, snappedBeat, std::atoi(split));
                 split_start = -1.0f;
               }
@@ -3133,15 +3385,24 @@ struct Canvas2D {
             if (containsKey(keys, 'x')) {
               // Remove the rhythm split under the cursor
               Event* beatEv = findBeatEv(beatEvents.root, snappedBeat);
-              if (beatEv)
+              if (beatEv) {
+                pushUndo();
                 beatEvents.remove_event(beatEv);
+              }
             }
             if (containsKey(keys, ' '))
                 play_triggered_from_space = true;
-            if (containsKey(keys, 'v'))
+            if (containsKey(keys, 'v') && !clipboard.empty()) {
+                pushUndo();
                 pasteNotes(snappedBeat);
+            }
             if (containsKey(keys, 'r')) {
-                // Remove selected notes
+                // Remove the selected notes
+                std::vector<Event*> notes = selectedNotes();
+                if (!notes.empty()) {
+                  pushUndo();
+                  deleteNotes(notes);
+                }
             }
         }
 
@@ -3177,6 +3438,7 @@ struct Canvas2D {
 
         // d over a blip deletes it
         if (hovered && closestBlip && containsKey(keys, 'd')) {
+          pushUndo();
           beatEvents.remove_event(closestBlip);
           closestBlip = nullptr;
         }
@@ -3204,6 +3466,7 @@ struct Canvas2D {
           } else if (containsKey(keys, 'm')) {
             clipEdit = {CLIP_MOVE, hoverClip, snappedBeat - hoverClip.start->beat};
           } else if (containsKey(keys, 'd')) {
+            pushUndo();
             beatEvents.remove_event(hoverClip.start);
             beatEvents.remove_event(hoverClip.end);
             spans = clipSpans();
@@ -3211,23 +3474,51 @@ struct Canvas2D {
           }
         }
 
-        if (containsKey(keys, 'e') && closest) {
-          if (selectFirst) {
-            select1 = hoverW;
-            select1closest = closest;
-            select2closest = nullptr;
+        // What e would pick under the cursor: the harmonic line it snapped
+        // to, if that's nearer than the closest note, else the closest note
+        MeasurePoint hoverMark;
+        if (inNotes) {
+          float y = unsnappedHoverW.y;
+          if (harmHover && hoverR.den != 0 &&
+              (!closest || std::abs(y - ratio_to_octave(hoverR)) < std::abs(y - ratio_to_octave(closest->ratio)))) {
+            hoverMark.harmonic = true;
+            hoverMark.ratio = hoverR;
+            hoverMark.time = hoverW.x;
+            hoverMark.t0 = harmT0;
+            hoverMark.t1 = harmT1;
           } else {
-            select2 = hoverW;
-            select2closest = closest;
+            hoverMark.note = closest;
+          }
+        }
+
+        if (containsKey(keys, 'e') && hoverMark.valid()) {
+          if (selectFirst) {
+            select1 = hoverMark;
+            select2 = {};
+          } else {
+            select2 = hoverMark;
           }
           selectFirst = !selectFirst;
         }
 
-        // Interval between the notes picked with e. Between the first and
-        // second press it's measured against the closest note.
-        Event* compareTo = selectFirst ? select2closest : closest;
-        if (select1closest && compareTo) {
-          Ratio rat = simplifyR(divideR(compareTo->ratio, select1closest->ratio));
+        // Interval between the points picked with e. Between the first and
+        // second press it's measured against whatever is under the cursor.
+        // Harmonic ends are highlighted orange, as is the reading when one
+        // of its ends is a harmonic.
+        const glm::vec4 measureOrange(1.0f, 0.55f, 0.1f, 1.0f);
+        auto highlightHarmonic = [&](const MeasurePoint& m) {
+          if (!m.harmonic) return;
+          float oct = ratio_to_octave(m.ratio);
+          Vec2 ap = worldToScreen(topLeft, {m.t0, oct});
+          Vec2 bp = worldToScreen(topLeft, {m.t1, oct});
+          addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 1, bp.x - ap.x, 3,
+                        measureOrange.r, measureOrange.g, measureOrange.b);
+        };
+        const MeasurePoint& compareTo = selectFirst ? select2 : hoverMark;
+        if (select1.valid() && compareTo.valid()) {
+          highlightHarmonic(select1);
+          highlightHarmonic(compareTo);
+          Ratio rat = simplifyR(divideR(compareTo.r(), select1.r()));
           Ratio simpRat = rat;
           if (simpRat.num > simpRat.den) {
             while (simpRat.num % 2 == 0 && simpRat.num > simpRat.den * 2) {
@@ -3239,12 +3530,16 @@ struct Canvas2D {
             }
           }
           sprintf(compareText, "%d/%d (%d/%d)", rat.num, rat.den, simpRat.num, simpRat.den);
-          renderer.addText(compareText, bottomRight.x - 150, bottomRight.y + 21, 15.0f, glm::vec4(1.0f, 1.0f, 0.6f, 1.0f));
+          bool viaHarmonic = select1.harmonic || compareTo.harmonic;
+          renderer.addText(compareText, bottomRight.x - 150, bottomRight.y + 21, 15.0f,
+                           viaHarmonic ? measureOrange : glm::vec4(1.0f, 1.0f, 0.6f, 1.0f));
         }
-        if (!selectFirst && select1closest) {   // mark the first note while choosing the second
-          Vec2 p = worldToScreen(topLeft, {select1closest->time, ratio_to_octave(select1closest->ratio)});
-          if (p.x >= topLeft.x && p.x <= bottomRight.x && p.y >= bottomRight.y && p.y <= topLeft.y)
-            renderer.addCircle(p.x, p.y, 4.0f, 1.0f, 1.0f, 0.6f);
+        if (!selectFirst && select1.valid()) {   // mark the first point while choosing the second
+          Vec2 p = worldToScreen(topLeft, {select1.x(), ratio_to_octave(select1.r())});
+          if (p.x >= topLeft.x && p.x <= bottomRight.x && p.y >= bottomRight.y && p.y <= topLeft.y) {
+            if (select1.harmonic) renderer.addCircle(p.x, p.y, 4.0f, measureOrange.r, measureOrange.g, measureOrange.b);
+            else                  renderer.addCircle(p.x, p.y, 4.0f, 1.0f, 1.0f, 0.6f);
+          }
         }
 
         // c copies the selected notes (or the closest one if none are
@@ -3254,6 +3549,43 @@ struct Canvas2D {
           if (notes.empty() && closest) notes.push_back(closest);
           if (containsKey(keys, 'c')) copyNotes(notes);
           if (containsKey(keys, 'g')) startGainEdit(notes);
+        }
+
+        // m picks up the selected notes (or the closest one) to move them
+        // in time; a click puts them down
+        if (hovered && inNotes && containsKey(keys, 'm') && !moveSel.active && !placing && !dragging && !box.active) {
+          std::vector<Event*> notes = selectedNotes();
+          if (notes.empty() && closest) notes.push_back(closest);
+          if (!notes.empty()) moveSel = {true, snappedBeat, notes};
+        }
+        if (moveSel.active) {
+          auto& v = moveSel.starts;
+          v.erase(std::remove_if(v.begin(), v.end(), [&](Event* e) { return !hasEvent(e); }), v.end());
+          if (v.empty()) moveSel = {};
+        }
+        if (moveSel.active) {
+          float earliest = moveSel.starts[0]->beat;
+          for (Event* s : moveSel.starts) earliest = std::min(earliest, s->beat);
+          float delta = std::max(snappedBeat - moveSel.anchorBeat, -earliest);   // not before 0
+          // Where they'd land, drawn over everything
+          for (Event* s : moveSel.starts) {
+            Event* end = noteEndOf(s);
+            if (!end) continue;
+            float oct = ratio_to_octave(s->ratio);
+            Vec2 ap = worldToScreen(topLeft, {calc_time(&timeEvents, s->beat + delta), oct});
+            Vec2 bp = worldToScreen(topLeft, {calc_time(&timeEvents, end->beat + delta), oct});
+            addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 2, bp.x - ap.x, 4, 0.9f, 0.9f, 0.9f);
+          }
+          renderer.addText("Moving notes: click to put down, Esc to cancel", topLeft.x + 3, topLeft.y - 32, 13.0f,
+                           glm::vec4(0.9f, 0.9f, 0.9f, 1.0f));
+          if (hovered && clickPressed) {
+            pushUndo();
+            moveNotes(moveSel.starts, delta);
+            moveSel = {};
+            click = 0;
+            swallowClick = true;   // holding the button mustn't start a note
+            closest = nullptr;     // may have been moved
+          }
         }
 
         // Draw origin line
@@ -3284,7 +3616,9 @@ struct Canvas2D {
           int number = numberContained(keys);
           int target = number == -1 ? -1 : hotkeyTrack('0' + number);
 
-          if (target != -1 && target < (int)g_tracks.size() && g_tracks[target].type == TrackType::Standard) {
+          if (target != -1 && target < (int)g_tracks.size() && g_tracks[target].type == TrackType::Standard &&
+              closest->profile != target) {
+            pushUndo();
             closest->profile = target;
           }
 
@@ -3306,11 +3640,13 @@ struct Canvas2D {
               current += 1;
               den = getNum(current, noVal);
               Ratio jump = {num, den};
+              pushUndo();
               closest->ratio = simplifyR(multiplyR(jump, closest->ratio));
             }
 
             if (containsKey(keys, 'd') || containsKey(keys, 'f') || \
                   containsKey(keys, 'l')) {
+                pushUndo();   // for f / l: undo puts the note back where it was
                 // Delete the note because it will be replaced
                 beatEvents.inorder();
                 Event* noteEnd = next(closest);
@@ -3374,8 +3710,8 @@ struct Canvas2D {
                 if (containsKey(keys, 'd')) {
                   forgetEvents({closest, noteEnd});
                 } else {   // f / l put the note back as a new event
-                  if (select1closest == closest) { select1closest = nullptr; selectFirst = true; }
-                  if (select2closest == closest) select2closest = nullptr;
+                  if (select1.note == closest) { select1 = {}; selectFirst = true; }
+                  if (select2.note == closest) select2 = {};
                 }
             }
         }
@@ -3389,6 +3725,7 @@ struct Canvas2D {
         // Have to constantly convert world x coordinate into beats for hover snap, should be a relatively simple calculation
 
         if (inNotes && click == 2 && !placing && (int)currentEvsAtCursor.size() > 0) {
+            pushUndo();
             float dist = 999999999999.0f;
             b = currentBeat;
             Event* closest;
@@ -3586,11 +3923,36 @@ struct Canvas2D {
             }
         }
 
+        // Shift + left-drag in the notes draws a box; on release the notes in
+        // it are added to the selection
+        if (!box.active && clickPressed && hovered && inNotes && (SDL_GetModState() & KMOD_SHIFT) &&
+            !placing && !dragging && !moveSel.active && clipEdit.mode == CLIP_NONE) {
+          box = {true, unsnappedHoverW, unsnappedHoverW};
+        }
+        if (box.active) {
+          if (hovered && inNotes) box.b = unsnappedHoverW;
+          if (click == 1) {
+            Vec2 a = worldToScreen(topLeft, box.a), b = worldToScreen(topLeft, box.b);
+            float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x);
+            float y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
+            const float c[3] = {0.55f, 0.75f, 1.0f};
+            addCanvasRect(renderer, topLeft, bottomRight, x0, y0, x1 - x0, 1, c[0], c[1], c[2]);
+            addCanvasRect(renderer, topLeft, bottomRight, x0, y1, x1 - x0, 1, c[0], c[1], c[2]);
+            addCanvasRect(renderer, topLeft, bottomRight, x0, y0, 1, y1 - y0, c[0], c[1], c[2]);
+            addCanvasRect(renderer, topLeft, bottomRight, x1, y0, 1, y1 - y0, c[0], c[1], c[2]);
+          } else {
+            selectInBox(box.a, box.b);
+            box = {};
+          }
+          click = 0;   // no note placing while boxing
+        }
+
         // A click finishes trimming / moving a clip (and does nothing else)
         if (hovered && click == 1 && clipEdit.mode != CLIP_NONE) {
           commitClipEdit(snappedBeat);
           spans = clipSpans();
           click = 0;
+          swallowClick = true;
         }
 
         // Input: left-click to place/finish
@@ -3641,9 +4003,8 @@ struct Canvas2D {
                 // Second click: finish note
                 float a = anchorW.x, b = hoverW.x;
                 if (a != b) {
-                    if (snap_harmonics) {
-                        // Check whether there's any focus at the anchor
-                    }
+                    // A note picked up with l was already saved when it was picked up
+                    if (heldProfile < 0) pushUndo();
                     Event* e1;
                     Event* e2;
                     if (anchorBeat > snappedBeat) {
@@ -3683,6 +4044,7 @@ struct Canvas2D {
             // The blip's height is its track's lane; the stored value is only
             // used by MIDI export (as an octave, 4 = C4).
             {
+              pushUndo();
               Event* ev = new Event(snappedBeat, "4", EV_PERC);
               ev->profile = hoverPercTrack;
               // Unique id, so the blip can be removed without touching other
@@ -4313,6 +4675,7 @@ struct App {
     // Swaps two tracks: their rows, their notes and blips, and their Pd slots.
     void swapTracks(int a, int b) {
         if (a == b) return;
+        gBeatOctCanvas.clearHistory();   // the snapshots' track numbers would be stale
         endAutoTakes();
         gBeatOctCanvas.picker = {};
         gBeatOctCanvas.autoEdit = {};
@@ -4351,6 +4714,7 @@ struct App {
         int n = (int)g_tracks.size();
         if (n <= 1 || i < 0 || i >= n) return;
         Canvas2D& c = gBeatOctCanvas;
+        c.clearHistory();   // the snapshots would hold this track's notes
 
         std::vector<Event*> removed;
         for (Event* e = c.beatEvents.get_first(); e; e = next(e)) {
@@ -4423,10 +4787,16 @@ struct App {
         for (int i = 0; i < (int)g_tracks.size(); i++) {
             const Track& t = g_tracks[i];
             bool audible = !t.mute && (!anySolo || t.solo);
-            engine.pd.setGain(i, t.gainDb);
+            // The gain is applied in the engine's mix, after the patch /
+            // plugins, so Pd's [r $0-gain] stays at 0 dB (not applied twice)
+            engine.pd.setGain(i, 0.0f);
             engine.setTrackGain(i, t.gainDb);
             engine.setTrackAudible(i, audible);
+            // Armed audio tracks play the live input through themselves
+            engine.setTrackMonitor(i, t.type == TrackType::Audio && t.armed);
         }
+        for (int i = (int)g_tracks.size(); i < MAX_TRACKS; i++)   // slots of deleted tracks
+            engine.setTrackMonitor(i, false);
     }
 
     // ---- Track list scrolling (only whole rows are shown) ----
@@ -4715,6 +5085,7 @@ struct App {
     // ones overlapping an edge are trimmed, and one spanning it is split.
     void layDownClip(int t, Clip clip, float startBeat, float endBeat) {
         Canvas2D& c = gBeatOctCanvas;
+        c.pushUndo();
         const double spb = engine.samplesPerBeat();
         const float eps = 1e-6f;
 
@@ -4885,6 +5256,7 @@ struct App {
         gBeatOctCanvas.picker = {};
         gBeatOctCanvas.autoEdit = {};
         gBeatOctCanvas.forgetNotes();
+        gBeatOctCanvas.clearHistory();
         autoTakes.clear();   // their lanes are about to go
         load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate,
                   automation);
@@ -5272,6 +5644,7 @@ int main(int, char**)
     renderer.createSpectrogramPipeline();
  
     bool running = true;
+    bool quitPrompt = false;   // "save before quitting?" is showing
     bool rerender = true;
     bool ctrl = false;
     int click = 0;
@@ -5312,7 +5685,7 @@ int main(int, char**)
             rerender = true;
             switch (e.type) {
             case SDL_QUIT:
-                running = false;
+                quitPrompt = true;   // ask about saving first
                 break;
  
             case SDL_WINDOWEVENT:
@@ -5320,10 +5693,11 @@ int main(int, char**)
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   windowActive = false;
                 if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) renderer.onResize(window);
                 if (e.window.event == SDL_WINDOWEVENT_CLOSE &&
-                    e.window.windowID == SDL_GetWindowID(window)) running = false;
+                    e.window.windowID == SDL_GetWindowID(window)) quitPrompt = true;
                 break;
  
             case SDL_MOUSEBUTTONDOWN:
+               if (quitPrompt) { quitPrompt = false; break; }   // a click cancels quitting
                if (e.button.button == SDL_BUTTON_LEFT) {
                  // Any click disarms a track's delete button; clicking it again
                  // right away (see rebuildTrackRows) deletes the track.
@@ -5344,6 +5718,15 @@ int main(int, char**)
             case SDL_KEYDOWN: {
                 SDL_Keycode sym = e.key.keysym.sym;
                 char key = sym;
+
+                // Quit prompt: Enter saves and quits, Esc quits, anything else cancels
+                if (quitPrompt) {
+                  if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { app.saveProject(); running = false; }
+                  else if (sym == SDLK_ESCAPE) running = false;
+                  else if (sym != SDLK_LSHIFT && sym != SDLK_RSHIFT && sym != SDLK_LCTRL &&
+                           sym != SDLK_RCTRL && sym != SDLK_LALT && sym != SDLK_RALT) quitPrompt = false;
+                  break;
+                }
 
                 // While the note gain box is open it takes every key
                 if (gBeatOctCanvas.gainEdit.active) {
@@ -5374,10 +5757,17 @@ int main(int, char**)
                   else if (gBeatOctCanvas.clearSelection()) {}
                   else if (vst3::editorsOpen()) vst3::closeAllEditors();
                   else if (gBeatOctCanvas.autoMode) app.toggleAutomationMode();
-                  else running = false;
+                  else quitPrompt = true;   // ask about saving first
                   break;
                 }
                 if (sym == SDLK_LCTRL) { ctrl = true; break; }
+
+                // Ctrl+Z undoes the last note edit, Ctrl+Shift+Z / Ctrl+Y redoes it
+                if ((e.key.keysym.mod & KMOD_CTRL) && !app.ui.focused && (sym == SDLK_z || sym == SDLK_y)) {
+                  if (sym == SDLK_y || (e.key.keysym.mod & KMOD_SHIFT)) gBeatOctCanvas.redo();
+                  else gBeatOctCanvas.undo();
+                  break;
+                }
 
                 // Up / Down grow / shrink the perc or audio strip under the
                 // cursor; with Shift they move the current track instead.
@@ -5496,6 +5886,18 @@ int main(int, char**)
             drawMargin(renderer, screenNw);
             renderer.nextLayer();
             app.ui.drawOverlay(renderer, (float)dh);   // dropdowns on top of everything
+
+            if (quitPrompt) {   // centred over the note window
+                const float w = 520, h = 58;
+                float x = (screenNw.x1 + screenNw.x2) / 2 - w / 2;
+                float y = (screenNw.y1 + screenNw.y2) / 2 - h / 2;
+                renderer.addRect(x - 2, y - 2, w + 4, h + 4, 1.0f, 0.55f, 0.1f);
+                renderer.addRect(x, y, w, h, 0.12f, 0.12f, 0.13f);
+                renderer.addText("Quit Sonnote? Unsaved changes will be lost.", x + 10, y + h - 22, 15.0f,
+                                 glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                renderer.addText("Enter: save (session.son) and quit    Esc: quit without saving    Other: cancel",
+                                 x + 10, y + 10, 13.0f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
+            }
  
             renderer.updateVertexData();
             renderer.drawFrame(std::floor(screenNw.x1), std::floor(screenNw.y1),

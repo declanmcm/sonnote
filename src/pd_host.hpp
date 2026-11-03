@@ -111,7 +111,7 @@ public:
     static constexpr float MIN_DB = -60.0f;   // at or below this, gain is 0
     static float dbToGain(float db);
 
-    void setGain(int slot, float db);   // -> [r $0-gain] of the slot's patch
+    void setGain(int slot, float db);   // -> [r $0-gain] of the slot's patch (Sonnote now keeps this at 0 dB and applies track gain in its mix)
     void setTempo(float bpm);           // -> sonnote-tempo, sonnote-beatms
     void setPlaying(bool on);           // -> sonnote-playing
     void setRefFreq(float hz);          // -> sonnote-ref

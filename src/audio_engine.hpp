@@ -699,8 +699,12 @@ public:
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
     void setProfile(const Profile& p, int n);
-    void setTrackGain(int track, float db);   // clip playback gain (PdHost::MIN_DB = silent)
+    void setTrackGain(int track, float db);   // the track's fader, applied in the mix (PdHost::MIN_DB = silent)
     void setTrackAudible(int track, bool on); // mute / solo: silences the track's whole output
+    // Input monitoring: the live input plays through the track (its Pd patch
+    // or straight onto its bus, then its effects and gain), playing or not.
+    // Nothing is recorded by this.
+    void setTrackMonitor(int track, bool on);
 
     // ---- VST3 plugins (main thread) ----
     // Each track can have a VST3 instrument, which plays its notes (alongside
@@ -820,8 +824,10 @@ private:
     std::array<uint8_t, MAX_VOICES> voiceProfiles{};
 
     // ---- Clip playback (audio thread) ----
-    std::array<std::atomic<float>, MAX_TRACKS> trackGain;   // linear
+    std::array<std::atomic<float>, MAX_TRACKS> trackGain;   // linear, the track's fader
+    std::array<float, MAX_TRACKS> mixGain{};                // gain the mix last used (audio thread), for ramping
     std::array<std::atomic<bool>, MAX_TRACKS> trackAudible; // false = bus left out of the mix
+    std::array<std::atomic<bool>, MAX_TRACKS> trackMonitor; // live input goes through the track
     struct ClipVoice {
         bool     active = false;
         int      track = 0;

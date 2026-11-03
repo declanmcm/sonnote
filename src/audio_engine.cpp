@@ -35,7 +35,9 @@ AudioEngine::AudioEngine() {
     // Lock memory to avoid page faults in audio thread
     mlockall(MCL_CURRENT | MCL_FUTURE);
     for (auto& g : trackGain) g = 1.0f;
+    mixGain.fill(1.0f);
     for (auto& a : trackAudible) a = true;
+    for (auto& m : trackMonitor) m = false;
     recRing.assign(REC_RING, 0.0f);
     busData.assign((size_t)MAX_TRACKS * 2 * MAX_BLOCK, 0.0f);
     clipInData.assign((size_t)MAX_TRACKS * MAX_BLOCK, 0.0f);
@@ -301,6 +303,10 @@ void AudioEngine::setTrackGain(int track, float db) {
 
 void AudioEngine::setTrackAudible(int track, bool on) {
     if (track >= 0 && track < MAX_TRACKS) trackAudible[track] = on;
+}
+
+void AudioEngine::setTrackMonitor(int track, bool on) {
+    if (track >= 0 && track < MAX_TRACKS) trackMonitor[track] = on;
 }
 
 size_t AudioEngine::drainRecording(std::vector<float>& out) {
@@ -758,17 +764,27 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
     // VST3 instruments add to their track's bus, then its effects process it
     processPlugins(n, blockStart, samplesPerBeat);
 
-    // Mix: every audible track's bus plus the metronome. Muted tracks are
-    // still rendered (so Pd and VST3 tails carry on), just not heard.
+    // Mix: every audible track's bus, through its gain (a post-FX fader, so
+    // it works whatever makes the sound: clips, Pd or a VST3 instrument),
+    // plus the metronome. Muted tracks are still rendered (so Pd and VST3
+    // tails carry on), just not heard. Gain changes ramp over the block so
+    // moving the slider doesn't click.
     std::array<bool, MAX_TRACKS> audible;
-    for (int t = 0; t < MAX_TRACKS; t++)
+    std::array<float, MAX_TRACKS> g0, gStep;
+    for (int t = 0; t < MAX_TRACKS; t++) {
         audible[t] = trackAudible[t].load(std::memory_order_relaxed);
+        float target = trackGain[t].load(std::memory_order_relaxed);
+        g0[t] = mixGain[t];
+        gStep[t] = n > 0 ? (target - g0[t]) / (float)n : 0.0f;
+        mixGain[t] = target;
+    }
     for (uint32_t i = 0; i < n; i++) {
         float l = metroBuf[i], r = metroBuf[i];
         for (int t = 0; t < MAX_TRACKS; t++) {
             if (!audible[t]) continue;
-            l += busL(t)[i];
-            r += busR(t)[i];
+            const float g = g0[t] + gStep[t] * (float)(i + 1);
+            l += busL(t)[i] * g;
+            r += busR(t)[i] * g;
         }
         outL[i] = std::clamp(l, -1.0f, 1.0f);
         outR[i] = std::clamp(r, -1.0f, 1.0f);
@@ -796,7 +812,6 @@ void AudioEngine::renderSegment(uint32_t pos, uint32_t len, const float* input,
             const auto& clips = g_clips[v.track];
             if (v.clip >= clips.size()) continue;
             const Clip& c = clips[v.clip];
-            const float g = trackGain[v.track].load(std::memory_order_relaxed);
             const bool toPd = pd.routes(v.track);
             float* dst = toPd ? clipIn(v.track) : busL(v.track) + pos;
             if (toPd && !hasClipIn[v.track]) {
@@ -807,10 +822,32 @@ void AudioEngine::renderSegment(uint32_t pos, uint32_t len, const float* input,
             for (uint32_t i = 0; i < len; i++) {
                 int64_t p = first + (int64_t)(i * step);
                 if (p < 0 || p >= (int64_t)c.samples.size()) continue;
-                dst[i] += c.samples[(size_t)p] * g;
+                dst[i] += c.samples[(size_t)p];   // track gain is applied in the mix
             }
             if (!toPd)   // mono clip: same on both sides
                 for (uint32_t i = 0; i < len; i++) busR(v.track)[pos + i] = busL(v.track)[pos + i];
+        }
+    }
+
+    // Monitored tracks get the live input, playing or not: into the Pd
+    // patch's input like clip audio, or onto the bus (both sides, it's mono),
+    // where the track's effects then process it
+    if (input) {
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            if (!trackMonitor[t].load(std::memory_order_relaxed)) continue;
+            if (pd.routes(t)) {
+                float* dst = clipIn(t);
+                if (!hasClipIn[t]) {
+                    std::fill_n(dst, len, 0.0f);
+                    hasClipIn[t] = true;
+                }
+                for (uint32_t i = 0; i < len; i++) dst[i] += input[pos + i];
+            } else {
+                for (uint32_t i = 0; i < len; i++) {
+                    busL(t)[pos + i] += input[pos + i];
+                    busR(t)[pos + i] += input[pos + i];
+                }
+            }
         }
     }
 
