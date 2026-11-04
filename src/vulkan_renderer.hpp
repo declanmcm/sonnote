@@ -326,7 +326,8 @@ public:
         VkImage image, VkFormat,
         VkImageLayout oldLayout, VkImageLayout newLayout
     ) {
-        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily);
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily, pool);
 
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.oldLayout = oldLayout;
@@ -359,12 +360,13 @@ public:
         }
 
         vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
-        endSingleTimeCommands(device, cmd, graphicsQueue, graphicsFamily);
+        endSingleTimeCommands(device, cmd, graphicsQueue, pool);
     }
 
     void copyBufferToImage(VkBuffer buffer, VkImage image, int w, int h)
     {
-        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily);
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = beginSingleTimeCommands(device, graphicsFamily, pool);
 
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
@@ -378,7 +380,7 @@ public:
         region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
 
         vkCmdCopyBufferToImage(cmd, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        endSingleTimeCommands(device, cmd, graphicsQueue, graphicsFamily);
+        endSingleTimeCommands(device, cmd, graphicsQueue, pool);
     }
 
 
@@ -388,6 +390,7 @@ private:
     uint32_t windowWidth;
     uint32_t windowHeight;
     VkInstance instance{};
+    VkDebugUtilsMessengerEXT debugMessenger{};
     VkSurfaceKHR surface{};
     VkPhysicalDevice physicalDevice{};
     VkDevice device{};
@@ -514,7 +517,6 @@ private:
         auto func = (PFN_vkCreateDebugUtilsMessengerEXT)
             vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
 
-        VkDebugUtilsMessengerEXT debugMessenger;
         if (func != nullptr) {
             func(instance, &debugCreateInfo, nullptr, &debugMessenger);
         }

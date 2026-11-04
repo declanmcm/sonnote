@@ -16,6 +16,10 @@ cmake --build build -j
 ./build/app
 ```
 
+It can be launched from any folder: Sonnote finds its own folder from the
+executable and works from there, so relative paths (`recordings/`, `export.mid`,
+and those typed into the save and load prompts) start there too.
+
 ---
 
 # User guide
@@ -27,11 +31,13 @@ the cursor vertically.
 
 ## The screen
 
-- **Menu bar** (top): `File` menu, `Rec` button, `Automation (Tab)` button.
+- **Menu bar** (top): `File` menu, `Rec` button, `Automation (Tab)` button,
+  `Tempo` and `Master gain` buttons (see *Global lanes*), `FX chain (b)`
+  button (toggles the signal chain bar at the bottom).
 - **Track list**: one row per track.
 - **Control panel**: BPM, reference frequency, jump / split sizes, harmonic
-  ranges, the current track's sound (oscillators, Pd patch, VST3 instrument
-  and effects, tuning).
+  ranges, the current track's sound (oscillators, Pd patch, VST3 instrument,
+  tuning).
 - **Note window**: x is time, y is pitch in octaves (up = higher). Below the
   notes are the **perc strip** (one lane per perc track) and the **audio
   strip** (one lane per audio track).
@@ -49,12 +55,16 @@ the cursor vertically.
 
 | Key | Action |
 |---|---|
-| **Space** | Play / stop |
-| **p** | Move the playhead to the cursor |
+| **Space** | Play / pause. The playhead stays where it stopped and playing carries on from there |
+| **p** | Move the playhead to the closest beat or rhythm split, also while playing |
+| **Shift + p** | Move the playhead exactly to the cursor, without snapping |
 | **u** | Set the loop end at the cursor (press again at the same spot to clear it) |
 | **k** | Metronome on / off |
 | **t** | Tuner on / off |
 | **n** | Freeze on / off |
+
+A loop goes back to where **p** last put the playhead, however many times
+you've paused since.
 
 ## Writing notes
 
@@ -148,7 +158,8 @@ interval to it is shown at the bottom left.
   between them into *Split size* equal parts (rhythm splits that notes snap
   to).
 - **x**: remove the rhythm split under the cursor.
-- **BPM** slider: the tempo.
+- **BPM** slider: the tempo, until the Tempo lane has points (see *Global
+  lanes*). After that this spot shows the tempo at the playhead.
 
 ## Tracks
 
@@ -167,8 +178,19 @@ interval to it is shown at the bottom left.
   Release / Gain / Hold sliders and a Freq box.
 - **Pd patch**: name of a Pure Data patch to play the track; **Edit in Pd**
   opens it (the patch reloads when its Pd window is closed).
-- **Inst / FX**: VST3 instrument and effects, each with an **Edit** button
-  for the plugin window.
+- **Inst**: VST3 instrument of the current track, with an **Edit** button that
+  opens its window. Its effects are in the signal chain bar.
+- **FX chain (b)** in the menu bar: toggles the signal chain bar at the bottom,
+  showing the current track's instrument and effects in processing order.
+  Each card has a slider per parameter, so plugins without a window are usable
+  too (the wheel scrolls them, **Find** filters them), and **UI** opens the
+  plugin's window. **<** and **>** reorder effects, and **x** clicked twice
+  removes one along with its automation. To add an effect, click it in the last
+  card, or type in its **Find** box and press Enter, which takes the first
+  match, or with no match tries the text as a name or a path to a `.vst3`.
+  With Rec on, moving a slider during playback records automation, as moving
+  the control in the plugin's window does. Shift + wheel scrolls along the
+  chain if it doesn't fit.
 - **Tuning**: how microtonal pitches are sent to a VST3 instrument (click to
   cycle).
 
@@ -204,9 +226,38 @@ automation for the current track; Tab again to go back.
 - With **Rec** on, moving a control in a plugin window during playback records
   it into that parameter's lane.
 
+## Global lanes
+
+Two lanes belong to the whole song rather than a track. The `Tempo` and `Master
+gain` buttons show them in automation mode; press the button again to go back
+to the track's lane, or **Tab** to go back to the notes.
+
+| Key / mouse | Action |
+|---|---|
+| **Click / drag** | Draw points |
+| **Drag a point** | Move it |
+| **g** | Type an exact value for the point under the cursor, or for a new point there. Enter applies, Esc cancels |
+| **d** | Delete the point under the cursor |
+
+- **Tempo** runs from 20 to 260 BPM. New points snap to beats, rhythm splits
+  and whole BPM; hold **Shift** not to. Between two points the tempo changes
+  smoothly; for a sudden change, put two points close together. Before the
+  first point and after the last it stays level.
+- **Master gain** scales everything but the metronome: the top of the lane is
+  0 dB and the bottom is silence.
+
+The note window's x axis is time, so a tempo change moves the notes on screen:
+they keep their beats. This happens when you let go of the mouse. Clips also
+keep their start and end beats, but they aren't stretched, so a clip can end
+early if the tempo speeds up under it. MIDI export has the tempo too, with
+ramps as small steps.
+
 ## Files
 
-The `File` menu: **Save project** / **Load project** (`session.son`),
+The `File` menu: **Save project** / **Load project** ask for a file (starting
+from the last one used, or `session.son`): type a name or path, **Tab**
+completes folders and `.son` files, **Enter** confirms, **Esc** cancels. Saving
+adds `.son` to a name with no extension and asks before replacing another file.
 **Export WAV** (to the name in *Wav name*), **Export MIDI** (`export.mid`).
 
 ## Escape and quitting
@@ -214,5 +265,5 @@ The `File` menu: **Save project** / **Load project** (`session.son`),
 Esc closes / cancels, in order: text editing, a clip edit / note move /
 selection box, an open menu, the note selection, open plugin windows,
 automation mode. With nothing left to close, Esc (or closing the window)
-asks before quitting: **Enter** saves to `session.son` and quits, **Esc**
-quits without saving, any other key or a click cancels.
+asks before quitting: **Enter** asks for a file name, then saves and quits (Esc
+there goes back), **Esc** quits without saving, any other key or a click cancels.

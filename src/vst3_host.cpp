@@ -182,6 +182,8 @@ public:
 // ======================================================
 
 struct Plugin::Impl {
+    static inline uint64_t nextUid = 1;   // only load() makes them, on the main thread
+    uint64_t uid = nextUid++;
     std::string name, query;
     bool instrument = false;
     double sampleRate = 48000.0;
@@ -318,6 +320,7 @@ Plugin::~Plugin() {
 
 const std::string& Plugin::name() const  { return d->name; }
 const std::string& Plugin::query() const { return d->query; }
+uint64_t Plugin::uid() const             { return d->uid; }
 bool Plugin::isInstrument() const        { return d->instrument; }
 
 std::unique_ptr<Plugin> Plugin::load(const std::string& query, bool instrument,
@@ -605,6 +608,12 @@ std::string Plugin::paramText(uint32_t id, double v) {
     auto u = d->units.find(id);
     if (u != d->units.end() && !u->second.empty()) text += " " + u->second;
     return text;
+}
+
+void Plugin::editParam(uint32_t id, double value) {
+    value = std::clamp(value, 0.0, 1.0);
+    if (d->controller) d->controller->setParamNormalized(id, value);
+    d->handler.performEdit(id, value);
 }
 
 void Plugin::takeEdits(std::vector<ParamEdit>& out) {

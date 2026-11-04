@@ -15,6 +15,7 @@
 #include "vst3_host.hpp"
 #include <memory>
 #include <algorithm>
+#include <cmath>
 
 // =============================================
 // ========== PUBLIC AUDIO ENGINE API ==========
@@ -214,7 +215,7 @@ public:
     }
 
     void find_loop() {
-      find_loop(root);
+      if (root) find_loop(root);   // an empty song has no root
     }
 
     void create_order() {
@@ -517,10 +518,10 @@ enum class MessageType {
     SetPlayState,
     ReplaceEvents,
     ResetSampleCounter,
+    SetLoop,
     SetADSR,
     SetWaveform,
     JumpSize,
-    SetTempo,
     Freeze,
 };
 
@@ -528,7 +529,10 @@ struct Message {
     MessageType type;
 
     // Union-like storage
-    float fValue = 0.0f;         // generic float (frequency, gain, tempo)
+    float fValue = 0.0f;         // generic float (frequency, gain)
+    double position = 0.0;       // ResetSampleCounter: beat to play from
+    double loopStart = 0.0;      // ResetSampleCounter, SetLoop: beats
+    double loopEnd = -1.0;       // same; negative = no loop
     bool  bValue = false;        // boolean (play state)
     ADSRParams adsr;             // envelope
     WaveformType waveform;       // waveform
@@ -621,6 +625,92 @@ struct AutoLane {
     }
 };
 
+// ---- Global lanes ----
+// Lanes for the whole song rather than a track. Their points use AutoPoint's
+// 0-1 values like any lane, so they're edited the same way; these turn them
+// into real units. They live under g_automationMutex, like g_automation.
+enum GlobalLane { GLOBAL_TEMPO, GLOBAL_GAIN, GLOBAL_LANES };
+extern AutoLane g_globalLanes[GLOBAL_LANES];
+
+constexpr float TEMPO_MIN = 20.0f, TEMPO_MAX = 260.0f;
+constexpr float MASTER_MIN_DB = -48.0f;   // the lane's top is 0 dB, its bottom silence
+
+inline float tempoFromValue(float v) { return TEMPO_MIN + v * (TEMPO_MAX - TEMPO_MIN); }
+inline float valueFromTempo(float bpm) { return (bpm - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN); }
+inline float masterDbFromValue(float v) { return MASTER_MIN_DB * (1.0f - v); }
+inline float valueFromMasterDb(float db) { return 1.0f - db / MASTER_MIN_DB; }
+inline float masterGainFromValue(float v) {
+    return v <= 0.0f ? 0.0f : std::pow(10.0f, masterDbFromValue(v) / 20.0f);
+}
+
+// ---- Tempo map ----
+// Converts between beats and seconds. Between two points of the tempo lane
+// the BPM changes linearly with the beat, which integrates exactly; before
+// the first point and after the last it stays level, as every lane does.
+// With no points the song is at a constant base tempo.
+struct TempoMap {
+    struct Node {
+        double beat = 0.0, bpm = 120.0;
+        double seconds = 0.0;   // when the node's beat falls
+    };
+    std::vector<Node> nodes{Node{}};   // never empty; the first is at beat 0
+
+    void build(const std::vector<AutoPoint>& points, double baseBpm) {
+        nodes.clear();
+        if (points.empty()) { nodes.push_back({0.0, baseBpm, 0.0}); return; }
+        nodes.push_back({0.0, tempoFromValue(points.front().value), 0.0});
+        for (const AutoPoint& p : points) {
+            const Node a = nodes.back();
+            const double bpm = tempoFromValue(p.value);
+            if (p.beat <= 0.0f) { nodes.back().bpm = bpm; continue; }
+            nodes.push_back({p.beat, bpm, a.seconds + span(a.bpm, bpm, p.beat - a.beat)});
+        }
+    }
+
+    double bpmAt(double beat) const {
+        const size_t i = nodeAtBeat(beat);
+        const Node& a = nodes[i];
+        if (i + 1 == nodes.size() || beat <= a.beat) return a.bpm;
+        const Node& z = nodes[i + 1];
+        return a.bpm + (z.bpm - a.bpm) * (beat - a.beat) / (z.beat - a.beat);
+    }
+
+    double secondsAt(double beat) const {
+        const size_t i = nodeAtBeat(beat);
+        const Node& a = nodes[i];
+        if (beat <= a.beat) return a.seconds + (beat - a.beat) * 60.0 / a.bpm;   // before beat 0
+        return a.seconds + span(a.bpm, bpmAt(beat), beat - a.beat);
+    }
+
+    double beatAt(double seconds) const {
+        auto it = std::upper_bound(nodes.begin(), nodes.end(), seconds,
+                                   [](double s, const Node& n) { return s < n.seconds; });
+        const size_t i = it == nodes.begin() ? 0 : (size_t)(it - nodes.begin()) - 1;
+        const Node& a = nodes[i];
+        const double dt = seconds - a.seconds;
+        const double slope = i + 1 < nodes.size() && dt > 0.0
+                                 ? (nodes[i + 1].bpm - a.bpm) / (nodes[i + 1].beat - a.beat) : 0.0;
+        if (std::abs(slope) < 1e-9) return a.beat + dt * a.bpm / 60.0;
+        return a.beat + a.bpm / slope * (std::exp(slope * dt / 60.0) - 1.0);
+    }
+
+private:
+    // Last node at or before `beat`
+    size_t nodeAtBeat(double beat) const {
+        auto it = std::upper_bound(nodes.begin(), nodes.end(), beat,
+                                   [](double b, const Node& n) { return b < n.beat; });
+        return it == nodes.begin() ? 0 : (size_t)(it - nodes.begin()) - 1;
+    }
+
+    // Seconds to cover `beats` while the tempo goes linearly from bpm0 to bpm1
+    static double span(double bpm0, double bpm1, double beats) {
+        if (beats <= 0.0) return 0.0;
+        const double slope = (bpm1 - bpm0) / beats;
+        if (std::abs(slope) < 1e-9) return beats * 60.0 / bpm0;
+        return 60.0 / slope * std::log(bpm1 / bpm0);
+    }
+};
+
 // Lanes per track: g_automation[track][lane], always MAX_TRACKS entries.
 // Hold g_automationMutex while changing them; the audio thread only
 // try-locks it, skipping automation for a block rather than waiting.
@@ -695,7 +785,9 @@ public:
     void setGain(float g);
     void setPlayState(bool on);
     void setWaveform(WaveformType type);
-    void setTempo(float bpm);
+    // Main thread: the new map takes over within a block. Playback keeps its
+    // place in the music, so it can be called while playing.
+    void setTempoMap(const TempoMap& map);
     void toggleFreeze();
     void setADSR(const ADSRParams& a);
     void setProfile(const Profile& p, int n);
@@ -716,6 +808,11 @@ public:
     bool setInstrument(int track, const std::string& name, std::string& status);
     // Effects in order. Ones already loaded under the same name are kept, with their settings.
     bool setEffects(int track, const std::vector<std::string>& names, std::string& status);
+    // Single edits of the chain, which keep every other effect as it is.
+    // `index` counts effects from 0, in processing order.
+    bool addEffect(int track, const std::string& name, std::string& status);
+    void removeEffect(int track, int index);
+    void swapEffects(int track, int a, int b);
     void clearPlugins(int track);
     void swapTrackPlugins(int a, int b);
     void setTuning(int track, vst3::TuningMode m);
@@ -743,7 +840,6 @@ public:
         for (int i = 0; i < recPassCount; i++) out.push_back(recPassEnds[i]);
         return out;
     }
-    double samplesPerBeat() const { return (60.0 / tempoBPM) * sampleRate; }
     // Where playback is, in beats (updated every block)
     double playheadBeat() const { return playBeat.load(std::memory_order_relaxed); }
     void toggleTuner();
@@ -766,7 +862,12 @@ public:
     void setEvents(EventTree* newEvents);
 
     // Reset playback position
-    void resetSampleCounter(float playhead_beat, float loop_end);
+    // Moves playback there, now if it's playing. It loops from loopStart once
+    // it passes loopEnd; a negative loopEnd, or one not after loopStart, means
+    // no loop.
+    void resetSampleCounter(double beat, double loopStart, double loopEnd);
+    // Changes the loop without moving playback
+    void setLoop(double loopStart, double loopEnd);
 
     // Renders the song offline, as fast as possible, through the same
     // processAudio() as playback (Pd patches, perc, clips), from startBeat to
@@ -793,7 +894,20 @@ private:
     bool isPlaying = false;
     WaveformType waveform = WaveformType::Sine;
     ADSRParams adsr;
-    float tempoBPM = 120.0f;
+
+    // The audio thread reads tempoMap. A new one is written to tempoPending
+    // under tempoMutex and swapped in at the top of a block, so the audio
+    // thread never allocates, frees or waits.
+    TempoMap tempoMap;
+    TempoMap tempoPending;
+    std::mutex tempoMutex;
+    std::atomic<bool> tempoDirty{false};
+    void adoptTempoMap();
+    double beatAtSample(uint64_t sc) const { return tempoMap.beatAt((double)sc / sampleRate); }
+    double sampleAtBeat(double beat) const { return tempoMap.secondsAt(beat) * sampleRate; }
+    void updateLoopSamples();
+    double loopStartBeat = 0.0, loopEndBeat = -1.0;
+    float masterGain = 1.0f;   // last value of the master gain lane, ramped from
 
     // Musical timeline position
     double currentBeat = 0.0;    // increments based on BPM
@@ -835,7 +949,7 @@ private:
         int64_t  startSc = 0;   // sampleCounter at which the clip's startSample plays
     };
     std::array<ClipVoice, 64> clipVoices{};
-    void startClip(int track, uint32_t clip, double beat, double samplesPerBeat);
+    void startClip(int track, uint32_t clip, double beat);
     void stopClip(int track, uint32_t clip);
     void stopAllClips();
 
@@ -855,7 +969,7 @@ private:
     bool    exporting = false;    // exportWav() is running: no clicks
     int64_t metroBeat = INT64_MIN; // beat the playhead was last in
     float   metroPhase = 0.0f, metroEnv = 0.0f, metroFreq = 0.0f;
-    float   metronomeSample(uint64_t sc, double samplesPerBeat);
+    float   metronomeSample(uint64_t sc);
 
     // ---- Per-track buses (audio thread) ----
     // processAudio() works in pieces of at most MAX_BLOCK frames. Each track
@@ -868,10 +982,10 @@ private:
     float* busR(int t)   { return busL(t) + MAX_BLOCK; }
     float* clipIn(int t) { return clipInData.data() + (size_t)t * MAX_BLOCK; }
     void processBlock(float* outL, float* outR, const float* in, uint32_t n,
-                      double samplesPerBeat, bool clipsReadable);
+                      bool clipsReadable);
     void renderSegment(uint32_t pos, uint32_t len, const float* in,
-                       double samplesPerBeat, bool clipsReadable);
-    void fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uint32_t offset);
+                       bool clipsReadable);
+    void fireDueEvents(uint32_t blockFrames, uint32_t offset);
 
     // ---- VST3 plugins (audio thread reads them; changed under processMutex) ----
     struct TrackPlugins {
@@ -893,9 +1007,9 @@ private:
     // Automation (audio thread). autoEpoch changes whenever playback jumps,
     // so every lane sends its value again.
     uint32_t autoEpoch = 1;
-    void applyAutomation(uint32_t pos, uint32_t len, double samplesPerBeat);
+    void applyAutomation(uint32_t pos, uint32_t len);
     std::atomic<double> playBeat{0.0};
-    void processPlugins(uint32_t n, uint64_t blockStart, double samplesPerBeat);
+    void processPlugins(uint32_t n, uint64_t blockStart);
 
     // =================================
     // Lock-free message queue

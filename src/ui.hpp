@@ -71,6 +71,7 @@ struct Widget {
     std::function<void(Widget&)> onDoubleClick;  // Button: second click of a double-click
     std::function<void(Widget&)> onChange;  // Slider, TextBox
     std::function<void(Widget&)> onCommit;  // TextBox: editing finished (Enter or focus lost)
+    std::function<void(Widget&)> onEnter;   // TextBox: Enter pressed, before onCommit
 
     // --- Tree ---
     Widget* parent = nullptr;
@@ -176,6 +177,7 @@ public:
     Widget  root;
     Widget* focused  = nullptr;  // text box currently being typed into
     Widget* openMenu = nullptr;  // menu whose dropdown is showing
+    Widget* dragging = nullptr;  // slider held down by the mouse
 
     void layout(float width, float height) {
         root.screen = {0, 0, width, height};
@@ -216,10 +218,15 @@ public:
         return w ? activate(*w, x, clicks) : false;
     }
 
+    // A held slider follows the mouse, even outside its own rect.
+    void mouseMove(float x) { if (dragging) setSlider(*dragging, x); }
+    void mouseUp() { dragging = nullptr; }
+
     // Returns true if the key went into a focused text box.
     bool keyDown(int key) {
         if (!focused || !focused->text) return false;
         if (key == '\r' || key == '\n') {           // Enter: finish editing
+            if (focused->onEnter) focused->onEnter(*focused);
             if (focused->parent == openMenu) closeMenu();
             blur();
             return true;
@@ -267,6 +274,11 @@ public:
     }
 
 private:
+    static void setSlider(Widget& w, float x) {
+        w.setNormalized((x - w.screen.x) / w.screen.w);
+        if (w.onChange) w.onChange(w);
+    }
+
     bool activate(Widget& w, float x, int clicks) {
         switch (w.kind) {
             case Kind::Menu:
@@ -278,8 +290,8 @@ private:
                 else if (w.onClick) w.onClick(w);
                 return true;
             case Kind::Slider:
-                w.setNormalized((x - w.screen.x) / w.screen.w);
-                if (w.onChange) w.onChange(w);
+                dragging = &w;
+                setSlider(w, x);
                 return true;
             case Kind::TextBox:
                 focused = &w;                       // menu stays open while typing

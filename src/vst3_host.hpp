@@ -76,6 +76,7 @@ public:
 
     const std::string& name() const;    // class name
     const std::string& query() const;   // what it was loaded with
+    uint64_t uid() const;               // unique for the whole run, unlike its address
     bool isInstrument() const;
 
     // ---- Main thread ----
@@ -94,6 +95,9 @@ public:
     std::string paramName(uint32_t id);           // "" if there's no such parameter
     double paramValue(uint32_t id);               // current normalised value
     std::string paramText(uint32_t id, double v); // v as the plugin displays it, e.g. "1200 Hz"
+    // Sets a parameter as if it were moved in the plugin's window: its window
+    // follows, the processor gets it, and takeEdits() reports it
+    void editParam(uint32_t id, double value);
     // Changes made in the plugin's window since the last call (for recording)
     void takeEdits(std::vector<ParamEdit>& out);
     // Tells the plugin's window about values set by setParameter(), so it

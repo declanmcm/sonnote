@@ -243,73 +243,46 @@ VkSampler createVulkanSampler(VkDevice device, VkFilter magFilter, VkFilter minF
 // These are necessary for image layout transitions and copying data to the GPU.
 // We create a temporary CommandPool/CommandBuffer for each use.
 
-VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyIndex) {
-    // 1. Create a transient command pool
+// Records into a new pool of its own, handed back in `pool` for
+// endSingleTimeCommands() to destroy along with the buffer.
+VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyIndex, VkCommandPool& pool) {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = queueFamilyIndex;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT; 
-    
-    VkCommandPool commandPool;
-    if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    if (vkCreateCommandPool(device, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create temporary command pool!");
     }
 
-    // 2. Allocate command buffer
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = commandPool;
+    allocInfo.commandPool = pool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer;
     vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
 
-    // 3. Begin recording
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
     vkBeginCommandBuffer(commandBuffer, &beginInfo);
-    
-    // We store the pool in the command buffer's user data (or pass it back)
-    // For simplicity, we'll return both and clean up in the end function.
     return commandBuffer;
 }
 
-void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, uint32_t queueFamilyIndex) {
-    (void)device; (void)queueFamilyIndex;
+void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, VkCommandPool pool) {
     vkEndCommandBuffer(commandBuffer);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
-
-    // 1. Submit the command buffer
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue); // Wait for execution to finish
+    vkQueueWaitIdle(queue);
 
-    // 2. Clean up the temporary command pool/buffer
-    //VkCommandPool commandPool;
-    // NOTE: This assumes we can retrieve the pool from the buffer, which isn't standard.
-    // A clean implementation would pass the pool explicitly or manage a pool internally.
-    // For simplicity and to avoid modifying the header, we'll recreate the pool from
-    // the family index and assume we can allocate/free the buffer manually.
-    
-    /*VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = queueFamilyIndex;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;*/ 
-    
-    // NOTE: This is slightly incorrect as it re-creates the pool but doesn't destroy the one created in beginSingleTimeCommands.
-    // The safest way is to manage a static/member CommandPool, but since we cannot modify the TextRenderer class easily,
-    // we'll rely on the simple pattern and assume the caller is aware of the lifetime.
-    // Given the constraints, we will rely on a dedicated internal command pool for the TextRenderer.
-    // I will refactor to use a member command pool.
+    vkDestroyCommandPool(device, pool, nullptr);   // frees the buffer too
 }
 
-// Utility for image layout transitions
 void transitionImageLayout(VkCommandBuffer commandBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
     (void)format;
     VkImageMemoryBarrier barrier{};
@@ -774,7 +747,8 @@ void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, Vk
     vkUnmapMemory(context.device, stagingBufferMemory);
     
     // 4. Record and submit commands
-    VkCommandBuffer commandBuffer = beginSingleTimeCommands(context.device, context.graphicsFamilyIndex);
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands(context.device, context.graphicsFamilyIndex, commandPool);
 
     // Transition image layout to TRANSFER_DST_OPTIMAL
     transitionImageLayout(commandBuffer, image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -785,7 +759,7 @@ void TextRenderer::loadAtlasDataAndUpload(const VulkanDeviceContext& context, Vk
     // Transition image layout to SHADER_READ_ONLY_OPTIMAL
     transitionImageLayout(commandBuffer, image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-    endSingleTimeCommands(context.device, commandBuffer, context.graphicsQueue, context.graphicsFamilyIndex);
+    endSingleTimeCommands(context.device, commandBuffer, context.graphicsQueue, commandPool);
 
     // 5. Cleanup staging resources
     vkDestroyBuffer(context.device, stagingBuffer, nullptr);

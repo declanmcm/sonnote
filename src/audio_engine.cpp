@@ -30,6 +30,7 @@ std::vector<std::vector<Clip>> g_clips(MAX_TRACKS);
 std::mutex g_clipsMutex;
 std::vector<std::vector<AutoLane>> g_automation(MAX_TRACKS);
 std::mutex g_automationMutex;
+AutoLane g_globalLanes[GLOBAL_LANES];
 
 AudioEngine::AudioEngine() {
     // Lock memory to avoid page faults in audio thread
@@ -274,11 +275,35 @@ void AudioEngine::setWaveform(WaveformType w) {
     messageQueue.push(m);
 }
 
-void AudioEngine::setTempo(float bpm) {
-    Message m;
-    m.type = MessageType::SetTempo;
-    m.fValue = bpm;
-    messageQueue.push(m);
+void AudioEngine::setTempoMap(const TempoMap& map) {
+    std::lock_guard<std::mutex> lock(tempoMutex);
+    tempoPending = map;
+    tempoDirty.store(true, std::memory_order_release);
+}
+
+// Audio thread. Whatever is playing keeps its place in the music: the sample
+// counter, and everything timed by it, moves to where that place now falls.
+void AudioEngine::adoptTempoMap() {
+    if (!tempoDirty.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lock(tempoMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    std::swap(tempoMap, tempoPending);
+    tempoDirty.store(false, std::memory_order_relaxed);
+    lock.unlock();
+
+    updateLoopSamples();
+    if (!isPlaying) return;
+    const int64_t moved = (int64_t)std::llround(sampleAtBeat(currentBeat)) - (int64_t)sampleCounter;
+    sampleCounter = (uint64_t)((int64_t)sampleCounter + moved);
+    for (auto& v : clipVoices)
+        if (v.active) v.startSc += moved;
+    for (PercOff& o : percOffs)
+        if (o.active) o.due = (uint64_t)((int64_t)o.due + moved);
+}
+
+void AudioEngine::updateLoopSamples() {
+    loopStartSamples = (uint64_t)std::floor(sampleAtBeat(loopStartBeat));
+    loopEndSamples = loopEndBeat > loopStartBeat ? (uint64_t)std::floor(sampleAtBeat(loopEndBeat)) : 0;
 }
 
 void AudioEngine::setADSR(const ADSRParams& a) {
@@ -318,10 +343,10 @@ size_t AudioEngine::drainRecording(std::vector<float>& out) {
     return n;
 }
 
-void AudioEngine::startClip(int track, uint32_t clip, double beat, double spb) {
+void AudioEngine::startClip(int track, uint32_t clip, double beat) {
     for (auto& v : clipVoices) {
         if (v.active) continue;
-        v = {true, track, clip, (int64_t)std::llround(beat * spb)};
+        v = {true, track, clip, (int64_t)std::llround(sampleAtBeat(beat))};
         return;
     }
 }
@@ -347,22 +372,21 @@ void AudioEngine::setEvents(EventTree* newEvents) {
     messageQueue.push(m);
 }
 
-void AudioEngine::resetSampleCounter(float playhead_beat, float loop_end) {
-    const double secondsPerBeat = 60.0 / tempoBPM;
-    const double samplesPerBeat = secondsPerBeat * sampleRate;
-    int newSc = std::floor(playhead_beat * samplesPerBeat);
-    if (newSc == -1)
-      sampleCounter = 0;
-    else
-      sampleCounter = newSc;
-    printf("sampleCounter: %ld\n", sampleCounter);
-    loopStartSamples = sampleCounter;
-    if (loop_end < 0)
-      loopEndSamples = 0;
-    else
-      loopEndSamples = std::floor(loop_end * samplesPerBeat);
+void AudioEngine::resetSampleCounter(double beat, double loopStart, double loopEnd) {
+    playBeat.store(beat, std::memory_order_relaxed);   // until the next block reports
     Message m;
     m.type = MessageType::ResetSampleCounter;
+    m.position = beat;
+    m.loopStart = loopStart;
+    m.loopEnd = loopEnd;
+    messageQueue.push(m);
+}
+
+void AudioEngine::setLoop(double loopStart, double loopEnd) {
+    Message m;
+    m.type = MessageType::SetLoop;
+    m.loopStart = loopStart;
+    m.loopEnd = loopEnd;
     messageQueue.push(m);
 }
 
@@ -379,6 +403,7 @@ void AudioEngine::toggleTuner() {
 void AudioEngine::applyMessages() {
     Message msg;
     std::fflush(stdout);
+    adoptTempoMap();
     while (messageQueue.pop(msg)) {
         switch (msg.type) {
 
@@ -414,11 +439,6 @@ void AudioEngine::applyMessages() {
             waveform = msg.waveform;
             break;
 
-        case MessageType::SetTempo:
-            tempoBPM = msg.fValue;
-            pd.setTempo(tempoBPM);
-            break;
-
         case MessageType::SetADSR:
             adsr = msg.adsr;
             break;
@@ -433,7 +453,11 @@ void AudioEngine::applyMessages() {
             stopAllClips();
             for (auto& o : percOffs) o.active = false;
             autoEpoch++;
-            currentBeat = 0.0;
+            currentBeat = std::max(0.0, msg.position);
+            sampleCounter = (uint64_t)std::floor(sampleAtBeat(currentBeat));
+            loopStartBeat = msg.loopStart;
+            loopEndBeat = msg.loopEnd;
+            updateLoopSamples();
             nextEventIndex = 0;
             metroBeat = INT64_MIN;   // click again if restarting on a beat
             // Clear voices
@@ -447,6 +471,12 @@ void AudioEngine::applyMessages() {
                 voiceProfiles[i] = 0;
             }
             divisorSmooth = 1.0f;
+            break;
+
+        case MessageType::SetLoop:
+            loopStartBeat = msg.loopStart;
+            loopEndBeat = msg.loopEnd;
+            updateLoopSamples();
             break;
 
         case MessageType::ReplaceEvents:
@@ -590,11 +620,11 @@ static Event* next_playable(Event* ev) {
 
 // One sample of the metronome at sample index `sc`: a short sine blip that
 // starts whenever the playhead reaches a whole beat.
-float AudioEngine::metronomeSample(uint64_t sc, double samplesPerBeat) {
-    int64_t beat = (int64_t)std::floor((double)sc / samplesPerBeat);
+float AudioEngine::metronomeSample(uint64_t sc) {
+    int64_t beat = (int64_t)std::floor(beatAtSample(sc));
     if (beat != metroBeat) {
         // Only click on the beat itself, not when starting (or looping) mid-beat
-        bool onBeat = (double)sc - beat * samplesPerBeat < 1.0;
+        bool onBeat = (double)sc - sampleAtBeat((double)beat) < 1.0;
         if (onBeat && metronome.load(std::memory_order_relaxed) && !exporting) {
             metroFreq = (beat % 4 == 0) ? 1760.0f : 1320.0f;
             metroPhase = 0.0f;
@@ -612,7 +642,7 @@ float AudioEngine::metronomeSample(uint64_t sc, double samplesPerBeat) {
 
 // Fires every event the playhead (currentBeat) has reached. `offset` is
 // where in the current block that is, for the VST3 plugins.
-void AudioEngine::fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uint32_t offset) {
+void AudioEngine::fireDueEvents(uint32_t blockFrames, uint32_t offset) {
     while (currentEv && currentEv->beat <= currentBeat) {
         if (currentEv->type == EV_NOTE_START) {
             int t = currentEv->profile;
@@ -637,7 +667,7 @@ void AudioEngine::fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uin
         } else if (currentEv->type == EV_PERC) {
             // Starting (or looping back) mid-song skips past every
             // earlier event at once; only play hits that are due now.
-            double lateSamples = (currentBeat - currentEv->beat) * samplesPerBeat;
+            double lateSamples = (double)sampleCounter - sampleAtBeat(currentEv->beat);
             if (lateSamples <= blockFrames) {
                 // The blip's velocity is kept as a gain, like a note's (0 dB = 1)
                 float g = PdHost::dbToGain(currentEv->gainDb);
@@ -646,7 +676,7 @@ void AudioEngine::fireDueEvents(double samplesPerBeat, uint32_t blockFrames, uin
             }
         } else if (currentEv->type == EV_AUDIO_START) {
             // Started late (mid-clip) it still plays from the right place
-            startClip(currentEv->profile, currentEv->id, currentEv->beat, samplesPerBeat);
+            startClip(currentEv->profile, currentEv->id, currentEv->beat);
         } else if (currentEv->type == EV_AUDIO_END) {
             stopClip(currentEv->profile, currentEv->id);
         }
@@ -664,17 +694,16 @@ void AudioEngine::processAudio(float* outL, float* outR, const float* input, uin
     // silent for this block and note messages are queued, not lost.
     pd.beginBlock();
     applyMessages();
+    pd.setTempo((float)tempoMap.bpmAt(currentBeat));
     pd.sendParams();   // gains and song parameters that changed (tempo, play state, ...)
 
     pd.diag.playing = isPlaying;
     pd.diag.frozen = freeze;
     pd.diag.nextBeat = currentEv ? currentEv->beat : -1.0f;
 
-    const double samplesPerBeat = (60.0 / tempoBPM) * sampleRate;
-
     // Recording starts with the first block of playback after it's requested
     if (recRequested && isPlaying && !recActive) {
-        recStartBeat = double(sampleCounter) / samplesPerBeat;
+        recStartBeat = beatAtSample(sampleCounter);
         recCaptured = 0;
         recPassCount = 0;
         recActive = true;
@@ -688,7 +717,7 @@ void AudioEngine::processAudio(float* outL, float* outR, const float* input, uin
     for (uint32_t done = 0; done < frames;) {
         uint32_t n = std::min<uint32_t>(MAX_BLOCK, frames - done);
         processBlock(outL + done, outR + done, input ? input + done : nullptr, n,
-                     samplesPerBeat, clipLock.owns_lock());
+                     clipLock.owns_lock());
         done += n;
     }
 
@@ -702,7 +731,7 @@ void AudioEngine::processAudio(float* outL, float* outR, const float* input, uin
 // events fire on the right sample and everything within a segment can be
 // rendered as a block.
 void AudioEngine::processBlock(float* outL, float* outR, const float* input, uint32_t n,
-                               double samplesPerBeat, bool clipsReadable)
+                               bool clipsReadable)
 {
     for (int t = 0; t < MAX_TRACKS; t++) {
         std::fill_n(busL(t), n, 0.0f);
@@ -714,14 +743,14 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
     for (uint32_t pos = 0; pos < n;) {
         uint32_t len = n - pos;
         if (isPlaying) {
-            currentBeat = double(sampleCounter) / samplesPerBeat;
+            currentBeat = beatAtSample(sampleCounter);
             b = currentBeat;
             if (!freeze) {
-                fireDueEvents(samplesPerBeat, n, pos);
+                fireDueEvents(n, pos);
                 // End the segment where the next event falls due (at least one
                 // frame, in case rounding leaves it just short)
                 if (currentEv) {
-                    double due = std::ceil((double)currentEv->beat * samplesPerBeat) - (double)sampleCounter;
+                    double due = std::ceil(sampleAtBeat(currentEv->beat)) - (double)sampleCounter;
                     if (due < len) len = (uint32_t)std::max(1.0, due);
                 }
             }
@@ -733,10 +762,10 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
             }
             // ...or where a perc hit on a VST3 instrument ends
             len = firePercOffs(pos, len);
-            if (!freeze) applyAutomation(pos, len, samplesPerBeat);
+            if (!freeze) applyAutomation(pos, len);
         }
 
-        renderSegment(pos, len, input, samplesPerBeat, clipsReadable);
+        renderSegment(pos, len, input, clipsReadable);
         pos += len;
         if (!isPlaying) continue;
 
@@ -762,13 +791,29 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
     }
 
     // VST3 instruments add to their track's bus, then its effects process it
-    processPlugins(n, blockStart, samplesPerBeat);
+    processPlugins(n, blockStart);
 
     // Mix: every audible track's bus, through its gain (a post-FX fader, so
     // it works whatever makes the sound: clips, Pd or a VST3 instrument),
     // plus the metronome. Muted tracks are still rendered (so Pd and VST3
     // tails carry on), just not heard. Gain changes ramp over the block so
     // moving the slider doesn't click.
+    // The master gain lane scales the tracks but not the metronome, which
+    // should stay audible through a fade.
+    float masterTarget = masterGain;
+    {
+        std::unique_lock<std::mutex> lock(g_automationMutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            // Where the block ends, so the ramp below arrives on time
+            const double beat = isPlaying ? beatAtSample(sampleCounter) : currentBeat;
+            const AutoLane& lane = g_globalLanes[GLOBAL_GAIN];
+            masterTarget = lane.points.empty() ? 1.0f : masterGainFromValue(lane.valueAt(beat));
+        }
+    }
+    const float master0 = masterGain;
+    const float masterStep = n > 0 ? (masterTarget - master0) / (float)n : 0.0f;
+    masterGain = masterTarget;
+
     std::array<bool, MAX_TRACKS> audible;
     std::array<float, MAX_TRACKS> g0, gStep;
     for (int t = 0; t < MAX_TRACKS; t++) {
@@ -779,15 +824,16 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
         mixGain[t] = target;
     }
     for (uint32_t i = 0; i < n; i++) {
-        float l = metroBuf[i], r = metroBuf[i];
+        float l = 0.0f, r = 0.0f;
         for (int t = 0; t < MAX_TRACKS; t++) {
             if (!audible[t]) continue;
             const float g = g0[t] + gStep[t] * (float)(i + 1);
             l += busL(t)[i] * g;
             r += busR(t)[i] * g;
         }
-        outL[i] = std::clamp(l, -1.0f, 1.0f);
-        outR[i] = std::clamp(r, -1.0f, 1.0f);
+        const float master = master0 + masterStep * (float)(i + 1);
+        outL[i] = std::clamp(metroBuf[i] + l * master, -1.0f, 1.0f);
+        outR[i] = std::clamp(metroBuf[i] + r * master, -1.0f, 1.0f);
     }
 
     if (!isPlaying) sampleCounter += n;
@@ -797,7 +843,7 @@ void AudioEngine::processBlock(float* outL, float* outR, const float* input, uin
 // No events fall due inside the segment, so sample i of it is at
 // sampleCounter + i (or stays at sampleCounter while frozen).
 void AudioEngine::renderSegment(uint32_t pos, uint32_t len, const float* input,
-                                double samplesPerBeat, bool clipsReadable)
+                                bool clipsReadable)
 {
     const uint64_t sc = sampleCounter;
     const uint32_t step = freeze ? 0 : 1;
@@ -860,7 +906,7 @@ void AudioEngine::renderSegment(uint32_t pos, uint32_t len, const float* input,
     if (!isPlaying) return;
 
     for (uint32_t i = 0; i < len; i++) {
-        metroBuf[pos + i] = metronomeSample(sc + i * step, samplesPerBeat);
+        metroBuf[pos + i] = metronomeSample(sc + i * step);
 
         // Capture the input while recording
         if (recActive && input) {
@@ -923,7 +969,7 @@ uint32_t AudioEngine::firePercOffs(uint32_t pos, uint32_t len) {
 // Sends every automation lane's value to its plugin over the segment, one
 // point every AUTO_STEP frames (plugins smooth between them), whenever it
 // has changed.
-void AudioEngine::applyAutomation(uint32_t pos, uint32_t len, double samplesPerBeat) {
+void AudioEngine::applyAutomation(uint32_t pos, uint32_t len) {
     constexpr uint32_t AUTO_STEP = 64;
     std::unique_lock<std::mutex> lock(g_automationMutex, std::try_to_lock);
     if (!lock.owns_lock()) return;
@@ -933,7 +979,7 @@ void AudioEngine::applyAutomation(uint32_t pos, uint32_t len, double samplesPerB
             vst3::Plugin* p = plugin(t, lane.plugin);
             if (!p) continue;
             for (uint32_t i = 0; i < len; i += AUTO_STEP) {
-                double beat = double(sampleCounter + i) / samplesPerBeat;
+                double beat = beatAtSample(sampleCounter + i);
                 float v = lane.valueAt(beat);
                 if (lane.sentEpoch == autoEpoch && std::abs(v - lane.lastSent) < 1e-5f) continue;
                 p->setParameter((int)(pos + i), lane.param, v);
@@ -944,12 +990,12 @@ void AudioEngine::applyAutomation(uint32_t pos, uint32_t len, double samplesPerB
     }
 }
 
-void AudioEngine::processPlugins(uint32_t n, uint64_t blockStart, double samplesPerBeat) {
+void AudioEngine::processPlugins(uint32_t n, uint64_t blockStart) {
     vst3::Transport tr;
     tr.playing = isPlaying;
-    tr.tempo = tempoBPM;
+    tr.beat = beatAtSample(blockStart);
+    tr.tempo = tempoMap.bpmAt(tr.beat);
     tr.samplePos = (int64_t)blockStart;
-    tr.beat = (double)blockStart / samplesPerBeat;
     float* inL = fxScratch.data();
     float* inR = inL + MAX_BLOCK;
     for (int t = 0; t < MAX_TRACKS; t++) {
@@ -1016,6 +1062,35 @@ bool AudioEngine::setEffects(int track, const std::vector<std::string>& names, s
         plugins[track].effects = std::move(chain);
     }
     return ok;   // effects no longer in the chain are freed here
+}
+
+bool AudioEngine::addEffect(int track, const std::string& name, std::string& status) {
+    if (track < 0 || track >= MAX_TRACKS) return false;
+    std::string error;
+    auto p = vst3::Plugin::load(name, false, sampleRate, (int)MAX_BLOCK, error);
+    if (!p) { status = error; return false; }
+    status = p->name() + " added to track " + std::to_string(track + 1);
+    std::lock_guard<std::mutex> lock(processMutex);
+    plugins[track].effects.push_back(std::move(p));
+    return true;
+}
+
+void AudioEngine::removeEffect(int track, int index) {
+    if (track < 0 || track >= MAX_TRACKS) return;
+    std::unique_ptr<vst3::Plugin> gone;   // freed outside the lock
+    std::lock_guard<std::mutex> lock(processMutex);
+    auto& fx = plugins[track].effects;
+    if (index < 0 || index >= (int)fx.size()) return;
+    gone = std::move(fx[index]);
+    fx.erase(fx.begin() + index);
+}
+
+void AudioEngine::swapEffects(int track, int a, int b) {
+    if (track < 0 || track >= MAX_TRACKS) return;
+    std::lock_guard<std::mutex> lock(processMutex);
+    auto& fx = plugins[track].effects;
+    if (a < 0 || b < 0 || a >= (int)fx.size() || b >= (int)fx.size()) return;
+    std::swap(fx[a], fx[b]);
 }
 
 void AudioEngine::clearPlugins(int track) {
@@ -1109,11 +1184,11 @@ bool AudioEngine::exportWav(const char* path, EventTree* events, float startBeat
     eachPlugin([](vst3::Plugin& p) { p.setOffline(true); });
 
     setEvents(events);
-    resetSampleCounter(startBeat, -1.0f);   // no loop
+    resetSampleCounter(startBeat, startBeat, -1.0);   // no loop
     setPlayState(true);
 
-    const double spb = samplesPerBeat();
-    const uint64_t playFrames = (uint64_t)std::max(0.0, (endBeat - startBeat) * spb);
+    adoptTempoMap();   // this thread is the audio thread now
+    const uint64_t playFrames = (uint64_t)std::max(0.0, sampleAtBeat(endBeat) - sampleAtBeat(startBeat));
     const uint64_t totalFrames = playFrames + (uint64_t)(tailSeconds * sampleRate);
 
     constexpr uint32_t BLOCK = 256;

@@ -43,10 +43,27 @@ VulkanRenderer::VulkanRenderer(SDL_Window* win) : window(win) {
     createTransientQuadBuffer();
 }
 
+// Reverse order of creation: everything made from the device goes before it,
+// then the debug messenger and surface, then the instance.
 VulkanRenderer::~VulkanRenderer() {
     vkDeviceWaitIdle(device);
+    textRenderer.destroy();
+    destroyTransientQuadBuffer();
+    if (hasSpectrogram) {
+        vkDestroyImageView(device, spectroView, nullptr);
+        vkDestroyImage(device, spectroImage, nullptr);
+        vkFreeMemory(device, spectroMemory, nullptr);
+    }
+    vkDestroyPipeline(device, spectroPipeline, nullptr);
+    vkDestroyPipelineLayout(device, spectroPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(device, spectroDescPool, nullptr);
+    vkDestroyDescriptorSetLayout(device, spectroSetLayout, nullptr);
+    vkDestroySampler(device, spectroSampler, nullptr);
+    vkDestroyBuffer(device, vertexBuffer, nullptr);
+    vkFreeMemory(device, vertexMemory, nullptr);
     vkDestroySemaphore(device, renderFinished, nullptr);
     vkDestroySemaphore(device, imageAvailable, nullptr);
+    vkDestroyCommandPool(device, commandPool, nullptr);
     for (auto fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
     vkDestroyPipeline(device, pipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -54,10 +71,11 @@ VulkanRenderer::~VulkanRenderer() {
     for (auto iv : imageViews) vkDestroyImageView(device, iv, nullptr);
     vkDestroySwapchainKHR(device, swapchain, nullptr);
     vkDestroyDevice(device, nullptr);
+    auto destroyMessenger = (PFN_vkDestroyDebugUtilsMessengerEXT)
+        vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+    if (destroyMessenger) destroyMessenger(instance, debugMessenger, nullptr);
     vkDestroySurfaceKHR(instance, surface, nullptr);
     vkDestroyInstance(instance, nullptr);
-    vkDestroyCommandPool(device, commandPool, nullptr);
-    destroyTransientQuadBuffer();
 }
 
 void VulkanRenderer::createSpectrogramPipeline()

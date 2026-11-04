@@ -51,8 +51,8 @@ struct TextVertex {
     glm::vec4 colour;
 };
 
-VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyIndex);
-void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, uint32_t queueFamilyIndex);
+VkCommandBuffer beginSingleTimeCommands(VkDevice device, uint32_t queueFamilyIndex, VkCommandPool& pool);
+void endSingleTimeCommands(VkDevice device, VkCommandBuffer commandBuffer, VkQueue queue, VkCommandPool pool);
 void createVulkanBuffer(VkDevice device, VkPhysicalDevice physicalDevice, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory, void** mappedData);
 
 // --- Main Text Renderer Class ---
@@ -119,7 +119,7 @@ private:
     VkBuffer m_vertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;
     void* m_vertexDataMapped = nullptr;
-    size_t m_maxVertices = 4096;
+    size_t m_maxVertices = 65536;   // 6 per glyph
     std::vector<TextVertex> m_stagedVertices;
     size_t m_uploadedVertices = 0;   // how many staged vertices are in the GPU buffer
 

@@ -641,101 +641,13 @@ Event* findBeatEv(Event* root, float v) {
   return nullptr;
 }
 
-float integrate(ArithTree function, float t1, float t2) {
-    (void)function; (void)t1; (void)t2;
-    // TODO: Implement step integration here
-    return 0.0f;
-}
+// The song's tempo: what g_globalLanes[GLOBAL_TEMPO] and g_baseBpm (used when
+// that lane is empty) add up to. Rebuilt by Canvas2D::applyTempo().
+TempoMap g_tempoMap;
+float g_baseBpm = 120.0f;
 
-
-float integrate_until(ArithTree function, float t1, float y) {
-    (void)function; (void)t1; (void)y;
-    // TODO: Integrate until equal to y and then return t2
-    return 0.0f;
-}
-
-float calc_beat(EventTree* times, float noteTime) {
-  Event* currentTempoEv = times->get_first();
-  if (currentTempoEv->type != EV_TEMPO)
-    currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
-  float beats = 0.0f;
-  while (currentTempoEv) {
-    if (next_type(currentTempoEv, EV_TEMPO) && next_type(currentTempoEv, EV_TEMPO)->time < noteTime) {
-        if (currentTempoEv->isConstant()) {
-          beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
-        } else {
-          beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
-        }
-        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
-    } else {
-      if (currentTempoEv->isConstant()) {
-        float thing = beats + (noteTime - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
-        return thing;
-      } else {
-        return beats + integrate(currentTempoEv->function, currentTempoEv->time, noteTime);
-      }
-    }
-  }
-  return beats;
-}
-
-float calc_time(EventTree* times, float noteBeat) {
-    Event* currentTempoEv = times->get_first();
-    if (currentTempoEv->type != EV_TEMPO)
-        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
-    float beats = 0.0f;
-    while (currentTempoEv) {
-        float currentTempoEvBeats = beats; // We can do this because there will always be a first tempoEv at zero
-        if (next_type(currentTempoEv, EV_TEMPO)) {
-            if (currentTempoEv->isConstant()) {
-                beats += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * (currentTempoEv->function.evaluate(b, t, 0, 0) / 60);
-            } else {
-                beats += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
-            }
-        }
-        if (!next_type(currentTempoEv, EV_TEMPO) || beats > noteBeat) {
-            if (currentTempoEv->isConstant()) {
-                return (noteBeat - currentTempoEvBeats) / (currentTempoEv->function.evaluate(b, t, 0, 0) / 60.0) + currentTempoEv->time;
-            } else {
-                return integrate_until(currentTempoEv->function, currentTempoEv->time, noteBeat - currentTempoEvBeats) + currentTempoEv->time;
-            }
-        }
-        currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
-    }
-    return -1.0f;
-}
-
-void calc_times(EventTree* times, EventTree* beats) {
-    Event* currentTempoEv = times->root;
-    Event* currentBeatEv = beats->root;
-    while (currentTempoEv->left)
-        currentTempoEv = currentTempoEv->left;
-    while (currentBeatEv->left)
-        currentBeatEv = currentBeatEv->left;
-    currentTempoEv = next_type(currentTempoEv, EV_TEMPO);
-    float beatAccum = 0.0f;
-    while (currentTempoEv) {
-        float currentTempoEvBeats = beatAccum;
-        if (currentTempoEv->isConstant()) {
-            beatAccum += (next_type(currentTempoEv, EV_TEMPO)->time - currentTempoEv->time) * currentTempoEv->function.evaluate(b, t, 0, 0);
-        } else {
-            beatAccum += integrate(currentTempoEv->function, currentTempoEv->time, next_type(currentTempoEv, EV_TEMPO)->time);
-        }
-        while (currentBeatEv) {
-            if (beatAccum > currentBeatEv->beat) {
-                if (currentTempoEv->isConstant()) {
-                    currentBeatEv->time = (currentBeatEv->beat - currentTempoEvBeats) / currentTempoEv->function.evaluate(b, t, 0, 0);
-                } else {
-                    currentBeatEv->time = integrate_until(currentTempoEv->function, currentTempoEv->time, currentBeatEv->beat - currentTempoEvBeats);
-                }
-            } else {
-                break;
-            }
-            currentBeatEv = next(currentBeatEv);
-        }
-
-    }
-}
+float calc_beat(float seconds) { return (float)g_tempoMap.beatAt(seconds); }
+float calc_time(float beat)    { return (float)g_tempoMap.secondsAt(beat); }
 
 struct MidiEvent {
     double tick;
@@ -1244,9 +1156,12 @@ Ratio perfectIntervalRatios[] {
   {13, 7}
 };
 
-float playhead_time = 0.0f;
+float playhead_time = 0.0f;      // follows playback; playing starts from here
+float loop_start_time = 0.0f;    // where a loop goes back to: the last place p put the playhead
 float loop_end = -1.0f;
 bool play_triggered_from_space = false;
+bool seek_triggered = false;     // the playhead was moved by hand
+bool loop_changed = false;       // the loop end was moved by hand
 bool tuner_triggered = false;
 
 template<typename Stream>
@@ -1263,7 +1178,6 @@ static void writeVarLen(Stream& f, uint32_t value) {
 // --- Write binary song file ---
 bool save_song(const std::string& path,
                EventTree& beatEvents,
-               EventTree& timeEvents,
                const std::vector<Track>& tracks,
                const std::vector<std::vector<Clip>>& clips,
                const std::vector<std::vector<AutoLane>>& automation)
@@ -1280,35 +1194,13 @@ bool save_song(const std::string& path,
     uint32_t id, numB, denB, numR, denR;
     uint32_t eventCount = 0;
 
-    // Write number of time events followed by time Events in order
-
-    Event* current = timeEvents.get_first();
-
-    while (current) {
-      eventCount++;
-      current = next(current);
-    }
-
+    // No time events: this section is kept so the layout stays the same,
+    // and the tempo is in the GLOB section now.
     f.write(reinterpret_cast<const char*>(&eventCount), sizeof(eventCount));
-
-    current = timeEvents.get_first();
-
-    while (current) {
-      v = current->beat;
-      sprintf(expr, "%s", current->string_expr.c_str());
-      l = strlen(expr);
-      t = current->type;
-      f.write(reinterpret_cast<const char*>(&v), sizeof(float));
-      f.write(reinterpret_cast<const char*>(&l), sizeof(int));
-      f.write(expr, l);
-      f.write(reinterpret_cast<const char*>(&t), sizeof(int));
-      printf("write: %f, %d, %d\n", v, l, t);
-      current = next(current);
-    }
 
     // Write number of beat events followed by beat Events in order
 
-    current = beatEvents.get_first();
+    Event* current = beatEvents.get_first();
     eventCount = 0;
     while (current) {
       eventCount++;
@@ -1464,6 +1356,20 @@ bool save_song(const std::string& path,
         }
     }
 
+    // The base tempo, then the global lanes (see GlobalLane)
+    f.write("GLOB", 4);
+    f.write(reinterpret_cast<const char*>(&g_baseBpm), sizeof(float));
+    uint32_t globalLanes = GLOBAL_LANES;
+    f.write(reinterpret_cast<const char*>(&globalLanes), sizeof(globalLanes));
+    for (const AutoLane& lane : g_globalLanes) {
+        uint32_t n = (uint32_t)lane.points.size();
+        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        for (const AutoPoint& pt : lane.points) {
+            f.write(reinterpret_cast<const char*>(&pt.beat), sizeof(float));
+            f.write(reinterpret_cast<const char*>(&pt.value), sizeof(float));
+        }
+    }
+
     f.close();
     return true;
 }
@@ -1587,7 +1493,6 @@ struct Canvas2D {
     float snap_x = 0.125f;  // snap to quarter-beats
     float snap_y = 1.0/12.0;  // snap to semitones
 
-    EventTree timeEvents;
     EventTree beatEvents;
 
     bool placing = false;
@@ -1650,6 +1555,8 @@ struct Canvas2D {
       bool active = false;
       std::string text;
       std::vector<Event*> targets;   // note starts
+      int lane = -1;           // >= 0: typing a value for this global lane instead
+      float beat = 0.0f;       // at this beat
     } gainEdit;
 
     // The EV_NOTE_END that closes a note start, or nullptr
@@ -1705,8 +1612,8 @@ struct Canvas2D {
         } else {
           e1->id = e2->id = nextID++;
         }
-        e1->time = calc_time(&timeEvents, e1->beat);
-        e2->time = calc_time(&timeEvents, e2->beat);
+        e1->time = calc_time(e1->beat);
+        e2->time = calc_time(e2->beat);
         beatEvents.insert(e1);
         beatEvents.insert(e2);
       }
@@ -1750,7 +1657,7 @@ struct Canvas2D {
     // finish walking the old one)
     Event* cloneEventAt(const Event* e, float beat) {
       Event* c = e->string_expr.empty() ? new Event(beat, e->type) : new Event(beat, e->string_expr, e->type);
-      c->time = calc_time(&timeEvents, beat);
+      c->time = calc_time(beat);
       c->ratio = e->ratio;
       c->beatL = e->beatL; c->beatR = e->beatR;
       c->num = e->num; c->den = e->den;
@@ -1848,7 +1755,24 @@ struct Canvas2D {
       }
     }
 
+    // Puts a point at the typed value: BPM or dB depending on the lane
+    void commitLaneValue() {
+      const GainEdit ed = gainEdit;
+      gainEdit = {};
+      char* end = nullptr;
+      float x = std::strtof(ed.text.c_str(), &end);
+      if (ed.text.empty() || !end || *end != '\0' || !std::isfinite(x)) return;
+      float value = ed.lane == GLOBAL_TEMPO ? valueFromTempo(std::clamp(x, TEMPO_MIN, TEMPO_MAX))
+                                            : valueFromMasterDb(std::clamp(x, MASTER_MIN_DB, 0.0f));
+      {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        putAutoPoint(g_globalLanes[ed.lane].points, ed.beat, value);
+      }
+      if (ed.lane == GLOBAL_TEMPO) applyTempo();
+    }
+
     void commitGainEdit() {
+      if (gainEdit.lane >= 0) { commitLaneValue(); return; }
       char* end = nullptr;
       float db = std::strtof(gainEdit.text.c_str(), &end);
       if (!gainEdit.text.empty() && end && *end == '\0' && std::isfinite(db)) {
@@ -1919,7 +1843,7 @@ struct Canvas2D {
       uint32_t maxID = 0;
       for (const EventSnap& n : s) {
         Event* e = n.expr.empty() ? new Event(n.beat, n.type) : new Event(n.beat, n.expr, n.type);
-        e->time = n.time;
+        e->time = calc_time(n.beat);   // the tempo may have changed since
         e->ratio = n.ratio;
         e->beatL = n.beatL; e->beatR = n.beatR;
         e->num = n.num; e->den = n.den;
@@ -1975,16 +1899,33 @@ struct Canvas2D {
 
     Event* createEv(float v, int t) { return new Event(v, t); }
 
-    void setBPM(const char* expr, float beat) {
-        // Event toInsert = Event(beat, expr, EV_TEMPO);
-        Event* toInsert =  new Event(beat, expr, EV_TEMPO);
-        if (toInsert->right) {
-          printf("HOW?!?\n");
-          std::fflush(stdout);
-        }
-        printf("val: %f\n", ratio_to_octave(toInsert->ratio));
-        timeEvents.insert(toInsert);
-        timeEvents.setFinalEv();   // accum_beats needs to know which tempo event is last
+    // Call after changing the tempo lane or the base tempo. The music stays
+    // on its beats, so everything placed in seconds moves to match.
+    void applyTempo() {
+        const float head = calc_beat(playhead_time), loopStart = calc_beat(loop_start_time);
+        const float loopEnd = loop_end < 0.0f ? -1.0f : calc_beat(loop_end);
+        const float recordStart = calc_beat(recordStartTime);
+        g_tempoMap.build(g_globalLanes[GLOBAL_TEMPO].points, g_baseBpm);
+        for (Event* e = beatEvents.get_first(); e; e = next(e)) e->time = calc_time(e->beat);
+        playhead_time = calc_time(head);
+        loop_start_time = calc_time(loopStart);
+        if (loopEnd >= 0.0f) loop_end = calc_time(loopEnd);
+        recordStartTime = calc_time(recordStart);
+        if (engine) engine->setTempoMap(g_tempoMap);
+    }
+
+    // The closest whole beat or rhythm split
+    float snapToDivision(float beat) {
+        float snapped = snap_beat(beatEvents.root, beat, 999999999.0f);
+        if (std::abs(beat - std::round(beat)) < std::abs(beat - snapped)) snapped = std::round(beat);
+        return snapped;
+    }
+
+    // p puts the playhead on a division; with Shift, exactly at the cursor
+    void movePlayhead(float beat) {
+        if (!(SDL_GetModState() & KMOD_SHIFT)) beat = snapToDivision(beat);
+        playhead_time = loop_start_time = calc_time(std::max(0.0f, beat));
+        seek_triggered = true;
     }
 
     void addCanvasRect(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight, float rx, float ry, float rw, float rh, float r, float g, float b) {
@@ -2066,13 +2007,13 @@ struct Canvas2D {
         toInsert->num = g ? unsimpNum / g : unsimpNum;
         toInsert->den = g ? unsimpDen / g : unsimpDen;
         toInsert->primeFactors = getPrimeFactors(toInsert->den);
-        toInsert->time = calc_time(&timeEvents, toInsert->beat);
+        toInsert->time = calc_time(toInsert->beat);
         beatEvents.insert(toInsert);
       }
     }
 
     // ---- Audio clips ----
-    AudioEngine* engine = nullptr;   // for the engine's samples-per-beat
+    AudioEngine* engine = nullptr;   // for its sample rate, plugins and tempo
 
     // A clip on the timeline: its EV_AUDIO_START / EV_AUDIO_END pair
     struct ClipSpan { Event* start = nullptr; Event* end = nullptr; };
@@ -2120,22 +2061,30 @@ struct Canvas2D {
       return true;
     }
 
+    // Clips play at their own speed whatever the tempo, so their length is
+    // real time: these convert it to and from beats. Both need `engine`.
+    float beatAfterSamples(float beat, double samples) const {
+      return (float)g_tempoMap.beatAt(g_tempoMap.secondsAt(beat) + samples / engine->sampleRate);
+    }
+    double samplesBetween(float beatA, float beatB) const {
+      return (g_tempoMap.secondsAt(beatB) - g_tempoMap.secondsAt(beatA)) * engine->sampleRate;
+    }
+
     // Where the clip being edited would go with the cursor at `beat`: {start, end}
     std::pair<float, float> clipEditExtent(float beat) const {
       const ClipSpan& sp = clipEdit.span;
       float s0 = sp.start->beat, e0 = sp.end->beat;
       const float minLen = 1.0f / 32.0f;
       const Clip* c = clipOf(sp.start);
-      double spb = engine ? engine->samplesPerBeat() : 0.0;
       switch (clipEdit.mode) {
         case CLIP_TRIM_START: {
           // Can't start before the clip's first sample
-          float earliest = (c && spb > 0) ? s0 - (float)(c->startSample / spb) : s0;
+          float earliest = (c && engine) ? beatAfterSamples(s0, -(double)c->startSample) : s0;
           return {std::clamp(beat, std::min(earliest, e0 - minLen), e0 - minLen), e0};
         }
         case CLIP_TRIM_END: {
           // Can't end after the clip's last sample
-          float latest = (c && spb > 0) ? s0 + (float)((c->samples.size() - c->startSample) / spb) : e0;
+          float latest = (c && engine) ? beatAfterSamples(s0, (double)(c->samples.size() - c->startSample)) : e0;
           return {s0, std::clamp(beat, s0 + minLen, std::max(latest, s0 + minLen))};
         }
         case CLIP_MOVE: {
@@ -2152,7 +2101,7 @@ struct Canvas2D {
       Event* moved = new Event(beat, ev->type);
       moved->id = ev->id;
       moved->profile = ev->profile;
-      moved->time = calc_time(&timeEvents, beat);
+      moved->time = calc_time(beat);
       beatEvents.remove_event(ev);
       beatEvents.insert(moved);
       return moved;
@@ -2164,7 +2113,7 @@ struct Canvas2D {
       ClipSpan sp = clipEdit.span;
       if (clipEdit.mode == CLIP_TRIM_START && engine) {
         if (Clip* c = clipOf(sp.start)) {
-          int64_t ss = (int64_t)c->startSample + std::llround((start - sp.start->beat) * engine->samplesPerBeat());
+          int64_t ss = (int64_t)c->startSample + std::llround(samplesBetween(sp.start->beat, start));
           c->startSample = (uint64_t)std::max<int64_t>(0, ss);
         }
       }
@@ -2382,53 +2331,6 @@ struct Canvas2D {
           return rightVal;
     }
 
-    float accum_beats(Event* node, float acc, float v, Event* last) {
-        if (!node) return acc;
-        float current = accum_beats(node->left, acc, v, last);
-        if (node->type == EV_TEMPO) {
-            // Tempo change event
-            if (node->finalEv) {
-                // This is the last tempo event, will return
-                if (node->beat > v) {
-                    if (last && last->isConstant())
-                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (v - last->beat);
-                    else if (last)
-                        current += integrate(last->function, last->beat, v);
-                } else {
-                    if (last && last->isConstant())
-                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (node->beat - last->beat);
-                    else if (last)
-                      current += integrate(last->function, last->beat, node->beat);
-
-                    if (node->isConstant())
-                        current += (node->function.evaluate(b, t, 0, 0) / 60.0) * (v - node->beat);
-                    else if (last)
-                        current += integrate(node->function, node->beat, v);
-                }
-                return current;
-            } else {
-                // Node isn't the final event
-                if (node->beat > v) {
-                    // Current time is less than current node's time
-                    // Find value up to v and return
-                    if (last && last->isConstant())
-                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (v - last->beat);
-                    else if (last)
-                        current += integrate(last->function, last->beat, v);
-                    return current;
-                } else {
-                    // Keep going, current node's time is less than current time
-                    if (last && last->isConstant())
-                        current += (last->function.evaluate(b, t, 0, 0) / 60.0) * (node->beat - last->beat);
-                    else if (last)
-                        current += integrate(last->function, last->beat, v);
-                }
-            }
-            last = node;
-        }
-        return accum_beats(node->right, current, v, last);
-    }
-
     void drawNumber(int n, Vec2 p, VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
       int current = n % 10;
       // Draw current;
@@ -2610,6 +2512,7 @@ struct Canvas2D {
     // it and d deletes the point under the cursor. For Velocity, click or
     // drag across the notes / blips to set theirs.
     bool autoMode = false;
+    int  globalLane = -1;  // GlobalLane being shown instead of the track's lane, or -1
     int  lastClick = 0;   // click as of the previous draw, to tell presses from holds
 
     enum AutoDrag { AUTO_DRAG_NONE, AUTO_DRAG_POINT, AUTO_DRAG_PENCIL, AUTO_DRAG_VELOCITY };
@@ -2685,9 +2588,9 @@ struct Canvas2D {
     }
 
     // Beats <-> screen x in the notes area
-    float xOfBeat(Vec2 topLeft, float beat) { return worldToScreen(topLeft, {calc_time(&timeEvents, beat), 0.0f}).x; }
+    float xOfBeat(Vec2 topLeft, float beat) { return worldToScreen(topLeft, {calc_time(beat), 0.0f}).x; }
     float beatAtX(Vec2 topLeft, float x) {
-      return std::max(0.0f, calc_beat(&timeEvents, screenToWorld(topLeft, {x, 0.0f}).x));
+      return std::max(0.0f, calc_beat(screenToWorld(topLeft, {x, 0.0f}).x));
     }
 
     void drawAutomation(VulkanRenderer& r, Vec2 topLeft, Vec2 bottomRight, Vec2 hover, bool hovered,
@@ -2717,7 +2620,7 @@ struct Canvas2D {
       float t0 = std::max(0.0f, screenToWorld(topLeft, {x1, 0.0f}).x);
       float t1 = screenToWorld(topLeft, {x2, 0.0f}).x;
       if (t1 > t0) {
-        int b0 = (int)std::floor(calc_beat(&timeEvents, t0)), b1 = (int)std::ceil(calc_beat(&timeEvents, t1));
+        int b0 = (int)std::floor(calc_beat(t0)), b1 = (int)std::ceil(calc_beat(t1));
         for (int i = std::max(b0, 0); i <= b1 && i - b0 < 2000; i++)
           rect(xOfBeat(topLeft, (float)i), ay0, 1, ay1 - ay0, i % 4 == 0 ? ui::Color{0.30f, 0.30f, 0.38f} : ui::Color{0.18f, 0.18f, 0.22f});
       }
@@ -2726,6 +2629,178 @@ struct Canvas2D {
 
       if (picker.open) {
         drawPicker(r, x1, x2, yb, yt, hover, hovered, pressed, wheel);
+        return;
+      }
+
+      // Edits one lane of points. Used for plugin parameters and global lanes.
+      struct LaneView {
+        AutoLane* lane = nullptr;
+        int key = 0;                 // tells lanes apart in autoEdit, with plugin and param
+        int plugin = 0;
+        uint32_t param = 0;
+        ui::Color color{};
+        std::string title;
+        std::function<std::string(float)> valueText;
+        float idleValue = 0.0f;      // shown as a dashed line while the lane is empty
+        std::string emptyHint;
+        float tolerance = 0.01f;     // how far simplifying a drawn stroke may stray
+        bool snap = false;           // points go on rhythm divisions and whole numbers, unless Shift
+        bool typed = false;          // g types an exact value
+        bool gridLabels = false;     // name the value grid
+        std::function<void()> onEdited;   // after an edit is finished, not during a drag
+      };
+      auto editLane = [&](LaneView& v) {
+      text(v.title, x1 + 6, yt - 18, 13.0f, bright);
+      AutoLane& lane = *v.lane;
+      std::vector<AutoPoint>& pts = lane.points;
+      const bool free = !v.snap || (SDL_GetModState() & KMOD_SHIFT);
+      auto beatUnder = [&](float x) {
+        float b = beatAtX(topLeft, x);
+        return free ? b : snapToDivision(b);
+      };
+      auto valueUnder = [&](float y) {
+        float val = valueAtY(y);
+        return free ? val : valueFromTempo(std::round(tempoFromValue(val)));
+      };
+      bool finished = false;
+      if (v.gridLabels)
+        for (int k = 0; k <= 4; k++)
+          text(v.valueText(k / 4.0f), x1 + 4, ay0 + k * (ay1 - ay0) / 4 + (k == 4 ? -14 : 3), 11.0f, dim);
+      if (autoEdit.mode != AUTO_DRAG_NONE && (autoEdit.track != v.key || autoEdit.plugin != v.plugin || autoEdit.param != v.param))
+        autoEdit = {};
+
+      // Point under the cursor
+      int hoverPt = -1;
+      float best = 7.0f;
+      for (size_t i = 0; hovered && i < pts.size(); i++) {
+        float d = std::hypot(xOfBeat(topLeft, pts[i].beat) - hover.x, yOf(pts[i].value) - hover.y);
+        if (d < best) { best = d; hoverPt = (int)i; }
+      }
+      if (hoverPt >= 0 && autoEdit.mode == AUTO_DRAG_NONE && containsKey(keys, 'd')) {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        pts.erase(pts.begin() + hoverPt);
+        hoverPt = -1;
+        finished = true;
+      }
+      if (v.typed && hovered && autoEdit.mode == AUTO_DRAG_NONE && containsKey(keys, 'g')) {
+        gainEdit = {};
+        gainEdit.active = true;
+        gainEdit.lane = globalLane;
+        gainEdit.beat = hoverPt >= 0 ? pts[hoverPt].beat : beatUnder(hover.x);
+      }
+
+      if (hovered && pressed) {
+        float b = beatUnder(hover.x);
+        if (hoverPt >= 0) {
+          autoEdit = {AUTO_DRAG_POINT, v.key, v.plugin, v.param, (size_t)hoverPt};
+        } else {
+          std::lock_guard<std::mutex> lock(g_automationMutex);
+          putAutoPoint(pts, b, valueUnder(hover.y));
+          autoEdit = {AUTO_DRAG_PENCIL, v.key, v.plugin, v.param, 0, b, b, b};
+        }
+      } else if (autoEdit.mode == AUTO_DRAG_POINT) {
+        if (!held) {
+          autoEdit = {};
+          finished = true;
+        } else if (hovered && autoEdit.point < pts.size()) {
+          // Moves between its neighbours, so the order (and its index) stays
+          size_t i = autoEdit.point;
+          float lo = i > 0 ? pts[i - 1].beat : 0.0f;
+          float hi = i + 1 < pts.size() ? pts[i + 1].beat : 1e9f;
+          std::lock_guard<std::mutex> lock(g_automationMutex);
+          pts[i].beat = std::clamp(beatUnder(hover.x), lo, hi);
+          pts[i].value = valueUnder(hover.y);
+          hoverPt = (int)i;
+        }
+      } else if (autoEdit.mode == AUTO_DRAG_PENCIL) {
+        std::lock_guard<std::mutex> lock(g_automationMutex);
+        if (!held) {
+          simplifyAutoPoints(pts, autoEdit.lo, autoEdit.hi, v.tolerance);
+          autoEdit = {};
+          finished = true;
+        } else if (hovered) {
+          // The stroke replaces whatever it passes over
+          float b = beatUnder(hover.x);
+          eraseAutoPoints(pts, autoEdit.last, b);
+          putAutoPoint(pts, b, valueUnder(hover.y));
+          autoEdit.last = b;
+          autoEdit.lo = std::min(autoEdit.lo, b);
+          autoEdit.hi = std::max(autoEdit.hi, b);
+        }
+      }
+
+      // The curve, one screen column at a time; level before the first point
+      // and after the last, as it plays. With no points, a dashed line at the
+      // parameter's current value.
+      const ui::Color tc = v.color;
+      ui::Color lc = {tc.r * 0.9f, tc.g * 0.9f, tc.b * 0.9f};
+      if (!pts.empty()) {
+        float prevY = yOf(lane.valueAt(beatAtX(topLeft, x1)));
+        for (float px = x1; px < x2; px += 1.0f) {
+          float y = yOf(lane.valueAt(beatAtX(topLeft, px)));
+          float lo = std::min(prevY, y), hi = std::max(prevY, y);
+          rect(px, lo - 1, 1, hi - lo + 2, lc);
+          prevY = y;
+        }
+        if (lane.held) text("Recording...", x1 + 6, yt - 36, 13.0f, glm::vec4(1.0f, 0.5f, 0.5f, 1.0f));
+      } else {
+        float y = yOf(v.idleValue);
+        for (float px = x1; px < x2; px += 10.0f) rect(px, y, 5, 1, {0.45f, 0.45f, 0.5f});
+        text(v.emptyHint, x1 + 6, yt - 36, 13.0f, dim);
+      }
+      for (size_t i = 0; i < pts.size(); i++) {
+        float x = xOfBeat(topLeft, pts[i].beat);
+        if (x < x1 || x > x2) continue;
+        bool hot = (int)i == hoverPt;
+        if (hot) r.addCircle(x, yOf(pts[i].value), 5.0f, 0.95f, 0.95f, 0.95f);
+        else     r.addCircle(x, yOf(pts[i].value), 3.0f, tc.r, tc.g, tc.b);
+      }
+
+      // Value under the cursor (or of the point being moved)
+      if (hovered) {
+        float b = hoverPt >= 0 ? pts[hoverPt].beat : beatUnder(hover.x);
+        float val = hoverPt >= 0 ? pts[hoverPt].value : valueUnder(hover.y);
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "beat %.2f   ", b);
+        text(buf + v.valueText(val),
+             std::clamp(hover.x + 10, x1 + 4, x2 - 220), std::clamp(hover.y + 10, yb + 4, yt - 52), 12.0f, bright);
+      }
+      if (finished && v.onEdited) v.onEdited();
+      };
+
+      // ---- A global lane ----
+      if (globalLane >= 0) {
+        const bool tempo = globalLane == GLOBAL_TEMPO;
+        LaneView view;
+        view.lane = &g_globalLanes[globalLane];
+        view.key = -2 - globalLane;
+        view.color = tempo ? ui::Color{0.95f, 0.75f, 0.3f} : ui::Color{0.4f, 0.85f, 0.6f};
+        view.typed = view.gridLabels = true;
+        std::string hints = "    click / drag: draw  |  drag a point: move  |  g: type a value  |  d: delete point";
+        if (tempo) hints += "  |  Shift: don't snap";
+        view.title = std::string(tempo ? "Tempo" : "Master gain") + " (global)" + hints + "  |  Tab: back to notes";
+        if (tempo) {
+          view.idleValue = valueFromTempo(g_baseBpm);
+          view.emptyHint = "No tempo changes yet: the BPM slider sets the tempo until the first point goes in";
+          view.tolerance = 0.002f;
+          view.snap = true;
+          view.valueText = [](float val) {
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%.4g BPM", tempoFromValue(val));
+            return std::string(buf);
+          };
+          view.onEdited = [this] { applyTempo(); };
+        } else {
+          view.idleValue = 1.0f;
+          view.emptyHint = "No master gain changes yet: click or drag to draw a fade";
+          view.valueText = [](float val) {
+            if (val <= 0.0f) return std::string("silent");
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%.1f dB", masterDbFromValue(val) + 0.0f);   // no "-0.0"
+            return std::string(buf);
+          };
+        }
+        editLane(view);
         return;
       }
 
@@ -2812,103 +2887,25 @@ struct Canvas2D {
         return;
       }
       vst3::Plugin* plug = engine ? engine->plugin(t, tr.autoPlugin) : nullptr;
-      text(title + (plug ? "" : " (plugin not loaded)") +
-           "    click / drag: draw  |  drag a point: move  |  d: delete point  |  Tab: back to notes",
-           x1 + 6, yt - 18, 13.0f, bright);
-      AutoLane* lane = ensureAutoLane(t, tr.autoPlugin, tr.autoParam, tr.autoName);
-      if (!lane) return;
-      std::vector<AutoPoint>& pts = lane->points;
-      if (autoEdit.mode != AUTO_DRAG_NONE && (autoEdit.plugin != tr.autoPlugin || autoEdit.param != tr.autoParam))
-        autoEdit = {};
-
-      // Point under the cursor
-      int hoverPt = -1;
-      float best = 7.0f;
-      for (size_t i = 0; hovered && i < pts.size(); i++) {
-        float d = std::hypot(xOfBeat(topLeft, pts[i].beat) - hover.x, yOf(pts[i].value) - hover.y);
-        if (d < best) { best = d; hoverPt = (int)i; }
-      }
-      if (hoverPt >= 0 && autoEdit.mode == AUTO_DRAG_NONE && containsKey(keys, 'd')) {
-        std::lock_guard<std::mutex> lock(g_automationMutex);
-        pts.erase(pts.begin() + hoverPt);
-        hoverPt = -1;
-      }
-
-      if (hovered && pressed) {
-        float b = beatAtX(topLeft, hover.x), v = valueAtY(hover.y);
-        if (hoverPt >= 0) {
-          autoEdit = {AUTO_DRAG_POINT, t, tr.autoPlugin, tr.autoParam, (size_t)hoverPt};
-        } else {
-          std::lock_guard<std::mutex> lock(g_automationMutex);
-          putAutoPoint(pts, b, v);
-          autoEdit = {AUTO_DRAG_PENCIL, t, tr.autoPlugin, tr.autoParam, 0, b, b, b};
-        }
-      } else if (autoEdit.mode == AUTO_DRAG_POINT) {
-        if (!held) {
-          autoEdit = {};
-        } else if (hovered && autoEdit.point < pts.size()) {
-          // Moves between its neighbours, so the order (and its index) stays
-          size_t i = autoEdit.point;
-          float lo = i > 0 ? pts[i - 1].beat : 0.0f;
-          float hi = i + 1 < pts.size() ? pts[i + 1].beat : 1e9f;
-          std::lock_guard<std::mutex> lock(g_automationMutex);
-          pts[i].beat = std::clamp(beatAtX(topLeft, hover.x), lo, hi);
-          pts[i].value = valueAtY(hover.y);
-          hoverPt = (int)i;
-        }
-      } else if (autoEdit.mode == AUTO_DRAG_PENCIL) {
-        std::lock_guard<std::mutex> lock(g_automationMutex);
-        if (!held) {
-          simplifyAutoPoints(pts, autoEdit.lo, autoEdit.hi, 0.01f);
-          autoEdit = {};
-        } else if (hovered) {
-          // The stroke replaces whatever it passes over
-          float b = beatAtX(topLeft, hover.x);
-          eraseAutoPoints(pts, autoEdit.last, b);
-          putAutoPoint(pts, b, valueAtY(hover.y));
-          autoEdit.last = b;
-          autoEdit.lo = std::min(autoEdit.lo, b);
-          autoEdit.hi = std::max(autoEdit.hi, b);
-        }
-      }
-
-      // The curve, one screen column at a time; level before the first point
-      // and after the last, as it plays. With no points, a dashed line at the
-      // parameter's current value.
-      ui::Color lc = {tc.r * 0.9f, tc.g * 0.9f, tc.b * 0.9f};
-      if (!pts.empty()) {
-        float prevY = yOf(lane->valueAt(beatAtX(topLeft, x1)));
-        for (float px = x1; px < x2; px += 1.0f) {
-          float y = yOf(lane->valueAt(beatAtX(topLeft, px)));
-          float lo = std::min(prevY, y), hi = std::max(prevY, y);
-          rect(px, lo - 1, 1, hi - lo + 2, lc);
-          prevY = y;
-        }
-        if (lane->held) text("Recording...", x1 + 6, yt - 36, 13.0f, glm::vec4(1.0f, 0.5f, 0.5f, 1.0f));
-      } else {
-        float y = yOf(plug ? (float)plug->paramValue(tr.autoParam) : 0.0f);
-        for (float px = x1; px < x2; px += 10.0f) rect(px, y, 5, 1, {0.45f, 0.45f, 0.5f});
-        text("No automation yet: click or drag to draw some, or turn on Rec and move the control in the plugin while playing",
-             x1 + 6, yt - 36, 13.0f, dim);
-      }
-      for (size_t i = 0; i < pts.size(); i++) {
-        float x = xOfBeat(topLeft, pts[i].beat);
-        if (x < x1 || x > x2) continue;
-        bool hot = (int)i == hoverPt;
-        if (hot) r.addCircle(x, yOf(pts[i].value), 5.0f, 0.95f, 0.95f, 0.95f);
-        else     r.addCircle(x, yOf(pts[i].value), 3.0f, tc.r, tc.g, tc.b);
-      }
-
-      // Value under the cursor (or of the point being moved)
-      if (hovered) {
-        float b = hoverPt >= 0 ? pts[hoverPt].beat : beatAtX(topLeft, hover.x);
-        float v = hoverPt >= 0 ? pts[hoverPt].value : valueAtY(hover.y);
-        std::string shown = plug ? plug->paramText(tr.autoParam, v) : "";
-        char buf[48];
-        std::snprintf(buf, sizeof buf, "beat %.2f   %.0f%%", b, v * 100.0f);
-        text(std::string(buf) + (shown.empty() ? "" : "   " + shown),
-             std::clamp(hover.x + 10, x1 + 4, x2 - 220), std::clamp(hover.y + 10, yb + 4, yt - 52), 12.0f, bright);
-      }
+      LaneView view;
+      view.lane = ensureAutoLane(t, tr.autoPlugin, tr.autoParam, tr.autoName);
+      if (!view.lane) return;
+      view.key = t;
+      view.plugin = tr.autoPlugin;
+      view.param = tr.autoParam;
+      view.color = tc;
+      view.title = title + (plug ? "" : " (plugin not loaded)") +
+                   "    click / drag: draw  |  drag a point: move  |  d: delete point  |  Tab: back to notes";
+      view.idleValue = plug ? (float)plug->paramValue(tr.autoParam) : 0.0f;
+      view.emptyHint = "No automation yet: click or drag to draw some, or turn on Rec and move the control in the plugin while playing";
+      const uint32_t param = tr.autoParam;
+      view.valueText = [plug, param](float v) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%.0f%%", v * 100.0f);
+        std::string shown = plug ? plug->paramText(param, v) : "";
+        return std::string(buf) + (shown.empty() ? "" : "   " + shown);
+      };
+      editLane(view);
     }
 
     void drawPicker(VulkanRenderer& r, float x1, float x2, float yb, float yt, Vec2 hover,
@@ -3024,13 +3021,15 @@ struct Canvas2D {
           if (hovered) {
             if (containsKey(keys, ' ')) play_triggered_from_space = true;
             if (containsKey(keys, 't')) tuner_triggered = true;
-            if (containsKey(keys, 'p')) playhead_time = calc_time(&timeEvents, beatAtX(topLeft, hover.x));
+            if (containsKey(keys, 'p')) movePlayhead(beatAtX(topLeft, hover.x));
             if (containsKey(keys, 'u')) {
-              float x = calc_time(&timeEvents, beatAtX(topLeft, hover.x));
+              float x = calc_time(beatAtX(topLeft, hover.x));
               loop_end = std::abs(loop_end - x) < 1e-6 ? -1.0f : x;
+              loop_changed = true;
             }
           }
           drawAutomation(renderer, topLeft, bottomRight, hover, inNotes, click, keys, pickerWheel);
+          if (gainEdit.active) drawGainBox(renderer, topLeft, bottomRight);
           drawSubPanels(renderer, perc, audio, nw.x1, nw.x2, topLeft);
           drawClips(renderer, audio, nw.x1, nw.x2, topLeft, clipSpans(), ClipSpan{}, 0.0f);
           lastClick = click;
@@ -3067,21 +3066,16 @@ struct Canvas2D {
 
         // First end of a split being made with s
         if (split_start >= 0.0f) {
-          s0 = worldToScreen(topLeft, { calc_time(&timeEvents, split_start), wA.y });
+          s0 = worldToScreen(topLeft, { calc_time(split_start), wA.y });
           addCanvasRect(renderer, topLeft, bottomRight, s0.x, topLeft.y, 1, bottomRight.y - topLeft.y, 0.8, 0.7, 0.3);
         }
 
         Vec2 w = screenToWorld(topLeft, hover);
-        float currentBeat = accum_beats(timeEvents.root, 0.0f, w.x, NULL);
-        float snappedBeat = snap_beat(beatEvents.root, currentBeat, 999999999.0f);
-
-        printf("snappedBeat: %f\n", snappedBeat);
-
-        if (std::abs(currentBeat - std::round(currentBeat)) < std::abs(currentBeat - snappedBeat))
-            snappedBeat =  std::round(currentBeat);
+        float currentBeat = std::max(0.0f, calc_beat(w.x));
+        float snappedBeat = snapToDivision(currentBeat);
         printf("topLeft.x: %f, w.x: %f, currentBeat: %f, snappedBeat: %f\n", topLeft.x, w.x, currentBeat, snappedBeat);
 
-        float snappedTime = calc_time(&timeEvents, snappedBeat);
+        float snappedTime = calc_time(snappedBeat);
 
         Event* currentBeatEv = beatEvents.get_first();
 
@@ -3173,7 +3167,7 @@ struct Canvas2D {
                 if (i <= beatRLi)
                   continue;
                 // Draw line in the middle of the screen
-                Vec2 ap = worldToScreen(topLeft, {calc_time(&timeEvents, i), 0.0f});
+                Vec2 ap = worldToScreen(topLeft, {calc_time(i), 0.0f});
                 addCanvasRect(renderer, topLeft, bottomRight, ap.x, std::floor((topLeft.y + bottomRight.y) / 2) - 15, 1, 30, 0.47, 0.47, 0.63);
               }
               beatRLi = std::ceil(currentBeatEv->beat);
@@ -3359,13 +3353,14 @@ struct Canvas2D {
             if (containsKey(keys, 't'))
               tuner_triggered = true;
             if (containsKey(keys, 'p'))
-                playhead_time = hoverW.x;
+                movePlayhead(currentBeat);
             if (containsKey(keys, 'u')) {
               // Set loop limit
               if (std::abs(loop_end - hoverW.x) < 1e-6)
                 loop_end = -1.0f;
               else
                 loop_end = hoverW.x;
+              loop_changed = true;
             }
             if (containsKey(keys, 'h'))
                 snap_foci = !snap_foci;
@@ -3572,8 +3567,8 @@ struct Canvas2D {
             Event* end = noteEndOf(s);
             if (!end) continue;
             float oct = ratio_to_octave(s->ratio);
-            Vec2 ap = worldToScreen(topLeft, {calc_time(&timeEvents, s->beat + delta), oct});
-            Vec2 bp = worldToScreen(topLeft, {calc_time(&timeEvents, end->beat + delta), oct});
+            Vec2 ap = worldToScreen(topLeft, {calc_time(s->beat + delta), oct});
+            Vec2 bp = worldToScreen(topLeft, {calc_time(end->beat + delta), oct});
             addCanvasRect(renderer, topLeft, bottomRight, ap.x, ap.y - 2, bp.x - ap.x, 4, 0.9f, 0.9f, 0.9f);
           }
           renderer.addText("Moving notes: click to put down, Esc to cancel", topLeft.x + 3, topLeft.y - 32, 13.0f,
@@ -3805,7 +3800,7 @@ struct Canvas2D {
             if (no_prev_or_closest_starts_after_prev) {
                 printf("A");
                 start->beat = closest->beat;
-                start->time = calc_time(&timeEvents, start->beat);
+                start->time = calc_time(start->beat);
                 start->ratio = closest->ratio;
             } else if (closest_starts_at_prev) {
                 printf("B");
@@ -3817,7 +3812,7 @@ struct Canvas2D {
                     removePrevious = true;
                 } else {
                     prev->beat = closest->beat;
-                    prev->time = calc_time(&timeEvents, prev->beat);
+                    prev->time = calc_time(prev->beat);
                     prev->ratio = closest->ratio;
                 }
             } else { // focus_before is true
@@ -3832,7 +3827,7 @@ struct Canvas2D {
             if (no_foci_or_after_foci_or_closest_ends_before_next) {
                 printf("C");
                 end->beat = closestOff->beat;
-                end->time = calc_time(&timeEvents, end->beat);
+                end->time = calc_time(end->beat);
                 if (insert > 0 && prev) {
                     end->ratio = prevRat;
                 }
@@ -3844,7 +3839,7 @@ struct Canvas2D {
                     removeNext = true;
                 } else {
                     insertEv->beat = closestOff->beat;
-                    insertEv->time = calc_time(&timeEvents, insertEv->beat);
+                    insertEv->time = calc_time(insertEv->beat);
                     insertEv->ratio = {0, 0};
                 }
             } else {
@@ -3873,15 +3868,15 @@ struct Canvas2D {
                 if (no_prev_or_closest_starts_after_prev && no_foci_or_after_foci_or_closest_ends_before_next) {
                     printf("foci start: %s, end: %s\n", start->string_expr.c_str(), end->string_expr.c_str());
                     beatEvents.insert(start);
-                    start->time = calc_time(&timeEvents, start->beat);
+                    start->time = calc_time(start->beat);
                     beatEvents.insert(end);
-                    end->time = calc_time(&timeEvents, end->beat);
+                    end->time = calc_time(end->beat);
                 } else if (no_prev_or_closest_starts_after_prev) {
                     beatEvents.insert(start);
-                    start->time = calc_time(&timeEvents, start->beat);
+                    start->time = calc_time(start->beat);
                 } else if (no_foci_or_after_foci_or_closest_ends_before_next) {
                     beatEvents.insert(end);
-                    end->time = calc_time(&timeEvents, end->beat);
+                    end->time = calc_time(end->beat);
                 }
             }
         }
@@ -3913,8 +3908,8 @@ struct Canvas2D {
                 float y   = ratio_to_octave(hoverR);
                 // rectangle from (x0w,y±h/2) to (x1w,y±h/2); choose fixed height (e.g., 0.6 octave)
                 float halfH = 1.0/24.0;
-                Vec2 a = worldToScreen(topLeft, { calc_time(&timeEvents, currently_dragged.x), y + halfH });
-                Vec2 b = worldToScreen(topLeft, { calc_time(&timeEvents, currently_dragged.y), y - halfH });
+                Vec2 a = worldToScreen(topLeft, { calc_time(currently_dragged.x), y + halfH });
+                Vec2 b = worldToScreen(topLeft, { calc_time(currently_dragged.y), y - halfH });
                 // ensure correct corners
                 Vec2 rmin{ std::min(a.x,b.x), std::min(a.y,b.y) };
                 Vec2 rmax{ std::max(a.x,b.x), std::max(a.y,b.y) };
@@ -3982,8 +3977,8 @@ struct Canvas2D {
                   }
                   beatEvents.insert(e1);
                   beatEvents.insert(e2);
-                  e1->time = calc_time(&timeEvents, e1->beat);
-                  e2->time = calc_time(&timeEvents, e2->beat);
+                  e1->time = calc_time(e1->beat);
+                  e2->time = calc_time(e2->beat);
                   e1->origin = originEv;
                   beatEvents.inorder();
                   beatEvents.ordered = false;
@@ -4027,8 +4022,8 @@ struct Canvas2D {
                     beatEvents.insert(e1);
                     printf("INSERTED\n");
                     beatEvents.insert(e2);
-                    e1->time = calc_time(&timeEvents, e1->beat);
-                    e2->time = calc_time(&timeEvents, e2->beat);
+                    e1->time = calc_time(e1->beat);
+                    e2->time = calc_time(e2->beat);
                     e1->origin = originEv;
                     //printf("e1->function: %f\n", e1->function.evaluate(b, t, 0, 0));
                     printf("e1 time: %f, e2 time: %f\n", e1->time, e2->time);
@@ -4055,7 +4050,7 @@ struct Canvas2D {
               } else {
                 ev->id = nextID++;
               }
-              ev->time = calc_time(&timeEvents, ev->beat);
+              ev->time = calc_time(ev->beat);
               beatEvents.insert(ev);
               beatEvents.inorder();
             }
@@ -4083,6 +4078,20 @@ struct Canvas2D {
     // The note gain box, next to the first of its notes (kept inside the notes area)
     void drawGainBox(VulkanRenderer& renderer, Vec2 topLeft, Vec2 bottomRight) {
         const float w = 210.0f, h = 40.0f;
+        if (gainEdit.lane >= 0) {   // a global lane's value, under the lane's title
+            const bool tempo = gainEdit.lane == GLOBAL_TEMPO;
+            float x = std::clamp(xOfBeat(topLeft, gainEdit.beat), topLeft.x + 4, std::max(topLeft.x + 4, bottomRight.x - w - 4));
+            float y = topLeft.y - h - 40;
+            renderer.addRect(x - 1, y - 1, w + 2, h + 2, 0.95f, 0.85f, 0.3f);
+            renderer.addRect(x, y, w, h, 0.10f, 0.10f, 0.12f);
+            char title[48];
+            std::snprintf(title, sizeof title, "%s at beat %.2f:", tempo ? "Tempo" : "Master gain", gainEdit.beat);
+            laneLabels.push_back(title);
+            renderer.addText(laneLabels.back().c_str(), x + 6, y + h - 15, 12.0f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
+            laneLabels.push_back(gainEdit.text + (tempo ? "_ BPM    Enter / Esc" : "_ dB    Enter / Esc"));
+            renderer.addText(laneLabels.back().c_str(), x + 6, y + 5, 14.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+            return;
+        }
         Event* first = nullptr;
         for (Event* e : gainEdit.targets)
           if (!first || e->beat < first->beat) first = e;
@@ -4115,7 +4124,7 @@ struct Canvas2D {
     // and the preview of a clip being trimmed or moved.
     void drawClips(VulkanRenderer& renderer, const SubPanel& audio, float x1, float x2, Vec2 topLeft,
                    const std::vector<ClipSpan>& spans, const ClipSpan& hoverClip, float snappedBeat) {
-        double spb = engine ? engine->samplesPerBeat() : 0.0;
+        const double sampleRate = engine ? engine->sampleRate : 0.0;
         auto laneOf = [&](int track) {
           auto it = std::find(audio.lanes.begin(), audio.lanes.end(), track);
           return it == audio.lanes.end() ? -1 : (int)(it - audio.lanes.begin());
@@ -4139,12 +4148,11 @@ struct Canvas2D {
 
           // Waveform: for each 2px column, the loudest peak block it covers
           const Clip* clip = clipOf(sp.start);
-          if (clip && !clip->peaks.empty() && spb > 0) {
+          if (clip && !clip->peaks.empty() && sampleRate > 0) {
             float mid = (yt + yb) / 2, half = (yt - yb) / 2 - 1;
             ui::Color wc = {c.r * 0.9f, c.g * 0.9f, c.b * 0.9f};
             auto sampleAt = [&](float px) {
-              float beat = calc_beat(&timeEvents, screenToWorld(topLeft, {px, 0.0f}).x);
-              return (double)clip->startSample + (beat - sp.start->beat) * spb;
+              return (double)clip->startSample + (screenToWorld(topLeft, {px, 0.0f}).x - sp.start->time) * sampleRate;
             };
             for (float px = std::max(xs, x1); px < std::min(xe, x2); px += 2) {
               double a = sampleAt(px), b = sampleAt(px + 2);
@@ -4172,8 +4180,8 @@ struct Canvas2D {
           int k = laneOf(clipEdit.span.start->profile);
           if (k >= 0) {
             auto [sb, eb] = clipEditExtent(snappedBeat);
-            float xs = worldToScreen(topLeft, {calc_time(&timeEvents, sb), 0.0f}).x;
-            float xe = worldToScreen(topLeft, {calc_time(&timeEvents, eb), 0.0f}).x;
+            float xs = worldToScreen(topLeft, {calc_time(sb), 0.0f}).x;
+            float xe = worldToScreen(topLeft, {calc_time(eb), 0.0f}).x;
             outline(xs, xe, audio.laneTop(k) - AUDIO_LANE_H + 2, audio.laneTop(k) - 2, {0.95f, 0.85f, 0.3f});
           }
         }
@@ -4205,10 +4213,10 @@ struct Canvas2D {
         float t0 = std::max(0.0f, screenToWorld(topLeft, {x1, 0.0f}).x);
         float t1 = screenToWorld(topLeft, {x2, 0.0f}).x;
         if (t1 > t0) {
-          int b0 = (int)std::floor(calc_beat(&timeEvents, t0));
-          int b1 = (int)std::ceil(calc_beat(&timeEvents, t1));
+          int b0 = (int)std::floor(calc_beat(t0));
+          int b1 = (int)std::ceil(calc_beat(t1));
           for (int i = std::max(b0, 0); i <= b1 && i - b0 < 2000; i++)
-            beatXs.push_back({worldToScreen(topLeft, {calc_time(&timeEvents, (float)i), 0.0f}).x, true});
+            beatXs.push_back({worldToScreen(topLeft, {calc_time((float)i), 0.0f}).x, true});
         }
         Event* e = beatEvents.get_first();
         if (e && e->type != EV_BEAT) e = next_type(e, EV_BEAT);
@@ -4257,7 +4265,7 @@ struct Canvas2D {
         panelRect(renderer, perc, x1, x2, loopX, perc.bottom, 1, perc.height(), {0.235f, 0.235f, 0.235f});
         panelRect(renderer, perc, x1, x2, playheadX, perc.bottom, 1, perc.height(), {0.784f, 0.08f, 0.08f});
         if (split_start >= 0.0f) {
-          float sx0 = worldToScreen(topLeft, {calc_time(&timeEvents, split_start), 0.0f}).x;
+          float sx0 = worldToScreen(topLeft, {calc_time(split_start), 0.0f}).x;
           panelRect(renderer, perc, x1, x2, sx0, perc.bottom, 1, perc.height(), {0.8f, 0.7f, 0.3f});
         }
         if (perc.lanes.empty() && perc.height() >= 16)
@@ -4286,7 +4294,8 @@ bool load_song(const std::string& path,
                Canvas2D* canvas,
                std::vector<Track>& tracks, uint32_t* nextID,
                std::vector<std::vector<Clip>>& clipsOut, float sampleRate,
-               std::vector<std::vector<AutoLane>>& autoOut)
+               std::vector<std::vector<AutoLane>>& autoOut,
+               std::array<std::vector<AutoPoint>, GLOBAL_LANES>& globalOut, float& baseBpm)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
@@ -4297,7 +4306,6 @@ bool load_song(const std::string& path,
         throw std::runtime_error("Invalid file format");
     }
 
-    canvas->timeEvents.remove_all();
     canvas->beatEvents.remove_all();
 
     uint32_t eventCount;
@@ -4307,29 +4315,17 @@ bool load_song(const std::string& path,
     uint32_t id, numR, denR, numB, denB;
     uint32_t next_id = 0;
     std::vector<Event*> beatEvs;   // in file order, for the NGDB section
-    // Read time events
+    // Time events are from before the tempo lane, when they only set the
+    // drawing scale, not what played: skip them.
 
     f.read(reinterpret_cast<char*>(&eventCount), sizeof(eventCount));
 
     for (int i = 0; i < (int)eventCount; i++) {
       f.read(reinterpret_cast<char*>(&v), sizeof(float));
       f.read(reinterpret_cast<char*>(&l), sizeof(int));
-      f.read(expr, l);
-      expr[l] = '\0';
-      printf("timeEvent: %f, %s\n", v, expr);
+      f.seekg(l, std::ios::cur);
       f.read(reinterpret_cast<char*>(&t), sizeof(t));
-      Event* toInsert;
-      if (l != 0)
-        toInsert = canvas->createEvExpr(v, expr, t);
-      else
-        toInsert = canvas->createEv(v, t);
-      canvas->timeEvents.insert(toInsert);
     }
-
-    canvas->timeEvents.reparent_tree();
-    canvas->timeEvents.setFinalEv();
-    printf("read timeEvents:");
-    canvas->timeEvents.inorder();
 
     // Read beat events
 
@@ -4372,7 +4368,7 @@ bool load_song(const std::string& path,
       if (toInsert->den != 0)
         toInsert->primeFactors = getPrimeFactors(denB);
       toInsert->ratio = {numR, denR};
-      toInsert->time = calc_time(&canvas->timeEvents, v);
+      toInsert->time = calc_time(v);
       toInsert->profile = p;
       std::fflush(stdout);
       canvas->beatEvents.insert(toInsert);
@@ -4539,6 +4535,21 @@ bool load_song(const std::string& path,
                     autoOut[i].push_back(std::move(lane));
                 }
             }
+        } else if (std::strncmp(tag, "GLOB", 4) == 0) {
+            uint32_t lanes = 0;
+            f.read(reinterpret_cast<char*>(&baseBpm), sizeof(float));
+            if (!f.read(reinterpret_cast<char*>(&lanes), sizeof(lanes))) return false;
+            for (uint32_t k = 0; k < lanes; k++) {
+                uint32_t n = 0;
+                if (!f.read(reinterpret_cast<char*>(&n), sizeof(n)) || n > (16u << 20)) return false;
+                std::vector<AutoPoint> pts(n);
+                for (AutoPoint& pt : pts) {
+                    f.read(reinterpret_cast<char*>(&pt.beat), sizeof(float));
+                    f.read(reinterpret_cast<char*>(&pt.value), sizeof(float));
+                }
+                if (!f) return false;
+                if (k < GLOBAL_LANES) globalOut[k] = std::move(pts);
+            }
         } else {
             break;
         }
@@ -4606,6 +4617,48 @@ constexpr float TRACK_ROW_H    = 46.0f;
 constexpr float TRACK_HEADER_H = 22.0f;
 constexpr float TRACK_FOOTER_H = 26.0f;
 
+// Signal chain bar geometry, in pixels
+constexpr float CHAIN_BAR_H    = 190.0f;
+constexpr float CHAIN_TITLE_H  = 20.0f;
+constexpr float CHAIN_CARD_W   = 236.0f;
+constexpr float CHAIN_CARD_GAP = 16.0f;   // room for the arrow between cards
+constexpr float CHAIN_HEAD_H   = 42.0f;   // a card's buttons and filter box
+constexpr float CHAIN_ROW_H    = 17.0f;
+constexpr int   CHAIN_ROWS     = 7;
+
+// One card of the signal chain bar: the instrument, an effect, or (last) the
+// list of effects that can be added. Its rows show the entries that match
+// the filter, starting at `scroll`; they're widgets for what fits, not for
+// every parameter, as a plugin can have hundreds.
+constexpr int CHAIN_ADD = -1;   // ChainCard::slot of the add card
+struct ChainCard {
+    int slot = CHAIN_ADD;                  // or AUTO_INSTRUMENT, or the k-th effect, as in AutoLane
+    vst3::Plugin* plugin = nullptr;        // null on the add card; only valid while uid matches
+    uint64_t uid = 0;
+    std::vector<vst3::ParamInfo> entries;  // its parameters, or the effects to add (id unused)
+    std::vector<int> matches;              // indices into entries
+    std::string filter;
+    int scroll = 0;
+    float values[CHAIN_ROWS] = {};         // what the sliders show; read back every draw
+    ui::Widget* widget = nullptr;
+
+    const vst3::ParamInfo* row(int r) const {
+        int i = scroll + r;
+        return i >= 0 && i < (int)matches.size() ? &entries[matches[i]] : nullptr;
+    }
+    void scrollBy(int rows) {
+        scroll = std::clamp(scroll + rows, 0, std::max(0, (int)matches.size() - CHAIN_ROWS));
+    }
+    void applyFilter() {
+        auto lower = [](std::string t) { for (char& c : t) c = (char)std::tolower((unsigned char)c); return t; };
+        std::string f = lower(filter);
+        matches.clear();
+        for (int i = 0; i < (int)entries.size(); i++)
+            if (f.empty() || lower(entries[i].name).find(f) != std::string::npos) matches.push_back(i);
+        scrollBy(0);
+    }
+};
+
 // Everything the control panel edits lives here. Sliders hold pointers into
 // `profile` and into g_tracks, so an App must not be moved or copied after
 // buildUI(), and the track rows are rebuilt (tracksChanged) whenever g_tracks
@@ -4624,11 +4677,18 @@ struct App {
     int          deleteArmedBefore = -1; // deleteArmed as it was before the current click
 
     Profile     profile;                 // synth settings of the current track
-    float       bpm = 110.0f;
     std::string freqText[3];             // percussion freq text boxes
     std::string pdPatchText;             // Pd patch name for the current track
     std::string vstInstText;             // VST3 instrument of the current track
-    std::string vstFxText;               // VST3 effects of the current track
+
+    // The signal chain bar. Cards are rebuilt before drawing whenever the
+    // current track's plugins changed (never from inside a widget callback).
+    ui::Widget*  chainList = nullptr;     // holds one widget per card
+    bool         chainOpen = false;
+    int          chainFirst = 0;          // cards scrolled off the left
+    std::vector<std::unique_ptr<ChainCard>> chainCards;
+    uint64_t     chainArmed = 0;          // uid of the effect whose x was clicked once
+    uint64_t     chainArmedBefore = 0;    // chainArmed before the current click
 
     explicit App(AudioEngine& e) : engine(e) {}
     App(const App&) = delete;
@@ -4653,7 +4713,6 @@ struct App {
         }
         pdPatchText = track().pdPatch;
         vstInstText = track().vstInstrument;
-        vstFxText = track().vstEffects;
         scrollToTrack(index);
     }
 
@@ -4853,20 +4912,10 @@ struct App {
         loadPlugins(g_currentTrack);
     }
 
-    void commitVstEffects() {
-        track().vstEffects = vstFxText;
-        loadPlugins(g_currentTrack);
-    }
-
-    // The Edit buttons open the plugin windows, or close them if they're open
+    // The Edit button opens the instrument's window, or closes it if it's open
     bool instrumentEditorOpen() {
         vst3::Plugin* p = engine.instrument(g_currentTrack);
         return p && p->editorOpen();
-    }
-    bool effectEditorsOpen() {
-        for (vst3::Plugin* p : engine.effects(g_currentTrack))
-            if (p->editorOpen()) return true;
-        return false;
     }
 
     void editVstInstrument() {
@@ -4877,16 +4926,107 @@ struct App {
         if (!p->openEditor()) engine.pd.status = p->name() + " has no editor window";
     }
 
-    void editVstEffects() {
-        if (effectEditorsOpen()) {
-            for (vst3::Plugin* p : engine.effects(g_currentTrack)) p->closeEditor();
-            return;
+    // ---- Signal chain ----
+    // Track t's effect list as saved, from what's really loaded
+    void syncEffectNames(int t) {
+        std::string names;
+        for (vst3::Plugin* p : engine.effects(t))
+            names += (names.empty() ? "" : ",") + p->query();
+        g_tracks[t].vstEffects = names;
+    }
+
+    // Automation lanes name effects by position, so they move with them.
+    // `to` gives an effect's new position, or -1 if it's gone. Call holding
+    // g_automationMutex, along with changing the chain, so that the audio
+    // thread never sends a lane to the wrong effect.
+    template <class To>
+    void remapLanes(int t, To to) {
+        auto& lanes = g_automation[t];
+        for (AutoLane& l : lanes) if (l.plugin >= 1) l.plugin = to(l.plugin);
+        lanes.erase(std::remove_if(lanes.begin(), lanes.end(),
+                                   [](const AutoLane& l) { return l.plugin < 0; }), lanes.end());
+        Track& tr = g_tracks[t];
+        if (tr.autoPlugin >= 1) {
+            tr.autoPlugin = to(tr.autoPlugin);
+            if (tr.autoPlugin < 0) tr.autoPlugin = AUTO_VELOCITY;
         }
-        commitVstEffects();
-        std::vector<vst3::Plugin*> fx = engine.effects(g_currentTrack);
-        if (fx.empty()) { engine.pd.status = "No effects on this track"; return; }
-        for (vst3::Plugin* p : fx)
-            if (!p->openEditor()) engine.pd.status = p->name() + " has no editor window";
+    }
+
+    void beforeChainEdit() {
+        endAutoTakes();
+        gBeatOctCanvas.picker = {};
+        gBeatOctCanvas.autoEdit = {};
+    }
+
+    void addEffect(const std::string& name) {
+        std::string status;
+        if (engine.addEffect(g_currentTrack, name, status)) {
+            syncEffectNames(g_currentTrack);
+            chainFirst = (int)chainCards.size();   // bring it into view (clamped before drawing)
+        }
+        engine.pd.status = status;
+    }
+
+    // k is the effect's position, from 1 as in AutoLane
+    void removeEffect(int k) {
+        beforeChainEdit();
+        {
+            std::lock_guard<std::mutex> lock(g_automationMutex);
+            engine.removeEffect(g_currentTrack, k - 1);
+            remapLanes(g_currentTrack, [k](int p) { return p == k ? -1 : p > k ? p - 1 : p; });
+        }
+        syncEffectNames(g_currentTrack);
+    }
+
+    // Swaps effects k and k + 1
+    void swapWithNext(int k) {
+        beforeChainEdit();
+        {
+            std::lock_guard<std::mutex> lock(g_automationMutex);
+            engine.swapEffects(g_currentTrack, k - 1, k);
+            remapLanes(g_currentTrack, [k](int p) { return p == k ? k + 1 : p == k + 1 ? k : p; });
+        }
+        syncEffectNames(g_currentTrack);
+    }
+
+    // Is this card still what's on the current track? It isn't between a
+    // change of plugins and the next draw, which rebuilds the cards.
+    bool cardLive(const ChainCard& c) {
+        vst3::Plugin* p = engine.plugin(g_currentTrack, c.slot);
+        return p && p->uid() == c.uid;
+    }
+
+    int chainFits() {
+        return std::max(1, (int)((chainList->screen.w + CHAIN_CARD_GAP) / (CHAIN_CARD_W + CHAIN_CARD_GAP)));
+    }
+    void scrollChain(int cards) {
+        int maxFirst = std::max(0, (int)chainCards.size() - chainFits());
+        chainFirst = std::clamp(chainFirst + cards, 0, maxFirst);
+    }
+
+    void toggleChain() {
+        chainOpen = !chainOpen;
+        // The track list changes height: keep the current track in view
+        ui.layout(ui.root.screen.w, ui.root.screen.h);
+        scrollToTrack(g_currentTrack);
+        scrollTracks(0);
+    }
+
+    // The wheel over the bar: a card's rows scroll under the cursor; over
+    // anything else, or with Shift or a sideways wheel, the chain does.
+    bool chainWheel(float x, float y, int steps, int sideways, bool shift) {
+        if (!chainOpen || !chainList->parent->screen.contains(x, y)) return false;
+        if (ui.dragging) return true;   // the held row would become another parameter
+        if (sideways) { scrollChain(sideways); return true; }
+        if (!shift)
+            for (auto& c : chainCards)
+                if (c->widget && c->widget->visible() && c->widget->screen.contains(x, y) &&
+                    y >= c->widget->screen.y + CHAIN_HEAD_H) {
+                    c->scrollBy(steps * 2);
+                    return true;
+                }
+        scrollChain(steps);
+        return true;
     }
 
     void cycleTuning() {
@@ -4931,19 +5071,38 @@ struct App {
 
     bool playing = false;   // transport state, shared with the main loop
 
+    // Sends the engine the song and where to play it from. A take's passes
+    // must all start where it did, so while recording a loop goes back there.
+    void sendPosition() {
+        engine.setEvents(&gBeatOctCanvas.beatEvents);
+        engine.resetSampleCounter(calc_beat(playhead_time), calc_beat(recording ? playhead_time : loop_start_time),
+                                  loop_end < 0.0f ? -1.0 : (double)calc_beat(loop_end));
+    }
+
+    void startPlayback() {
+        startRecordingIfArmed();
+        sendPosition();
+        engine.setPlayState(true);
+        playing = true;
+    }
+
+    // Pauses: the playhead stays where it got to, and playing resumes there
+    void stopPlayback() {
+        playhead_time = calc_time((float)engine.playheadBeat());
+        engine.setPlayState(false);
+        stopRecording();
+        playing = false;
+    }
+
     // Renders from the playhead to the last note / blip / clip, offline,
     // through the same engine path as playback.
     void exportWav() {
-        if (playing) {
-            engine.setPlayState(false);
-            stopRecording();
-            playing = false;
-        }
+        if (playing) stopPlayback();
         float endBeat = 0.0f;
         for (Event* e = gBeatOctCanvas.beatEvents.get_first(); e; e = next(e))
             if (e->type == EV_NOTE_END || e->type == EV_PERC || e->type == EV_AUDIO_END)
                 endBeat = std::max(endBeat, e->beat);
-        float startBeat = calc_beat(&gBeatOctCanvas.timeEvents, playhead_time);
+        float startBeat = calc_beat(playhead_time);
         if (endBeat <= startBeat) {
             engine.pd.status = "Nothing to export after the playhead";
             return;
@@ -5014,7 +5173,6 @@ struct App {
         std::vector<uint64_t> ends = engine.recordPassEnds();
         ends.push_back(take.size());
         float startBeat = (float)engine.recordStartBeat();   // every pass starts here
-        double spb = engine.samplesPerBeat();
 
         // A pass is worth keeping unless a later pass covers all of it
         struct Pass { size_t from, to; };
@@ -5043,7 +5201,7 @@ struct App {
                 clip.file = nextTakeFile(g_tracks[t].name);
                 writeMonoWav(clip.file, clip.samples);
                 clip.computePeaks();
-                float endBeat = startBeat + (float)(clip.samples.size() / spb);
+                float endBeat = gBeatOctCanvas.beatAfterSamples(startBeat, (double)clip.samples.size());
                 saved = clip.file;
                 layDownClip(t, std::move(clip), startBeat, endBeat);
             }
@@ -5086,7 +5244,6 @@ struct App {
     void layDownClip(int t, Clip clip, float startBeat, float endBeat) {
         Canvas2D& c = gBeatOctCanvas;
         c.pushUndo();
-        const double spb = engine.samplesPerBeat();
         const float eps = 1e-6f;
 
         for (const Canvas2D::ClipSpan& sp : c.clipSpans()) {
@@ -5100,7 +5257,7 @@ struct App {
 
             if (keepsTail) {
                 // The tail plays from further into the old audio
-                uint64_t tailStart = old ? old->startSample + (uint64_t)std::llround((endBeat - s0) * spb) : 0;
+                uint64_t tailStart = old ? old->startSample + (uint64_t)std::llround(c.samplesBetween(s0, endBeat)) : 0;
                 if (keepsHead) {
                     // Split: the tail becomes a clip of its own
                     Clip tail = old ? *old : Clip{};
@@ -5137,7 +5294,7 @@ struct App {
         Event* ev = new Event(beat, type);
         ev->id = index;
         ev->profile = t;
-        ev->time = calc_time(&c.timeEvents, beat);
+        ev->time = calc_time(beat);
         c.beatEvents.insert(ev);
     }
 
@@ -5208,9 +5365,9 @@ struct App {
                 if (!p) continue;
                 edits.clear();
                 p->takeEdits(edits);
+                changed |= !edits.empty();   // the chain bar's sliders show them too
                 if (!rec) continue;
                 for (const vst3::ParamEdit& e : edits) recordAutoPoint(t, k, *p, e, beat);
-                changed |= !edits.empty();
             }
         }
 
@@ -5226,7 +5383,20 @@ struct App {
 
     void toggleAutomationMode() {
         Canvas2D& c = gBeatOctCanvas;
+        if (c.autoEdit.mode != Canvas2D::AUTO_DRAG_NONE) c.applyTempo();   // a stroke cut short
         c.autoMode = !c.autoMode;
+        c.globalLane = -1;
+        c.picker = {};
+        c.autoEdit = {};
+        c.cancelEdit();
+    }
+
+    // The Tempo and Master gain buttons: shows that lane, or back to the
+    // track's lane if it's already showing
+    void toggleGlobalLane(int lane) {
+        Canvas2D& c = gBeatOctCanvas;
+        c.globalLane = c.autoMode && c.globalLane == lane ? -1 : lane;
+        c.autoMode = true;
         c.picker = {};
         c.autoEdit = {};
         c.cancelEdit();
@@ -5236,30 +5406,131 @@ struct App {
     void openAutomationPicker(int i) {
         selectTrack(i);
         gBeatOctCanvas.autoMode = true;
+        gBeatOctCanvas.globalLane = -1;
         gBeatOctCanvas.openPicker(i);
     }
 
-    void saveProject() {
+    // ---- Save / load prompt ----
+
+    struct FilePrompt {
+        bool open = false;
+        bool saving = false;      // otherwise loading
+        bool quitAfter = false;   // opened from the quit prompt
+        std::string path;         // as typed
+        std::string message;      // error, or Tab's list of matches
+        std::string confirmed;    // the file the user agreed to overwrite
+    } filePrompt;
+
+    std::string projectFile = "session.son";   // last saved / loaded
+
+    void openFilePrompt(bool saving, bool quitAfter = false) {
+        filePrompt = {};
+        filePrompt.open = true;
+        filePrompt.saving = saving;
+        filePrompt.quitAfter = quitAfter;
+        filePrompt.path = projectFile;
+        SDL_StartTextInput();   // the text arrives as SDL_TEXTINPUT
+    }
+
+    static std::string expandHome(const std::string& path) {
+        const char* home = std::getenv("HOME");
+        if (home && (path == "~" || path.rfind("~/", 0) == 0)) return home + path.substr(1);
+        return path;
+    }
+
+    // Tab: extends the typed path as far as the folders and .son files allow.
+    void completeFilePrompt() {
+        namespace fs = std::filesystem;
+        FilePrompt& fp = filePrompt;
+        fp.message.clear();
+        fs::path typed(expandHome(fp.path));
+        fs::path dir = typed.parent_path();
+        std::string prefix = typed.filename().string();
+
+        std::vector<std::string> matches;
+        std::error_code ec;
+        fs::directory_iterator it(dir.empty() ? fs::path(".") : dir, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::string name = it->path().filename().string();
+            if (name.rfind(prefix, 0) != 0) continue;
+            if (name[0] == '.' && (prefix.empty() || prefix[0] != '.')) continue;
+            std::error_code dirEc;
+            bool isDir = it->is_directory(dirEc);
+            if (isDir) matches.push_back(name + "/");
+            else if (it->path().extension() == ".son") matches.push_back(name);
+        }
+        if (matches.empty()) { fp.message = "No matches"; return; }
+        std::sort(matches.begin(), matches.end());
+
+        std::string common = matches[0];
+        for (const std::string& m : matches) {
+            size_t n = 0;
+            while (n < common.size() && n < m.size() && common[n] == m[n]) n++;
+            common.resize(n);
+        }
+        fp.path += common.substr(prefix.size());
+        if (matches.size() > 1)
+            for (const std::string& m : matches) fp.message += m + "  ";
+    }
+
+    // Enter: returns true once the file has been saved / loaded. Otherwise
+    // filePrompt.message says why not and the prompt stays up.
+    bool submitFilePrompt() {
+        namespace fs = std::filesystem;
+        FilePrompt& fp = filePrompt;
+        fp.message.clear();
+        if (fp.path.empty()) { fp.message = "Type a file name"; return false; }
+        std::string path = expandHome(fp.path);
+        if (fp.saving) {
+            if (fs::path(path).filename().empty()) { fp.message = "Type a file name"; return false; }
+            if (!fs::path(path).has_extension()) path += ".son";
+            std::error_code ec;
+            if (fs::is_directory(path, ec)) { fp.message = "That is a folder"; return false; }
+            if (path != projectFile && path != fp.confirmed && fs::exists(path, ec)) {
+                fp.confirmed = path;
+                fp.message = "Already exists. Enter again to overwrite it";
+                return false;
+            }
+            if (!saveProject(path)) { fp.message = "Couldn't write " + path; return false; }
+        } else if (!loadProject(path)) {
+            fp.message = "Missing, or not a Sonnote project: " + path;
+            return false;
+        }
+        projectFile = path;
+        engine.pd.status = (fp.saving ? "Saved " : "Loaded ") + path;
+        fp.open = false;
+        return true;
+    }
+
+    bool saveProject(const std::string& path) {
         collectPluginStates();
-        save_song("session.son", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents, g_tracks, g_clips,
-                  g_automation);
+        bool ok = save_song(path, gBeatOctCanvas.beatEvents, g_tracks, g_clips, g_automation);
         for (Track& t : g_tracks) {   // only needed in the file
             t.instrumentState.clear();
             t.effectStates.clear();
         }
+        return ok;
     }
 
-    void loadProject() {
+    // Returns false, with the current project untouched, unless `path` is a
+    // project file: everything below throws the current one away.
+    bool loadProject(const std::string& path) {
+        {
+            std::ifstream f(path, std::ios::binary);
+            char magic[4] = {};
+            if (!f.read(magic, 4) || std::strncmp(magic, "SONN", 4) != 0) return false;
+        }
         std::vector<std::vector<Clip>> clips(MAX_TRACKS);
         std::vector<std::vector<AutoLane>> automation(MAX_TRACKS);
+        std::array<std::vector<AutoPoint>, GLOBAL_LANES> globalLanes;
         gBeatOctCanvas.clipEdit = {};
         gBeatOctCanvas.picker = {};
         gBeatOctCanvas.autoEdit = {};
         gBeatOctCanvas.forgetNotes();
         gBeatOctCanvas.clearHistory();
         autoTakes.clear();   // their lanes are about to go
-        load_song("session.son", &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate,
-                  automation);
+        load_song(path, &gBeatOctCanvas, g_tracks, &gBeatOctCanvas.nextID, clips, engine.sampleRate,
+                  automation, globalLanes, g_baseBpm);
         engine.setFrequency(ref);   // the file may have its own reference frequency
         {
             std::lock_guard<std::mutex> lock(g_clipsMutex);
@@ -5269,7 +5540,9 @@ struct App {
             std::lock_guard<std::mutex> lock(g_automationMutex);
             g_automation = std::move(automation);
             g_automation.resize(MAX_TRACKS);
+            for (int k = 0; k < GLOBAL_LANES; k++) g_globalLanes[k].points = std::move(globalLanes[k]);
         }
+        gBeatOctCanvas.applyTempo();
         g_tracks.reserve(MAX_TRACKS);
         // Perc tracks start with a patch, unless they play a VST3 instrument
         for (Track& t : g_tracks)
@@ -5281,6 +5554,7 @@ struct App {
         tracksChanged = true;
         trackScroll = 0.0f;
         selectTrack(std::min(g_currentTrack, (int)g_tracks.size() - 1));   // refresh the panel
+        return true;
     }
 };
 
@@ -5341,6 +5615,7 @@ static void addTrackToggle(ui::Widget& row, App& app, float x, const char* label
 static void rebuildTrackRows(App& app) {
     using namespace ui;
     Widget* list = app.trackList;
+    app.ui.dragging = nullptr;   // a gain slider may be about to go
     if (app.renaming >= 0) {   // the box being typed into is about to go
         app.ui.focused = nullptr;
         app.renaming = -1;
@@ -5429,6 +5704,204 @@ static void rebuildTrackRows(App& app) {
     }
 }
 
+// "name: value", cut to fit in `chars`, losing the name's end before the value's
+static std::string chainLabel(const std::string& name, const std::string& value, size_t chars) {
+    if (value.empty()) return name.size() > chars ? name.substr(0, chars - 2) + ".." : name;
+    size_t room = chars > value.size() + 2 ? chars - value.size() - 2 : 4;
+    return ((name.size() > room ? name.substr(0, room - 1) + "." : name) + ": " + value).substr(0, chars);
+}
+
+static void buildChainCard(App& app, ChainCard& card, int index) {
+    using namespace ui;
+    ChainCard* c = &card;
+    const Color head{0.30f, 0.30f, 0.33f};
+
+    card.widget = app.chainList->add(panelFn([&app, index](const Rect& p) {
+        return Rect{p.x + (index - app.chainFirst) * (CHAIN_CARD_W + CHAIN_CARD_GAP), p.y, CHAIN_CARD_W, p.h};
+    }, {0.14f, 0.14f, 0.16f}));
+    Widget* w = card.widget;
+    w->visibleFn = [&app, index] {
+        return index >= app.chainFirst && index < app.chainFirst + app.chainFits();
+    };
+
+    if (index > 0) {   // the signal goes this way
+        Widget* arrow = w->add(button({-12, 70, 10, 16}, ">", {}));
+        arrow->fill = false;
+        arrow->textColor = {0.7f, 0.7f, 0.7f};
+    }
+
+    // Top line: the name, then the card's buttons
+    Widget* name = w->add(button({2, 2, 122, 16}, "", {}));
+    name->fill = false;
+    name->textColor = {1, 1, 1};
+    if (card.slot == CHAIN_ADD) {
+        name->label = "+ Add effect";
+    } else {
+        name->labelFn = [&app, c] {
+            if (app.chainArmed == c->uid) return std::string("Click x again");
+            std::string prefix = c->slot == AUTO_INSTRUMENT ? "Inst " : std::to_string(c->slot) + " ";
+            return chainLabel(prefix + c->plugin->name(), "", 16);
+        };
+        auto small = [&](Rect r, const char* label, std::function<void(Widget&)> fn) {
+            Widget* b = w->add(button(r, label, std::move(fn), head));
+            b->textColor = {1, 1, 1};
+            return b;
+        };
+        small({166, 2, 46, 16}, "", [&app, c](Widget&) {
+            if (!app.cardLive(*c)) return;
+            if (c->plugin->editorOpen()) c->plugin->closeEditor();
+            else if (!c->plugin->openEditor()) app.engine.pd.status = c->plugin->name() + " has no editor window";
+        })->labelFn = [c] { return std::string(c->plugin->editorOpen() ? "Close" : "UI"); };
+
+        if (card.slot >= 1) {
+            small({126, 2, 18, 16}, "<", [&app, c](Widget&) {
+                if (app.cardLive(*c)) app.swapWithNext(c->slot - 1);
+            })->visibleFn = [c] { return c->slot > 1; };
+            small({146, 2, 18, 16}, ">", [&app, c](Widget&) {
+                if (app.cardLive(*c)) app.swapWithNext(c->slot);
+            })->visibleFn = [&app, c] { return c->slot < (int)app.engine.effects(g_currentTrack).size(); };
+
+            // Like a track's delete button: the first click arms it, a second removes
+            Widget* del = small({214, 2, 19, 16}, "x", [&app, c](Widget&) {
+                if (!app.cardLive(*c)) return;
+                if (app.chainArmedBefore == c->uid) app.removeEffect(c->slot);
+                else app.chainArmed = c->uid;
+            });
+            del->colorFn = [&app, c, head] {
+                return app.chainArmed == c->uid ? Color{0.85f, 0.15f, 0.15f} : head;
+            };
+        }
+    }
+
+    // Second line: the filter, and how many rows it leaves
+    Widget* find = w->add(textBox({54, 22, 104, 16}, "Find:", &card.filter,
+                                  [c](Widget&) { c->scroll = 0; c->applyFilter(); }, /*labelLeft=*/true));
+    find->textColor = {1, 1, 1};
+    find->maxLen = card.slot == CHAIN_ADD ? 255 : 31;
+    if (card.slot == CHAIN_ADD) {
+        // Enter adds the first match, or tries the text as a name or path
+        find->onEnter = [&app, c](Widget&) {
+            if (c->filter.empty()) return;
+            const vst3::ParamInfo* first = c->row(0);
+            app.addEffect(first ? first->name : c->filter);
+            c->filter.clear();
+            c->applyFilter();
+        };
+    }
+    Widget* count = w->add(button({162, 22, 72, 16}, "", {}));
+    count->fill = false;
+    count->textColor = {0.7f, 0.7f, 0.7f};
+    count->labelFn = [c] {
+        int n = (int)c->matches.size();
+        if (n <= CHAIN_ROWS) return std::to_string(n);
+        return std::to_string(c->scroll + 1) + "-" + std::to_string(std::min(n, c->scroll + CHAIN_ROWS)) +
+               "/" + std::to_string(n);
+    };
+
+    // The rows
+    for (int r = 0; r < CHAIN_ROWS; r++) {
+        Rect rect{4, CHAIN_HEAD_H + r * CHAIN_ROW_H, CHAIN_CARD_W - 8, CHAIN_ROW_H - 2};
+        Widget* row;
+        if (card.slot == CHAIN_ADD) {
+            row = w->add(button(rect, "", [&app, c, r](Widget&) {
+                if (const vst3::ParamInfo* e = c->row(r)) app.addEffect(e->name);
+            }, {0.20f, 0.20f, 0.22f}));
+            row->textColor = {1, 1, 1};
+            row->labelFn = [c, r] {
+                const vst3::ParamInfo* e = c->row(r);
+                return e ? chainLabel(e->name, "", 30) : std::string();
+            };
+        } else {
+            row = w->add(slider(rect, "", &card.values[r], 0.0f, 1.0f, 1.0f, [&app, c, r](Widget&) {
+                const vst3::ParamInfo* e = c->row(r);
+                if (e && app.cardLive(*c)) c->plugin->editParam(e->id, c->values[r]);
+            }));
+            row->labelFn = [c, r] {
+                const vst3::ParamInfo* e = c->row(r);
+                return e ? chainLabel(e->name, c->plugin->paramText(e->id, c->values[r]), 30) : std::string();
+            };
+        }
+        row->visibleFn = [c, r, w] {
+            return c->row(r) && CHAIN_HEAD_H + (r + 1) * CHAIN_ROW_H <= w->screen.h + 2;
+        };
+    }
+
+    Widget* none = w->add(button({6, CHAIN_HEAD_H, CHAIN_CARD_W - 12, 16}, "", {}));
+    none->fill = false;
+    none->textColor = {0.7f, 0.7f, 0.7f};
+    none->labelFn = [c] {
+        if (c->slot != CHAIN_ADD) return std::string(c->entries.empty() ? "No parameters" : "No match");
+        return std::string(c->filter.empty() ? "No VST3 effects found" : "Enter: load as name or path");
+    };
+    none->visibleFn = [c] { return c->matches.empty(); };
+}
+
+// Brings the cards up to date with the current track's plugins, keeping the
+// scroll position and filter of the ones that stay.
+static void rebuildChain(App& app) {
+    struct Want {
+        int slot;
+        vst3::Plugin* plugin;
+        uint64_t uid() const { return plugin ? plugin->uid() : 0; }
+    };
+    std::vector<Want> want;
+    if (vst3::Plugin* p = app.engine.instrument(g_currentTrack)) want.push_back({AUTO_INSTRUMENT, p});
+    int k = 1;
+    for (vst3::Plugin* p : app.engine.effects(g_currentTrack)) want.push_back({k++, p});
+    want.push_back({CHAIN_ADD, nullptr});
+
+    const auto& have = app.chainCards;
+    if (want.size() == have.size() &&
+        std::equal(want.begin(), want.end(), have.begin(), [](const Want& a, const auto& b) {
+            return a.slot == b->slot && a.uid() == b->uid;
+        })) return;
+
+    // The widgets are about to go, along with anything pointing at them
+    auto inChain = [&app](ui::Widget* w) {
+        for (; w; w = w->parent) if (w == app.chainList) return true;
+        return false;
+    };
+    if (inChain(app.ui.focused)) app.ui.focused = nullptr;
+    if (inChain(app.ui.dragging)) app.ui.dragging = nullptr;
+    app.chainList->children.clear();
+
+    std::vector<std::unique_ptr<ChainCard>> old = std::move(app.chainCards);
+    app.chainCards.clear();
+    for (const Want& w : want) {
+        auto same = std::find_if(old.begin(), old.end(), [&](const auto& c) {
+            return c && c->uid == w.uid();
+        });
+        std::unique_ptr<ChainCard> card;
+        if (same != old.end()) {
+            card = std::move(*same);
+        } else {
+            card = std::make_unique<ChainCard>();
+            if (w.plugin) card->entries = w.plugin->parameters();
+            else for (const vst3::PluginInfo& info : vst3::plugins()) {
+                // The same folder can be scanned twice, e.g. /usr/lib64 -> /usr/lib
+                auto& e = card->entries;
+                bool listed = std::any_of(e.begin(), e.end(), [&](const auto& x) { return x.name == info.name; });
+                if (!info.instrument && !listed) e.push_back({0, info.name});
+            }
+            card->applyFilter();
+        }
+        card->slot = w.slot;
+        card->plugin = w.plugin;
+        card->uid = w.uid();
+        buildChainCard(app, *card, (int)app.chainCards.size());
+        app.chainCards.push_back(std::move(card));
+    }
+}
+
+// Sliders show the plugins' current values, however they got there
+static void refreshChain(App& app) {
+    for (auto& c : app.chainCards) {
+        if (!c->plugin) continue;
+        for (int r = 0; r < CHAIN_ROWS; r++)
+            if (const vst3::ParamInfo* e = c->row(r)) c->values[r] = (float)c->plugin->paramValue(e->id);
+    }
+}
+
 static void buildUI(App& app) {
     using namespace ui;
     Widget& root = app.ui.root;
@@ -5442,9 +5915,10 @@ static void buildUI(App& app) {
     }, {}, /*fill=*/false));
 
     // Area under the control panel: track panel on the left, note window on the right
-    auto below = [](const Rect& p) {
+    auto below = [&app](const Rect& p) {
         float top = p.y + p.h * CW_HEIGHT;
-        return Rect{p.x, top, p.w, p.y + p.h - top};
+        float bottom = p.y + p.h - (app.chainOpen ? std::min(CHAIN_BAR_H, p.h * 0.5f) : 0.0f);
+        return Rect{p.x, top, p.w, bottom - top};
     };
 
     // Note window. Canvas2D draws inside its screen rect.
@@ -5491,6 +5965,24 @@ static void buildUI(App& app) {
     Widget* border = content->add(panel({0.0f, 0.0f, 1.0f, CW_HEIGHT},
                                         {0.15f, 0.15f, 0.15f}, 2.0f, /*relative=*/true));
     Widget* cw = border->add(panel({0, 0, 1, 1}, {0.01f, 0.03f, 0.07f}, 3.0f, true));
+
+    // Bottom: the signal chain of the current track, toggled from the menu bar
+    Widget* chain = content->add(panelFn([](const Rect& p) {
+        float h = std::min(CHAIN_BAR_H, p.h * 0.5f);
+        return Rect{p.x, p.y + p.h - h, p.w, h};
+    }, {0.08f, 0.08f, 0.09f}));
+    chain->visibleFn = [&app] { return app.chainOpen; };
+    Widget* chainTitle = chain->add(button({8, 2, 900, 16}, "", {}));
+    chainTitle->fill = false;
+    chainTitle->textColor = {0.8f, 0.8f, 0.8f};
+    chainTitle->labelFn = [&app] {
+        std::string label = "Signal chain: " + app.track().name;
+        if ((int)app.chainCards.size() > app.chainFits()) label += "   (Shift + wheel to scroll along it)";
+        return label;
+    };
+    app.chainList = chain->add(panelFn([](const Rect& p) {
+        return Rect{p.x + 6, p.y + CHAIN_TITLE_H, p.w - 12, p.h - CHAIN_TITLE_H - 4};
+    }, {}, /*fill=*/false));
  
     // ---- Menu bar (added after `content` so it's on top) ----
     Widget* menuBar = root.add(panelFn([](const Rect& p) {
@@ -5500,12 +5992,12 @@ static void buildUI(App& app) {
     // File menu. Item positions are relative to the "File" header.
     Widget* file = menuBar->add(menu({4, 2, 40, 18}, "File"));
     file->add(menuItem({0, 22, 150, 18}, "Export WAV",   [&app](Widget&) { app.exportWav(); }));
-    file->add(menuItem({0, 42, 150, 18}, "Save project", [&app](Widget&) { app.saveProject(); }));
-    file->add(menuItem({0, 62, 150, 18}, "Load project", [&app](Widget&) { app.loadProject(); }));
+    file->add(menuItem({0, 42, 150, 18}, "Save project", [&app](Widget&) { app.openFilePrompt(true); }));
+    file->add(menuItem({0, 62, 150, 18}, "Load project", [&app](Widget&) { app.openFilePrompt(false); }));
     file->add(textBox({0, 102, 150, 18}, "Wav name:", &g_settings.wavName,
                       {}, false, {0.85f, 0.85f, 0.85f}));
     file->add(menuItem({0, 122, 150, 18}, "Export MIDI", [](Widget&) {
-    export_midi("export.mid", gBeatOctCanvas.beatEvents, gBeatOctCanvas.timeEvents);
+    export_midi("export.mid", gBeatOctCanvas.beatEvents, g_tempoMap);
 }));
 
     // Record: arms recording into armed audio tracks and of automation
@@ -5521,10 +6013,38 @@ static void buildUI(App& app) {
         return gBeatOctCanvas.autoMode ? Color{0.22f, 0.36f, 0.50f} : Color{0.22f, 0.22f, 0.24f};
     };
 
+    // The global lanes
+    auto globalLaneButton = [&](Rect r, const char* label, int lane) {
+        Widget* b = menuBar->add(button(r, label, [&app, lane](Widget&) { app.toggleGlobalLane(lane); }));
+        b->textColor = {1, 1, 1};
+        b->colorFn = [lane] {
+            const Canvas2D& c = gBeatOctCanvas;
+            return c.autoMode && c.globalLane == lane ? Color{0.22f, 0.36f, 0.50f} : Color{0.22f, 0.22f, 0.24f};
+        };
+    };
+    globalLaneButton({244, 2, 60, 18}, "Tempo", GLOBAL_TEMPO);
+    globalLaneButton({310, 2, 100, 18}, "Master gain", GLOBAL_GAIN);
+
+    Widget* chainBtn = menuBar->add(button({416, 2, 110, 18}, "FX chain (b)", [&app](Widget&) { app.toggleChain(); }));
+    chainBtn->textColor = {1, 1, 1};
+    chainBtn->colorFn = [&app] {
+        return app.chainOpen ? Color{0.22f, 0.36f, 0.50f} : Color{0.22f, 0.22f, 0.24f};
+    };
+
     // ---- Control panel, left column ----
-    cw->add(slider({10, 10, 120, 15}, "BPM", &app.bpm, 20, 200, 1,
-                   [&app](Widget&) { app.engine.setTempo(app.bpm); }))
-        ->labelFn = [&app] { return "BPM: " + std::to_string((int)app.bpm); };
+    // The slider is the tempo until the tempo lane has points; after that
+    // this spot shows the lane's tempo at the playhead.
+    Widget* bpm = cw->add(slider({10, 10, 120, 15}, "BPM", &g_baseBpm, 20, 200, 1,
+                                 [](Widget&) { gBeatOctCanvas.applyTempo(); }));
+    bpm->labelFn = [] { return "BPM: " + std::to_string((int)g_baseBpm); };
+    bpm->visibleFn = [] { return g_globalLanes[GLOBAL_TEMPO].points.empty(); };
+    Widget* laneBpm = cw->add(button({10, 10, 120, 15}, "", {}));
+    laneBpm->fill = false;
+    laneBpm->textColor = {1, 1, 1};
+    laneBpm->labelFn = [] {
+        return "BPM: " + std::to_string((int)std::lround(g_tempoMap.bpmAt(calc_beat(playhead_time)))) + " (lane)";
+    };
+    laneBpm->visibleFn = [] { return !g_globalLanes[GLOBAL_TEMPO].points.empty(); };
 
     cw->add(textBox({10, 45, 120, 15}, "Ref. Freq.:", &g_settings.refFreq, [&app](Widget&) {
         if (g_settings.refFreq.empty()) return;
@@ -5560,17 +6080,12 @@ static void buildUI(App& app) {
     pdStatus->labelFn = [&app] { return app.engine.pd.status; };
     pdStatus->visibleFn = standardOnly;
 
-    // VST3 instrument and effects of the current track
+    // VST3 instrument of the current track (its effects are in the chain bar)
     Widget* inst = cw->add(textBox({610, 45, 140, 15}, "Inst:", &app.vstInstText, {}, /*labelLeft=*/true));
     inst->maxLen = 255;
     inst->onCommit = [&app](Widget&) { app.commitVstInstrument(); };
     cw->add(button({755, 45, 45, 15}, "Edit", [&app](Widget&) { app.editVstInstrument(); }))
         ->labelFn = [&app] { return std::string(app.instrumentEditorOpen() ? "Close" : "Edit"); };
-    Widget* fx = cw->add(textBox({865, 45, 150, 15}, "FX:", &app.vstFxText, {}, /*labelLeft=*/true));
-    fx->maxLen = 255;
-    fx->onCommit = [&app](Widget&) { app.commitVstEffects(); };
-    cw->add(button({1020, 45, 45, 15}, "Edit", [&app](Widget&) { app.editVstEffects(); }))
-        ->labelFn = [&app] { return std::string(app.effectEditorsOpen() ? "Close" : "Edit"); };
     cw->add(button({1030, 25, 150, 15}, "", [&app](Widget&) { app.cycleTuning(); }))
         ->labelFn = [&app] {
             return std::string("Tuning: ") + vst3::tuningName((vst3::TuningMode)app.track().tuning);
@@ -5600,8 +6115,41 @@ static void buildUI(App& app) {
     //for (int k = 0; k < 3; k++) addOscColumn(*cw, app, k, 140.0f + 130.0f * k);
 }
 
+// Moves to the folder holding shaders/, so the app works however it's launched:
+// its shaders, fonts and patches, and the recordings projects point at, are all
+// relative to there. It's the executable's folder or one above it (build/).
+static bool enterAppFolder() {
+    namespace fs = std::filesystem;
+    char* base = SDL_GetBasePath();
+    if (!base) return false;
+    fs::path dir(base);
+    SDL_free(base);
+    std::error_code ec;
+    for (dir = dir.parent_path();; dir = dir.parent_path()) {   // base ends in '/'
+        if (fs::exists(dir / "shaders" / "rect.vert.spv", ec)) {
+            fs::current_path(dir, ec);
+            return !ec;
+        }
+        if (dir == dir.parent_path()) return false;
+    }
+}
+
+// Closes the window and SDL last: declared before the renderer, so it goes
+// after it, and the renderer's Vulkan surface never outlives its window.
+struct SdlSession {
+    SDL_Window* window;
+    ~SdlSession() {
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
+};
+
 int main(int, char**)
 {
+    if (!enterAppFolder()) {
+        std::fprintf(stderr, "Couldn't find Sonnote's shaders/ folder near the executable.\n");
+        return 1;
+    }
     computeComplexityOrder(20);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
@@ -5615,6 +6163,7 @@ int main(int, char**)
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
  
+    SdlSession sdlSession{window};
     VulkanRenderer renderer = VulkanRenderer(window);
  
     AudioEngine engine;
@@ -5624,15 +6173,13 @@ int main(int, char**)
     }
     std::cout << "Audio engine started." << std::endl;
  
-    gBeatOctCanvas.setBPM("110", 0.0f);
- 
     engine.setFrequency(440.0f);
     engine.setGain(0.4f);
     engine.setWaveform(WaveformType::Sine);
-    engine.setTempo(120.0f);
     engine.setADSR({0.2f, 0.2f, 0.7f, 0.025f});   // same values the old buttons produced
  
     gBeatOctCanvas.engine = &engine;
+    gBeatOctCanvas.applyTempo();
     App app(engine);
     buildUI(app);
     g_tracks.reserve(MAX_TRACKS);
@@ -5645,6 +6192,7 @@ int main(int, char**)
  
     bool running = true;
     bool quitPrompt = false;   // "save before quitting?" is showing
+    Uint32 lastPlayheadDraw = 0;
     bool rerender = true;
     bool ctrl = false;
     int click = 0;
@@ -5696,13 +6244,23 @@ int main(int, char**)
                     e.window.windowID == SDL_GetWindowID(window)) quitPrompt = true;
                 break;
  
+            case SDL_TEXTINPUT:
+                if (app.filePrompt.open) {
+                    app.filePrompt.path += e.text.text;
+                    app.filePrompt.confirmed.clear();
+                }
+                break;
+
             case SDL_MOUSEBUTTONDOWN:
+               if (app.filePrompt.open) break;   // Enter or Esc closes it
                if (quitPrompt) { quitPrompt = false; break; }   // a click cancels quitting
                if (e.button.button == SDL_BUTTON_LEFT) {
                  // Any click disarms a track's delete button; clicking it again
                  // right away (see rebuildTrackRows) deletes the track.
                  app.deleteArmedBefore = app.deleteArmed;
                  app.deleteArmed = -1;
+                 app.chainArmedBefore = app.chainArmed;
+                 app.chainArmed = 0;
                  if (!app.ui.mouseDown((float)e.button.x, (float)e.button.y, e.button.clicks))
                    click = 1;
                } else if (e.button.button == SDL_BUTTON_RIGHT) {
@@ -5713,15 +6271,38 @@ int main(int, char**)
  
             case SDL_MOUSEBUTTONUP:
                 click = 0;
+                app.ui.mouseUp();
                 break;
  
             case SDL_KEYDOWN: {
                 SDL_Keycode sym = e.key.keysym.sym;
                 char key = sym;
 
+                // The save / load prompt takes every key; text comes from SDL_TEXTINPUT
+                if (app.filePrompt.open) {
+                  App::FilePrompt& fp = app.filePrompt;
+                  if (sym == SDLK_ESCAPE) {
+                    fp.open = false;
+                    if (fp.quitAfter) quitPrompt = true;   // back to the question
+                  } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+                    if (app.submitFilePrompt() && fp.quitAfter) running = false;
+                  } else if (sym == SDLK_TAB) {
+                    app.completeFilePrompt();
+                  } else if (sym == SDLK_BACKSPACE && !fp.path.empty()) {
+                    // A whole character: UTF-8 continuation bytes are 10xxxxxx
+                    while (fp.path.size() > 1 && (fp.path.back() & 0xC0) == 0x80) fp.path.pop_back();
+                    fp.path.pop_back();
+                    fp.confirmed.clear();
+                  }
+                  break;
+                }
+
                 // Quit prompt: Enter saves and quits, Esc quits, anything else cancels
                 if (quitPrompt) {
-                  if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) { app.saveProject(); running = false; }
+                  if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+                    quitPrompt = false;
+                    app.openFilePrompt(true, /*quitAfter=*/true);
+                  }
                   else if (sym == SDLK_ESCAPE) running = false;
                   else if (sym != SDLK_LSHIFT && sym != SDLK_RSHIFT && sym != SDLK_LCTRL &&
                            sym != SDLK_RCTRL && sym != SDLK_LALT && sym != SDLK_RALT) quitPrompt = false;
@@ -5795,6 +6376,8 @@ int main(int, char**)
                     engine.toggleFreeze();
                 } else if (key == 'k') {
                     engine.metronome = !engine.metronome;
+                } else if (key == 'b') {
+                    app.toggleChain();
                 } else if (key == '\t') {
                     app.toggleAutomationMode();
                 }
@@ -5809,7 +6392,8 @@ int main(int, char**)
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
                 float mx = (float)e.motion.x, my = (float)e.motion.y;
-                if (!app.ui.openMenu && app.noteWindow->screen.contains(mx, my))
+                app.ui.mouseMove(mx);
+                if (!app.ui.openMenu && !app.ui.dragging && app.noteWindow->screen.contains(mx, my))
                     hover = {mx, (float)dh - my};       // canvas expects y-up pixels
                 else
                     hover = {-1.0f, -1.0f};
@@ -5824,6 +6408,12 @@ int main(int, char**)
                     app.scrollTracks(steps);
                     break;
                 }
+                {
+                    int flip = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1;
+                    if (!app.ui.openMenu && app.chainWheel((float)mx, (float)my, -e.wheel.y * flip, e.wheel.x * flip,
+                                                           (SDL_GetModState() & KMOD_SHIFT) != 0))
+                        break;
+                }
                 dx = e.wheel.x * sens;
                 dy = e.wheel.y * sens;
                 if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { dx = -dx; dy = -dy; }
@@ -5834,17 +6424,32 @@ int main(int, char**)
  
         if (play_triggered_from_space) {
             play_triggered_from_space = false;
-            if (!app.playing) {
-                engine.setEvents(&(gBeatOctCanvas.beatEvents));
-                engine.resetSampleCounter(calc_beat(&gBeatOctCanvas.timeEvents, playhead_time),
-                                          calc_beat(&gBeatOctCanvas.timeEvents, loop_end));
-                app.startRecordingIfArmed();
-                engine.setPlayState(true);
-            } else {
-                engine.setPlayState(false);
-                app.stopRecording();
+            if (app.playing) app.stopPlayback();
+            else app.startPlayback();
+        }
+
+        // The playhead was moved by hand. A take has to stay in one piece, so
+        // recording carries on from where it is.
+        if (seek_triggered) {
+            seek_triggered = false;
+            rerender = true;   // the note area drew its playhead before the key was seen
+            if (app.playing && !app.recording) app.sendPosition();
+            else if (app.playing) engine.pd.status = "Stop recording to move the playhead";
+        }
+        if (loop_changed) {
+            loop_changed = false;
+            rerender = true;
+            if (app.playing && !app.recording)
+                engine.setLoop(calc_beat(loop_start_time), loop_end < 0.0f ? -1.0 : (double)calc_beat(loop_end));
+        }
+
+        // The playhead follows playback, at about the screen's frame rate
+        if (app.playing) {
+            playhead_time = calc_time((float)engine.playheadBeat());
+            if (SDL_GetTicks() - lastPlayheadDraw >= 16) {
+                lastPlayheadDraw = SDL_GetTicks();
+                rerender = true;
             }
-            app.playing = !app.playing;
         }
  
         if (tuner_triggered) {
@@ -5873,7 +6478,12 @@ int main(int, char**)
             SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
  
             if (app.tracksChanged) rebuildTrackRows(app);
+            if (app.chainOpen) {
+                rebuildChain(app);
+                refreshChain(app);
+            }
             app.ui.layout((float)dw, (float)dh);
+            if (app.chainOpen) app.scrollChain(0);
             app.ui.draw(renderer, (float)dh);
  
             const ui::Rect& s = app.noteWindow->screen;
@@ -5887,7 +6497,32 @@ int main(int, char**)
             renderer.nextLayer();
             app.ui.drawOverlay(renderer, (float)dh);   // dropdowns on top of everything
 
-            if (quitPrompt) {   // centred over the note window
+            if (app.filePrompt.open) {   // centred over the note window
+                const App::FilePrompt& fp = app.filePrompt;
+                const float w = 620, h = 96;
+                const size_t maxChars = 80;   // what fits in w; long text shows its tail
+                auto tail = [](const std::string& t, size_t n) {
+                    return t.size() > n ? "..." + t.substr(t.size() - n + 3) : t;
+                };
+                auto& labels = gBeatOctCanvas.laneLabels;   // the renderer keeps char*s until the frame is drawn
+                float x = (screenNw.x1 + screenNw.x2) / 2 - w / 2;
+                float y = (screenNw.y1 + screenNw.y2) / 2 - h / 2;
+                renderer.addRect(x - 2, y - 2, w + 4, h + 4, 1.0f, 0.55f, 0.1f);
+                renderer.addRect(x, y, w, h, 0.12f, 0.12f, 0.13f);
+                // Relative paths start in the app's folder, wherever it was launched from
+                labels.push_back(std::string(fp.saving ? "Save project as" : "Load project from") + " (from " +
+                                 tail(std::filesystem::current_path().string(), maxChars - 30) + "):");
+                renderer.addText(labels.back().c_str(), x + 10, y + h - 22, 15.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                renderer.addRect(x + 8, y + 40, w - 16, 22, 0.03f, 0.03f, 0.04f);
+                labels.push_back(tail(fp.path, maxChars) + "_");
+                renderer.addText(labels.back().c_str(), x + 12, y + 45, 13.0f, glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                if (!fp.message.empty()) {
+                    labels.push_back(tail(fp.message, maxChars));
+                    renderer.addText(labels.back().c_str(), x + 10, y + 24, 13.0f, glm::vec4(1.0f, 0.6f, 0.3f, 1.0f));
+                }
+                renderer.addText("Enter: confirm    Tab: complete path    Esc: cancel", x + 10, y + 7, 13.0f,
+                                 glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
+            } else if (quitPrompt) {   // centred over the note window
                 const float w = 520, h = 58;
                 float x = (screenNw.x1 + screenNw.x2) / 2 - w / 2;
                 float y = (screenNw.y1 + screenNw.y2) / 2 - h / 2;
@@ -5895,7 +6530,7 @@ int main(int, char**)
                 renderer.addRect(x, y, w, h, 0.12f, 0.12f, 0.13f);
                 renderer.addText("Quit Sonnote? Unsaved changes will be lost.", x + 10, y + h - 22, 15.0f,
                                  glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-                renderer.addText("Enter: save (session.son) and quit    Esc: quit without saving    Other: cancel",
+                renderer.addText("Enter: save and quit    Esc: quit without saving    Other: cancel",
                                  x + 10, y + 10, 13.0f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
             }
  
@@ -5911,7 +6546,5 @@ int main(int, char**)
     }
  
     engine.stop();
-    SDL_DestroyWindow(window);
-    SDL_Quit();
     return 0;
 }
