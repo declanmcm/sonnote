@@ -75,6 +75,11 @@ VulkanRenderer::~VulkanRenderer() {
         vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
     if (destroyMessenger) destroyMessenger(instance, debugMessenger, nullptr);
     vkDestroySurfaceKHR(instance, surface, nullptr);
+    if (debugMessenger) {
+        auto destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (destroy) destroy(instance, debugMessenger, nullptr);
+    }
     vkDestroyInstance(instance, nullptr);
 }
 

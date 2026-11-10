@@ -9,6 +9,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include "text_renderer.hpp"
 
 #define WIDTH 800
@@ -475,21 +477,33 @@ private:
         std::vector<const char*> extensions(extCount);
         SDL_Vulkan_GetInstanceExtensions(window, &extCount, extensions.data());
 
+        // Validation is used when the Khronos layer is installed (it usually
+        // isn't on end-user systems, and requesting a missing layer makes
+        // vkCreateInstance fail). SONNOTE_VALIDATION=0 turns it off.
+        bool validation = false;
+        const char* env = std::getenv("SONNOTE_VALIDATION");
+        if (!env || std::string(env) != "0") {
+            uint32_t layerCount = 0;
+            vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+            std::vector<VkLayerProperties> layers(layerCount);
+            vkEnumerateInstanceLayerProperties(&layerCount, layers.data());
+            for (auto& l : layers)
+                if (std::strcmp(l.layerName, "VK_LAYER_KHRONOS_validation") == 0) validation = true;
+        }
+        if (validation) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "Sonnote";
         appInfo.apiVersion = VK_API_VERSION_1_0;
 
         VkInstanceCreateInfo createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         createInfo.pApplicationInfo = &appInfo;
-        createInfo.enabledExtensionCount = extCount;
+        createInfo.enabledExtensionCount = (uint32_t)extensions.size();
         createInfo.ppEnabledExtensionNames = extensions.data();
 
         const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
-        createInfo.enabledLayerCount = 1;
-        createInfo.ppEnabledLayerNames = validationLayers;
-
         VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
         debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
         debugCreateInfo.messageSeverity =
@@ -502,8 +516,12 @@ private:
             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
         debugCreateInfo.pfnUserCallback = debugCallback;
 
-        createInfo.pNext = &debugCreateInfo;
-
+        if (validation) {
+            createInfo.enabledLayerCount = 1;
+            createInfo.ppEnabledLayerNames = validationLayers;
+            createInfo.pNext = &debugCreateInfo;
+        }
+        std::cout << "Vulkan validation: " << (validation ? "on" : "off") << std::endl;
 
         for (auto e : extensions)
         std::cout << "Using extension: " << e << std::endl;
@@ -514,11 +532,11 @@ private:
             return -1;
         }
 
-        auto func = (PFN_vkCreateDebugUtilsMessengerEXT)
-            vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
-
-        if (func != nullptr) {
-            func(instance, &debugCreateInfo, nullptr, &debugMessenger);
+        if (validation) {
+            auto func = (PFN_vkCreateDebugUtilsMessengerEXT)
+                vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+            if (func != nullptr)
+                func(instance, &debugCreateInfo, nullptr, &debugMessenger);
         }
 
         return 0;
