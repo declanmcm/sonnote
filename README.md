@@ -8,6 +8,57 @@
 
 **Sonnote** is a standalone program using Vulkan and JACK to provide a composition tool based on pure intervals.
 
+## Platform support
+
+Linux only, on X11 or Wayland (VST3 plugin windows open through XWayland).
+Audio goes through JACK, so either JACK itself or PipeWire's JACK layer
+(`pipewire-jack`, run as `pw-jack ./build/app` if it isn't the default).
+
+## Dependencies
+
+### Bundled as a git submodule
+
+- [VST3 SDK](https://github.com/steinbergmedia/vst3sdk) (MIT), in
+  `extern/vst3sdk`, pinned to `v3.8.1_build_84`. Only its `base`, `cmake`,
+  `pluginterfaces` and `public.sdk` parts are needed.
+
+`json.hpp` ([nlohmann/json](https://github.com/nlohmann/json)), `stb_image.h`
+and `stb_truetype.h` ([nothings/stb](https://github.com/nothings/stb)) are
+single headers committed in `src/`.
+
+### System packages
+
+| Needed for | Arch | Debian / Ubuntu |
+|---|---|---|
+| Building | `cmake gcc pkgconf` | `cmake g++ pkg-config` |
+| Window and graphics | `sdl2 vulkan-icd-loader vulkan-headers` | `libsdl2-dev libvulkan-dev` |
+| Vulkan driver | `vulkan-radeon`, `vulkan-intel` or `nvidia-utils` | `mesa-vulkan-drivers` (or the NVIDIA driver) |
+| Audio | `pipewire-jack` (or `jack2`), `libsndfile` | `libjack-jackd2-dev libsndfile1-dev` |
+| Fonts, tuner | `freetype2 fftw` | `libfreetype-dev libfftw3-dev` |
+| Pd patches | [libpd](https://github.com/libpd/libpd) (AUR: `libpd`) | `libpd-dev` |
+| Plugin windows, OpenGL | `libx11 libglvnd` | `libx11-dev libgl-dev` |
+| Pd editor (optional) | `tk` | `tk` |
+
+libpd needs to be built with multi-instance support (`PD_MULTI`); without it
+Sonnote still runs but Pd patches don't play.
+
+Optional: the Vulkan validation layer (`vulkan-validation-layers` on Arch,
+`vulkan-validationlayers` on Debian / Ubuntu) is used when installed, which
+prints Vulkan warnings to the terminal. Set `SONNOTE_VALIDATION=0` to turn it
+off.
+
+## Installation
+
+```
+git clone https://github.com/declanmcm/sonnote.git
+cd sonnote
+git submodule update --init
+git -C extern/vst3sdk submodule update --init base cmake pluginterfaces public.sdk
+```
+
+(Don't use `--recursive`: it also downloads the SDK's `vstgui4`, `doc` and
+`tutorials`, which Sonnote doesn't need.)
+
 ## Compilation
 
 ```
