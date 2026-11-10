@@ -28,14 +28,36 @@ single headers committed in `src/`.
 
 ### System packages
 
+Everything in one line:
+
+**Arch**
+
+```
+sudo pacman -S --needed cmake gcc pkgconf sdl2-compat vulkan-icd-loader vulkan-headers pipewire-jack libsndfile freetype2 fftw pd libx11 libglvnd tk
+```
+
+plus the Vulkan driver for your GPU: `vulkan-radeon` (AMD), `vulkan-intel`
+(Intel) or `nvidia-utils` (NVIDIA). If you use `jack2` instead of PipeWire,
+leave out `pipewire-jack` (pacman would offer to replace `jack2` with it).
+
+**Ubuntu / Debian**
+
+```
+sudo apt install cmake g++ pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers libjack-jackd2-dev pipewire-jack libsndfile1-dev libfreetype-dev libfftw3-dev libpd-dev libx11-dev libgl-dev tk
+```
+
+(`mesa-vulkan-drivers` covers AMD and Intel GPUs; NVIDIA needs its own driver.)
+
+What each package is for:
+
 | Needed for | Arch | Debian / Ubuntu |
 |---|---|---|
 | Building | `cmake gcc pkgconf` | `cmake g++ pkg-config` |
-| Window and graphics | `sdl2 vulkan-icd-loader vulkan-headers` | `libsdl2-dev libvulkan-dev` |
+| Window and graphics | `sdl2-compat vulkan-icd-loader vulkan-headers` | `libsdl2-dev libvulkan-dev` |
 | Vulkan driver | `vulkan-radeon`, `vulkan-intel` or `nvidia-utils` | `mesa-vulkan-drivers` (or the NVIDIA driver) |
-| Audio | `pipewire-jack` (or `jack2`), `libsndfile` | `libjack-jackd2-dev libsndfile1-dev` |
+| Audio | `pipewire-jack` (or `jack2`), `libsndfile` | `libjack-jackd2-dev pipewire-jack libsndfile1-dev` |
 | Fonts, tuner | `freetype2 fftw` | `libfreetype-dev libfftw3-dev` |
-| Pd patches | [libpd](https://github.com/libpd/libpd) (AUR: `libpd`) | `libpd-dev` |
+| Pd patches ([libpd](https://github.com/libpd/libpd)) | `pd` (includes libpd) | `libpd-dev` |
 | Plugin windows, OpenGL | `libx11 libglvnd` | `libx11-dev libgl-dev` |
 | Pd editor (optional) | `tk` | `tk` |
 
