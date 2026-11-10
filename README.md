@@ -40,11 +40,23 @@ plus the Vulkan driver for your GPU: `vulkan-radeon` (AMD), `vulkan-intel`
 (Intel) or `nvidia-utils` (NVIDIA). If you use `jack2` instead of PipeWire,
 leave out `pipewire-jack` (pacman would offer to replace `jack2` with it).
 
-**Ubuntu / Debian**
+**Ubuntu 24.04 and later**
 
 ```
 sudo apt install cmake g++ pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers libjack-jackd2-dev pipewire-jack libsndfile1-dev libfreetype-dev libfftw3-dev libpd-dev libx11-dev libgl-dev tk
 ```
+
+**Ubuntu 22.04**
+
+```
+sudo apt install cmake g++ pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers libjack-jackd2-dev jackd2 libsndfile1-dev libfreetype-dev libfftw3-dev libx11-dev libgl-dev tk
+```
+
+22.04 has no `pipewire-jack` (and uses PulseAudio by default), so this
+installs the JACK server (`jackd2`) instead: start JACK, for example with
+`qjackctl`, before running Sonnote. 22.04 also has no `libpd-dev`, so
+[libpd](https://github.com/libpd/libpd) has to be built from source, with
+multi-instance support (`-DPD_MULTI=ON`). Sonnote doesn't build without it.
 
 (`mesa-vulkan-drivers` covers AMD and Intel GPUs; NVIDIA needs its own driver.)
 
@@ -55,9 +67,9 @@ What each package is for:
 | Building | `cmake gcc pkgconf` | `cmake g++ pkg-config` |
 | Window and graphics | `sdl2-compat vulkan-icd-loader vulkan-headers` | `libsdl2-dev libvulkan-dev` |
 | Vulkan driver | `vulkan-radeon`, `vulkan-intel` or `nvidia-utils` | `mesa-vulkan-drivers` (or the NVIDIA driver) |
-| Audio | `pipewire-jack` (or `jack2`), `libsndfile` | `libjack-jackd2-dev pipewire-jack libsndfile1-dev` |
+| Audio | `pipewire-jack` (or `jack2`), `libsndfile` | `libjack-jackd2-dev libsndfile1-dev`, plus `pipewire-jack` (24.04+) or `jackd2` (22.04) |
 | Fonts, tuner | `freetype2 fftw` | `libfreetype-dev libfftw3-dev` |
-| Pd patches ([libpd](https://github.com/libpd/libpd)) | `pd` (includes libpd) | `libpd-dev` |
+| Pd patches ([libpd](https://github.com/libpd/libpd)) | `pd` (includes libpd) | `libpd-dev` (24.04+; build from source on 22.04) |
 | Plugin windows, OpenGL | `libx11 libglvnd` | `libx11-dev libgl-dev` |
 | Pd editor (optional) | `tk` | `tk` |
 
